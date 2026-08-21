@@ -4,14 +4,16 @@ Agent Bridge is a local coordination daemon for independently launched coding-ag
 
 The Go daemon owns coordination truth. Harness integrations remain thin adapters.
 
-Design references: [vision](docs/vision.md), [VCS identity](docs/vcs.md), and [harness compatibility](docs/harnesses.md).
+Design references: [vision](docs/vision.md), [VCS identity](docs/vcs.md), [provenance](docs/provenance.md), and [harness compatibility](docs/harnesses.md).
 
 ## Current vertical slice
 
 - Unix-domain-socket JSON RPC with owner-only permissions
 - append-only, fsynced event journal with crash-tail recovery
+- local Turso provenance database with MVCC, async I/O, mutation hashes, turn boundaries, and compaction summaries
 - actor registration, aliases, heartbeat leases, capabilities, and session generations
-- first-class Git repository/worktree/branch/HEAD identity, with optional JJ change identity layered on top
+- first-class Git repository/worktree/branch/HEAD identity, with optional JJ repository/workspace/change identity layered on top
+- normalized global, repository, workspace, and directory authority scopes
 - canonical `harness:session` addressing plus `@alias`, `@git:<HEAD>`, and `@change:<JJ ID>` selectors
 - durable mailbox polling and explicit acknowledgement
 - global, sender, recipient, and adapter-assigned sequence metadata
@@ -31,8 +33,9 @@ go build -o agent-bridge ./cmd/agent-bridge
 Defaults:
 
 ```text
-socket:  ~/.local/state/agent-bridge/bridge.sock
-journal: ~/.local/state/agent-bridge/events.jsonl
+socket:     ~/.agent-bridge/bridge.sock
+journal:    ~/.agent-bridge/events.jsonl
+provenance: ~/.agent-bridge/agent-bridge.db
 ```
 
 Override with `AGENT_BRIDGE_STATE_DIR` or `AGENT_BRIDGE_SOCKET`.
@@ -43,8 +46,14 @@ Override with `AGENT_BRIDGE_STATE_DIR` or `AGENT_BRIDGE_SOCKET`.
 agent-bridge ping
 agent-bridge stop
 agent-bridge sessions --all
+agent-bridge scopes
+agent-bridge sessions --workspace <workspace-id>
 agent-bridge send --from pi:01K... --id pi:01K:1:1 --sequence 1 @walkie "Can you yield schema.ts?"
 agent-bridge request mailbox.poll '{"actor":"pi:01K..."}'
+agent-bridge provenance who-changed /repo/file.ts
+agent-bridge provenance why <mutation-id>
+agent-bridge provenance agent @walkie
+agent-bridge provenance since-compaction @walkie
 ```
 
 The low-level `request` command is primarily for development and harness adapters.
@@ -76,6 +85,7 @@ mailbox.ack
 intent.begin
 intent.end
 collision.transition
+session.event
 ```
 
 ## Ordering and durability
@@ -96,10 +106,12 @@ The daemon reports collision state; harness policy decides whether a specific op
 cmd/agent-bridge/       CLI and foreground daemon entrypoint
 internal/client/        Go socket client
 internal/protocol/      harness-neutral wire types
+internal/provenance/    Turso projection and causal queries
 internal/server/        concurrent Unix socket server
 internal/state/         event-sourced coordination state machine
 internal/store/         durable JSONL journal
 packages/pi-extension/  canonical Pi adapter source
+skills/agent-bridge/     progressively disclosed provenance workflow
 scripts/                local adapter installation
 ```
 
@@ -108,6 +120,20 @@ Install the Pi adapter with:
 ```bash
 ./scripts/install-pi-extension.sh
 ```
+
+Pi exposes the concise client command:
+
+```text
+/bus talk                         # multi-select modal composer
+/bus talk @walkie message
+/bus talk @walkie,@talkie message
+/bus talk --repo message
+/bus list
+/bus name walkie
+/bus status
+```
+
+`/bridge` remains a deprecated compatibility alias.
 
 ## Next harness adapters
 

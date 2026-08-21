@@ -52,9 +52,42 @@ JJ workspace/change     → change ownership and dependency identity
 
 Selectors can address active actors by `@change:<JJ change ID prefix>`.
 
+## Authority scopes
+
+Agent Bridge normalizes every actor and mutation into:
+
+```text
+repository_id    shared Git common directory or JJ repository
+workspace_id     one physical Git worktree/JJ workspace
+workspace_root   physical working copy root
+relative_paths   paths relative to that workspace
+cwd              launch/current directory
+```
+
+IDs are stable hashes of canonical local identity paths; raw paths remain owner-local metadata.
+
+Routing and alias authority narrow in this order:
+
+```text
+same workspace → same repository → global
+```
+
+The same alias can exist in separate workspaces. A sender resolves its workspace-local peer first, then repository-local, and only then a globally unique actor. Canonical `harness:session` addresses always bypass scope ambiguity.
+
+Discovery supports:
+
+```bash
+agent-bridge scopes
+agent-bridge sessions --repo <repository-id>
+agent-bridge sessions --workspace <workspace-id>
+agent-bridge sessions --under /absolute/directory
+```
+
+Directory scope includes actors launched beneath that directory or with recent mutation intents beneath it.
+
 ## Collision scope
 
-Canonical absolute path equality is the highest-confidence collision signal. The Pi adapter uses Git worktree root as its first workspace key, then JJ workspace root, then cwd. This supports:
+Canonical absolute path equality is the highest-confidence collision signal. The Pi adapter resolves VCS identity from the mutation target path, not only the actor launch directory. It uses Git worktree root as its first workspace key, then JJ workspace root, then cwd. This supports:
 
 - ordinary Git repositories
 - linked Git worktrees

@@ -14,12 +14,15 @@ import (
 
 	"github.com/AndrewPBerg/agent-bridge/internal/client"
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
+	"github.com/AndrewPBerg/agent-bridge/internal/provenance"
 	"github.com/AndrewPBerg/agent-bridge/internal/server"
 	"github.com/AndrewPBerg/agent-bridge/internal/state"
 	"github.com/AndrewPBerg/agent-bridge/internal/store"
 )
 
 func main() {
+	// Provenance, journals, WAL files, and sockets are private by default.
+	syscall.Umask(0o077)
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "agent-bridge:", err)
 		os.Exit(1)
@@ -39,10 +42,14 @@ func run(args []string) error {
 		return callAndPrint("daemon.shutdown", map[string]any{})
 	case "sessions":
 		return sessions(args[1:])
+	case "scopes":
+		return callAndPrint("provenance.scopes", map[string]any{})
 	case "send":
 		return send(args[1:])
 	case "request":
 		return request(args[1:])
+	case "provenance":
+		return provenanceCommand(args[1:])
 	case "version", "--version", "-v":
 		fmt.Println("agent-bridge dev")
 		return nil
@@ -52,38 +59,63 @@ func run(args []string) error {
 }
 
 func usageError() error {
-	return errors.New("usage: agent-bridge <serve|stop|ping|sessions|send|request|version>")
+	return errors.New("usage: agent-bridge <serve|stop|ping|sessions|scopes|send|request|provenance|version>")
 }
 
 func serve(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	socket := flags.String("socket", defaultSocket(), "Unix socket path")
 	journalPath := flags.String("journal", defaultJournal(), "append-only event journal")
+	databasePath := flags.String("database", defaultDatabase(), "SQLite provenance database")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if os.Getenv("AGENT_BRIDGE_STATE_DIR") == "" && *journalPath == defaultJournal() {
+		if err := migrateLegacyJournal(*journalPath); err != nil {
+			return err
+		}
 	}
 	journal, events, err := store.Open(*journalPath)
 	if err != nil {
 		return err
 	}
 	defer journal.Close()
-	engine, err := state.New(journal, events, state.Options{})
+	database, err := provenance.Open(*databasePath)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	if err := database.ProjectAll(events); err != nil {
+		return fmt.Errorf("backfill provenance database: %w", err)
+	}
+	initialSequence := uint64(0)
+	if len(events) > 0 {
+		initialSequence = events[len(events)-1].Sequence
+	}
+	appender := provenance.NewProjectingAppender(journal, database, initialSequence)
+	defer appender.Close()
+	engine, err := state.New(appender, events, state.Options{})
 	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
-	fmt.Fprintf(os.Stderr, "agent-bridge listening on %s (replayed %d events)\n", *socket, len(events))
-	return server.New(engine, *socket).Serve(ctx)
+	fmt.Fprintf(os.Stderr, "agent-bridge listening on %s (replayed %d events, provenance %s)\n", *socket, len(events), *databasePath)
+	return server.NewWithProvenance(engine, database, *socket, appender).Serve(ctx)
 }
 
 func sessions(args []string) error {
 	flags := flag.NewFlagSet("sessions", flag.ContinueOnError)
 	includeStale := flags.Bool("all", false, "include stale sessions")
+	repositoryID := flags.String("repo", "", "repository ID authority scope")
+	workspaceID := flags.String("workspace", "", "workspace ID authority scope")
+	directory := flags.String("under", "", "directory scope (cwd or recent mutation)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	return callAndPrint("sessions.list", map[string]any{"include_stale": *includeStale})
+	return callAndPrint("sessions.list", map[string]any{
+		"include_stale": *includeStale, "repository_id": *repositoryID, "workspace_id": *workspaceID, "directory": *directory,
+	})
 }
 
 func send(args []string) error {
@@ -137,14 +169,11 @@ func stateDir() string {
 	if value := os.Getenv("AGENT_BRIDGE_STATE_DIR"); value != "" {
 		return value
 	}
-	if value := os.Getenv("XDG_STATE_HOME"); value != "" {
-		return filepath.Join(value, "agent-bridge")
-	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return filepath.Join(os.TempDir(), "agent-bridge")
 	}
-	return filepath.Join(home, ".local", "state", "agent-bridge")
+	return filepath.Join(home, ".agent-bridge")
 }
 
 func defaultSocket() string {
@@ -156,4 +185,8 @@ func defaultSocket() string {
 
 func defaultJournal() string {
 	return filepath.Join(stateDir(), "events.jsonl")
+}
+
+func defaultDatabase() string {
+	return filepath.Join(stateDir(), "agent-bridge.db")
 }

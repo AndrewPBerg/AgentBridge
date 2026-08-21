@@ -1,0 +1,391 @@
+package provenance
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
+)
+
+func event(t *testing.T, sequence uint64, eventType string, data any) protocol.Event {
+	t.Helper()
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return protocol.Event{Version: 1, Sequence: sequence, Type: eventType, At: time.Unix(int64(sequence), 0).UTC(), Data: encoded}
+}
+
+type recordingAppender struct {
+	events []protocol.Event
+}
+
+type blockingAppender struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingAppender) Append(protocol.Event) error {
+	close(b.entered)
+	<-b.release
+	return nil
+}
+
+func (r *recordingAppender) Append(event protocol.Event) error {
+	r.events = append(r.events, event)
+	return nil
+}
+
+func TestQueryWaitCannotMissConcurrentDurableAppendTail(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "agent-bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	primary := &blockingAppender{entered: make(chan struct{}), release: make(chan struct{})}
+	projector := NewProjectingAppender(primary, database)
+	defer projector.Close()
+	actor := protocol.Actor{Address: "pi:race", Harness: "pi", SessionID: "race", CWD: "/repo", State: "active", StartedAt: time.Now(), HeartbeatAt: time.Now()}
+	projectionEvent := event(t, 1, "actor.upserted", actor)
+	appendDone := make(chan error, 1)
+	go func() { appendDone <- projector.Append(projectionEvent) }()
+	<-primary.entered
+
+	waitDone := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() { waitDone <- projector.WaitForCurrent(ctx) }()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("query wait returned before durable append was published: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(primary.release)
+	if err := <-appendDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-waitDone; err != nil {
+		t.Fatal(err)
+	}
+	status, err := database.Status()
+	if err != nil || status.ProjectedSequence != 1 {
+		t.Fatalf("durable append was not visible after wait: %#v, %v", status, err)
+	}
+}
+
+func TestAsyncProjectorBackpressuresWithoutSequenceGaps(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "agent-bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	primary := &recordingAppender{}
+	projector := newProjectingAppender(primary, database, 1)
+	for sequence := uint64(1); sequence <= 100; sequence++ {
+		actor := protocol.Actor{
+			Address: "pi:actor", Harness: "pi", SessionID: "actor", CWD: "/repo", State: "active",
+			StartedAt: time.Now(), HeartbeatAt: time.Now(),
+		}
+		if err := projector.Append(event(t, sequence, "actor.upserted", actor)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projector.Close()
+	status, err := database.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Events != 100 || status.ProjectedSequence != 100 {
+		t.Fatalf("projection gap: %#v", status)
+	}
+	health := projector.Health()
+	if health.JournalSequence != 100 || health.ProjectedSequence != 100 || health.Lag != 0 {
+		t.Fatalf("misleading projection health: %#v", health)
+	}
+}
+
+func TestAsyncProjectorWaitsForReadYourWrites(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "agent-bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	projector := NewProjectingAppender(&recordingAppender{}, database)
+	defer projector.Close()
+	actor := protocol.Actor{Address: "pi:wait", Harness: "pi", SessionID: "wait", CWD: "/repo", State: "active", StartedAt: time.Now(), HeartbeatAt: time.Now()}
+	if err := projector.Append(event(t, 1, "actor.upserted", actor)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := projector.WaitForCurrent(ctx); err != nil {
+		t.Fatal(err)
+	}
+	health := projector.Health()
+	if health.Lag != 0 || health.JournalSequence != 1 || health.ProjectedSequence != 1 {
+		t.Fatalf("projection not caught up: %#v", health)
+	}
+}
+
+func TestAsyncProjectorFlushesOnClose(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "agent-bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	primary := &recordingAppender{}
+	projector := NewProjectingAppender(primary, database)
+	actor := protocol.Actor{Address: "pi:async", Harness: "pi", SessionID: "async", CWD: "/repo", State: "active", StartedAt: time.Now(), HeartbeatAt: time.Now()}
+	if err := projector.Append(event(t, 1, "actor.upserted", actor)); err != nil {
+		t.Fatal(err)
+	}
+	projector.Close()
+	if len(primary.events) != 1 {
+		t.Fatalf("primary events = %d", len(primary.events))
+	}
+	timeline, err := database.Timeline("pi:async", "", 10)
+	if err != nil || len(timeline) != 1 {
+		t.Fatalf("async projection was not flushed: %#v, %v", timeline, err)
+	}
+}
+
+func TestProjectionSchemaUpgradeResetsReadModelForJournalBackfill(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-bridge.db")
+	database, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	actor := protocol.Actor{Address: "pi:migrate", Harness: "pi", SessionID: "migrate", CWD: "/repo", State: "active", StartedAt: now, HeartbeatAt: now}
+	projectionEvent := event(t, 1, "actor.upserted", actor)
+	if err := database.Project(projectionEvent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.db.Exec(`UPDATE projection_meta SET version = ?`, projectionSchemaVersion-1); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	status, err := database.Status()
+	if err != nil || status.Events != 0 {
+		t.Fatalf("old projection was not reset: %#v, %v", status, err)
+	}
+	if err := database.Project(projectionEvent); err != nil {
+		t.Fatal(err)
+	}
+	status, err = database.Status()
+	if err != nil || status.Events != 1 || status.Actors != 1 {
+		t.Fatalf("journal backfill did not rebuild projection: %#v, %v", status, err)
+	}
+}
+
+func TestCanonicalActorAddressCannotBeShadowedByAlias(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "agent-bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Now()
+	real := protocol.Actor{Address: "pi:real", Harness: "pi", SessionID: "real", CWD: "/repo", State: "active", StartedAt: now, HeartbeatAt: now}
+	shadow := protocol.Actor{Address: "pi:other", Harness: "pi", SessionID: "other", Alias: "pi:real", CWD: "/repo", State: "active", StartedAt: now, HeartbeatAt: now}
+	if err := database.ProjectAll([]protocol.Event{
+		event(t, 1, "actor.upserted", real),
+		event(t, 2, "actor.upserted", shadow),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := database.ResolveActor("pi:real")
+	if err != nil || resolved != "pi:real" {
+		t.Fatalf("canonical address resolved to %q, %v", resolved, err)
+	}
+}
+
+func TestPersistedAliasRequiresScopeWhenAmbiguous(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "agent-bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Now()
+	left := protocol.Actor{
+		Address: "pi:left", Harness: "pi", SessionID: "left", Alias: "builder", CWD: "/repo", State: "active",
+		RepositoryID: "repo:1", RepositoryRoot: "/repo", WorkspaceID: "workspace:left", WorkspaceRoot: "/repo", WorkspaceKind: "git-worktree",
+		StartedAt: now, HeartbeatAt: now,
+	}
+	right := protocol.Actor{
+		Address: "pi:right", Harness: "pi", SessionID: "right", Alias: "builder", CWD: "/repo-right", State: "active",
+		RepositoryID: "repo:1", RepositoryRoot: "/repo", WorkspaceID: "workspace:right", WorkspaceRoot: "/repo-right", WorkspaceKind: "git-worktree",
+		StartedAt: now, HeartbeatAt: now,
+	}
+	if err := database.ProjectAll([]protocol.Event{
+		event(t, 1, "actor.upserted", left), event(t, 2, "actor.upserted", right),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ResolveActor("@builder"); err == nil {
+		t.Fatal("ambiguous unscoped alias unexpectedly resolved")
+	}
+	resolved, err := database.ResolveActorScoped("@builder", "", left.WorkspaceID)
+	if err != nil || resolved != left.Address {
+		t.Fatalf("workspace-scoped alias = %q, %v", resolved, err)
+	}
+	if _, err := database.AgentSummary("@builder", 10); err == nil {
+		t.Fatal("unscoped agent summary unexpectedly accepted ambiguous alias")
+	}
+	summary, err := database.AgentSummary("@builder", 10, ActorScope{WorkspaceID: left.WorkspaceID})
+	if err != nil || summary.Actor != left.Address {
+		t.Fatalf("scoped agent summary = %#v, %v", summary, err)
+	}
+}
+
+func TestMutationOrderingUsesStableSequenceTieBreaker(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "agent-bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Now().UTC()
+	actor := protocol.Actor{Address: "pi:order", Harness: "pi", SessionID: "order", CWD: "/repo", State: "active", StartedAt: now, HeartbeatAt: now}
+	intent := func(id string) protocol.Intent {
+		return protocol.Intent{ID: id, Actor: actor.Address, ToolCallID: id, Tool: "edit", Operation: "edit", Paths: []string{"/repo/x"}, CWD: "/repo", StartedAt: now, ExpiresAt: now.Add(time.Minute)}
+	}
+	if err := database.ProjectAll([]protocol.Event{
+		event(t, 1, "actor.upserted", actor), event(t, 2, "intent.started", intent("first")), event(t, 3, "intent.started", intent("second")),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mutations, err := database.ListMutations(MutationFilter{Actor: actor.Address, Limit: 2})
+	if err != nil || len(mutations) != 2 || mutations[0].ID != "second" || mutations[1].ID != "first" {
+		t.Fatalf("unstable mutation order: %#v, %v", mutations, err)
+	}
+}
+
+func TestTursoProjectionAndQueries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".agent-bridge", "agent-bridge.db")
+	database, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 8, 21, 4, 0, 0, 0, time.UTC)
+	actor := protocol.Actor{
+		Address: "pi:session", Harness: "pi", SessionID: "session", Alias: "walkie", CWD: "/repo", State: "active",
+		RepositoryID: "repo:test", RepositoryRoot: "/repo", WorkspaceID: "workspace:test", WorkspaceRoot: "/repo", WorkspaceKind: "git-jj-workspace",
+		Generation: 7, StartedAt: now, HeartbeatAt: now,
+		Git: &protocol.GitContext{RepoRoot: "/repo", WorktreeRoot: "/repo", Branch: "main", Head: "abcdef"},
+		JJ:  &protocol.JJContext{WorkspaceRoot: "/repo", ChangeID: "qpvuntsm"},
+	}
+	started := protocol.Intent{
+		ID: "intent-1", Actor: actor.Address, SessionGeneration: 7, TurnID: "pi:session:7:turn:3", TurnIndex: func() *int { value := 3; return &value }(),
+		ToolCallID: "tool-1", Tool: "edit", Operation: "edit",
+		Paths: []string{"/repo/schema.ts"}, RelativePaths: []string{"schema.ts"}, CWD: "/repo",
+		RepositoryID: actor.RepositoryID, RepositoryRoot: actor.RepositoryRoot, WorkspaceID: actor.WorkspaceID,
+		WorkspaceRoot: actor.WorkspaceRoot, WorkspaceKind: actor.WorkspaceKind, WorkspaceKey: "/repo", Git: actor.Git, JJ: actor.JJ,
+		Context:   protocol.IntentContext{AssistantExcerpt: "Updating the schema"},
+		Before:    []protocol.FileSnapshot{{Path: "/repo/schema.ts", Exists: true, Kind: "file", SHA256: "before", Size: 10}},
+		StartedAt: now, ExpiresAt: now.Add(5 * time.Minute),
+	}
+	completed := started
+	success := true
+	completed.Success = &success
+	completedAt := now.Add(time.Second)
+	completed.CompletedAt = &completedAt
+	completed.After = []protocol.FileSnapshot{{Path: "/repo/schema.ts", Exists: true, Kind: "file", SHA256: "after", Size: 11}}
+	completed.GitAfter = actor.Git
+	completed.JJAfter = actor.JJ
+	sessionEvent := protocol.SessionEvent{
+		ID: "session-event-1", Actor: actor.Address, SessionGeneration: 7, Type: "session.compacted", At: now.Add(2 * time.Second),
+		Summary: "Compacted schema work", Data: json.RawMessage(`{"reason":"threshold"}`),
+	}
+
+	collision := protocol.Collision{
+		ID: "collision-1", Path: "/repo/schema.ts", State: protocol.CollisionResolved,
+		Actors: [2]string{"pi:other", actor.Address}, CreatedAt: now, UpdatedAt: now.Add(3 * time.Second), Resolution: "walkie owned schema",
+	}
+	events := []protocol.Event{
+		event(t, 1, "actor.upserted", actor),
+		event(t, 2, "intent.started", started),
+		event(t, 3, "intent.completed", completed),
+		event(t, 4, "session.event", sessionEvent),
+		event(t, 5, "collision.upserted", collision),
+	}
+	if err := database.ProjectAll(events); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ProjectAll(events); err != nil {
+		t.Fatalf("idempotent replay failed: %v", err)
+	}
+
+	status, err := database.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Events != 5 || status.Actors != 1 || status.Repositories != 1 || status.Workspaces != 1 || status.Mutations != 1 || status.SessionEvents != 1 || status.Collisions != 1 {
+		t.Fatalf("status = %#v", status)
+	}
+	scopes, err := database.Scopes()
+	if err != nil || len(scopes.Repositories) != 1 || len(scopes.Workspaces) != 1 || scopes.Workspaces[0].ID != actor.WorkspaceID {
+		t.Fatalf("scopes = %#v, %v", scopes, err)
+	}
+	mutations, err := database.ListMutations(MutationFilter{Actor: "@walkie", Path: "/repo/schema.ts"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mutations) != 1 || mutations[0].Success == nil || !*mutations[0].Success || mutations[0].TurnID != "pi:session:7:turn:3" {
+		t.Fatalf("mutations = %#v", mutations)
+	}
+	if string(mutations[0].Before) == "" || string(mutations[0].After) == "" {
+		t.Fatalf("missing snapshots: %#v", mutations[0])
+	}
+	explained, err := database.Mutation("intent-1")
+	if err != nil || explained.AssistantExcerpt != "Updating the schema" {
+		t.Fatalf("explain = %#v, %v", explained, err)
+	}
+	timeline, err := database.Timeline("@walkie", "", 10)
+	if err != nil || len(timeline) != 4 {
+		t.Fatalf("timeline = %#v, %v", timeline, err)
+	}
+	sessionEvents, err := database.SessionEvents("@walkie", 10)
+	if err != nil || len(sessionEvents) != 1 || sessionEvents[0].Summary != "Compacted schema work" {
+		t.Fatalf("session events = %#v, %v", sessionEvents, err)
+	}
+	who, err := database.WhoChanged("/repo/schema.ts", 10)
+	if err != nil || len(who.Mutations) != 1 || len(who.Collisions) != 1 {
+		t.Fatalf("who changed = %#v, %v", who, err)
+	}
+	why, err := database.Why("intent-1", 10)
+	if err != nil || why.Mutation.TurnID != "pi:session:7:turn:3" || len(why.Collisions) != 1 {
+		t.Fatalf("why = %#v, %v", why, err)
+	}
+	agent, err := database.AgentSummary("@walkie", 10)
+	if err != nil || len(agent.Mutations) != 1 || len(agent.SessionEvents) != 1 {
+		t.Fatalf("agent summary = %#v, %v", agent, err)
+	}
+	since, err := database.SinceCompaction("@walkie", 10)
+	if err != nil || since.Compaction == nil || since.Compaction.Summary != "Compacted schema work" {
+		t.Fatalf("since compaction = %#v, %v", since, err)
+	}
+	files, err := filepath.Glob(path + "*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		info, err := os.Stat(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("database file %s mode = %o", file, info.Mode().Perm())
+		}
+	}
+}

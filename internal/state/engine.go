@@ -148,6 +148,10 @@ func (e *Engine) apply(event protocol.Event) error {
 		e.globalSequence = max(e.globalSequence, message.GlobalSequence)
 		e.senderSequences[message.From] = max(e.senderSequences[message.From], message.SenderSequence)
 		e.recipientSequences[message.To] = max(e.recipientSequences[message.To], message.RecipientSequence)
+	case "session.event":
+		if _, err := decode[protocol.SessionEvent](event); err != nil {
+			return err
+		}
 	case "message.acked":
 		ack, err := decode[ackEvent](event)
 		if err != nil {
@@ -188,6 +192,7 @@ func (e *Engine) Register(actor protocol.Actor) (protocol.Actor, error) {
 	if actor.State == "" {
 		actor.State = "waiting"
 	}
+	actor = normalizeActorScope(actor)
 	if err := e.record("actor.upserted", actor); err != nil {
 		return protocol.Actor{}, err
 	}
@@ -217,6 +222,7 @@ func (e *Engine) Heartbeat(params protocol.HeartbeatParams) (protocol.Actor, err
 	if params.Generation != 0 {
 		actor.Generation = params.Generation
 	}
+	actor = normalizeActorScope(actor)
 	// Presence is lease-based and intentionally ephemeral. Journaling a fsynced
 	// heartbeat every two seconds would grow the log and serialize all clients
 	// behind disk latency; sessions re-register after daemon restart.
@@ -236,8 +242,8 @@ func (e *Engine) SetAlias(address, alias string) (protocol.Actor, error) {
 		return protocol.Actor{}, errors.New("alias is required")
 	}
 	for _, candidate := range e.actors {
-		if candidate.Address != address && candidate.Alias == alias && e.active(candidate) {
-			return protocol.Actor{}, fmt.Errorf("alias @%s is already active", alias)
+		if candidate.Address != address && candidate.Alias == alias && candidate.WorkspaceID == actor.WorkspaceID && e.active(candidate) {
+			return protocol.Actor{}, fmt.Errorf("alias @%s is already active in workspace %s", alias, actor.WorkspaceID)
 		}
 	}
 	actor.Alias = alias
@@ -252,43 +258,94 @@ func (e *Engine) active(actor protocol.Actor) bool {
 }
 
 func (e *Engine) Sessions(includeStale bool) []protocol.Actor {
+	return e.SessionsScoped(includeStale, protocol.ScopeFilter{})
+}
+
+func (e *Engine) SessionsScoped(includeStale bool, scope protocol.ScopeFilter) []protocol.Actor {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	actors := make([]protocol.Actor, 0, len(e.actors))
 	for _, actor := range e.actors {
-		if includeStale || e.active(actor) {
-			actors = append(actors, actor)
+		if !includeStale && !e.active(actor) {
+			continue
 		}
+		if scope.RepositoryID != "" && actor.RepositoryID != scope.RepositoryID {
+			continue
+		}
+		if scope.WorkspaceID != "" && actor.WorkspaceID != scope.WorkspaceID {
+			continue
+		}
+		if scope.Directory != "" && !underDirectory(actor.CWD, scope.Directory) && !e.actorTouchesDirectory(actor.Address, scope.Directory) {
+			continue
+		}
+		actors = append(actors, actor)
 	}
 	sort.Slice(actors, func(i, j int) bool { return actors[i].Address < actors[j].Address })
 	return actors
 }
 
-func (e *Engine) resolve(selector string) (protocol.Actor, error) {
+func (e *Engine) actorTouchesDirectory(address, directory string) bool {
+	for _, intent := range e.intents {
+		if intent.Actor != address || !e.intentRecent(intent) {
+			continue
+		}
+		for _, path := range intent.Paths {
+			if underDirectory(path, directory) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (e *Engine) resolve(selector, senderAddress string) (protocol.Actor, error) {
 	normalized := strings.TrimPrefix(strings.TrimSpace(selector), "@")
 	if actor, ok := e.actors[normalized]; ok {
 		return actor, nil // canonical addresses remain mailbox-addressable while stale
 	}
+	sender := e.actors[senderAddress]
 	var matches []protocol.Actor
 	for _, actor := range e.actors {
-		matched := actor.Alias == normalized || actor.SessionID == normalized
+		matched := actor.SessionID == normalized
 		if strings.HasPrefix(normalized, "change:") && actor.JJ != nil {
 			matched = strings.HasPrefix(actor.JJ.ChangeID, strings.TrimPrefix(normalized, "change:"))
-		}
-		if strings.HasPrefix(normalized, "git:") && actor.Git != nil {
+		} else if strings.HasPrefix(normalized, "git:") && actor.Git != nil {
 			matched = strings.HasPrefix(actor.Git.Head, strings.TrimPrefix(normalized, "git:"))
+		} else if actor.Alias == normalized {
+			matched = true
 		}
 		if matched && e.active(actor) {
 			matches = append(matches, actor)
+		}
+	}
+	if len(matches) > 1 && sender.WorkspaceID != "" {
+		workspace := filterActors(matches, func(actor protocol.Actor) bool { return actor.WorkspaceID == sender.WorkspaceID })
+		if len(workspace) > 0 {
+			matches = workspace
+		} else {
+			repository := filterActors(matches, func(actor protocol.Actor) bool { return actor.RepositoryID == sender.RepositoryID })
+			if len(repository) > 0 {
+				matches = repository
+			}
 		}
 	}
 	if len(matches) != 1 {
 		if len(matches) == 0 {
 			return protocol.Actor{}, fmt.Errorf("no addressable actor matches %q", selector)
 		}
-		return protocol.Actor{}, fmt.Errorf("selector %q matches multiple actors", selector)
+		return protocol.Actor{}, fmt.Errorf("selector %q matches multiple actors at the same authority scope", selector)
 	}
 	return matches[0], nil
+}
+
+func filterActors(values []protocol.Actor, keep func(protocol.Actor) bool) []protocol.Actor {
+	result := make([]protocol.Actor, 0, len(values))
+	for _, actor := range values {
+		if keep(actor) {
+			result = append(result, actor)
+		}
+	}
+	return result
 }
 
 func (e *Engine) nextMessage(from, to, kind, body string, params protocol.SendParams, collisionID string) protocol.Message {
@@ -325,7 +382,7 @@ func (e *Engine) Send(params protocol.SendParams) (protocol.Message, error) {
 	if _, ok := e.actors[params.From]; !ok {
 		return protocol.Message{}, fmt.Errorf("unknown sender %q", params.From)
 	}
-	target, err := e.resolve(params.To)
+	target, err := e.resolve(params.To, params.From)
 	if err != nil {
 		return protocol.Message{}, err
 	}
@@ -377,6 +434,7 @@ func (e *Engine) BeginIntent(intent protocol.Intent) ([]protocol.Collision, erro
 	if intent.ID == "" || intent.ToolCallID == "" || len(intent.Paths) == 0 {
 		return nil, errors.New("intent id, tool_call_id, and paths are required")
 	}
+	intent = normalizeIntentScope(intent)
 	if intent.StartedAt.IsZero() {
 		intent.StartedAt = e.now().UTC()
 	}
@@ -472,19 +530,45 @@ func (e *Engine) hasCollisionSignal(collisionID, recipient string) bool {
 	return false
 }
 
-func (e *Engine) EndIntent(id string) (protocol.Intent, error) {
+func (e *Engine) EndIntent(params protocol.IntentEndParams) (protocol.Intent, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	intent, ok := e.intents[id]
+	intent, ok := e.intents[params.IntentID]
 	if !ok {
-		return protocol.Intent{}, fmt.Errorf("unknown intent %q", id)
+		return protocol.Intent{}, fmt.Errorf("unknown intent %q", params.IntentID)
 	}
-	now := e.now().UTC()
-	intent.CompletedAt = &now
+	completedAt := e.now().UTC()
+	if params.CompletedAt != nil {
+		completedAt = params.CompletedAt.UTC()
+	}
+	intent.CompletedAt = &completedAt
+	intent.Success = &params.Success
+	intent.Error = strings.TrimSpace(params.Error)
+	intent.After = params.After
+	intent.GitAfter = params.GitAfter
+	intent.JJAfter = params.JJAfter
 	if err := e.record("intent.completed", intent); err != nil {
 		return protocol.Intent{}, err
 	}
 	return intent, nil
+}
+
+func (e *Engine) RecordSessionEvent(event protocol.SessionEvent) (protocol.SessionEvent, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.actors[event.Actor]; !ok {
+		return protocol.SessionEvent{}, fmt.Errorf("unknown actor %q", event.Actor)
+	}
+	if event.ID == "" || event.Type == "" {
+		return protocol.SessionEvent{}, errors.New("session event id and type are required")
+	}
+	if event.At.IsZero() {
+		event.At = e.now().UTC()
+	}
+	if err := e.record("session.event", event); err != nil {
+		return protocol.SessionEvent{}, err
+	}
+	return event, nil
 }
 
 func (e *Engine) Poll(actor string, limit int) ([]protocol.Message, error) {

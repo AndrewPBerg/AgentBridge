@@ -1,6 +1,14 @@
-import { resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { inferIntentContext, inferMutation } from "./intent";
+
+const roots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
 
 describe("Agent Bridge intent inference", () => {
   it("automatically infers direct edits without an agent declaration", () => {
@@ -9,6 +17,16 @@ describe("Agent Bridge intent inference", () => {
       operation: "edit",
       paths: [resolve("/repo/src/schema.ts")],
     });
+  });
+
+  it("preserves repository symlink paths instead of leaking real targets", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-bridge-intent-link-"));
+    roots.push(root);
+    const target = join(root, "secret");
+    const link = join(root, "repo-link");
+    await writeFile(target, "secret", "utf8");
+    await symlink(target, link);
+    expect(inferMutation({ toolName: "edit", input: { path: link } }, root)?.paths).toEqual([link]);
   });
 
   it("recognizes destructive restore commands conservatively", () => {

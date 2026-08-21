@@ -218,6 +218,8 @@ export function createMockContext(overrides: Partial<any> = {}) {
       confirm: vi.fn(),
       select: vi.fn(),
       input: vi.fn(),
+      editor: vi.fn(),
+      custom: vi.fn(),
     },
     sessionManager: {
       getBranch: vi.fn(() => []),

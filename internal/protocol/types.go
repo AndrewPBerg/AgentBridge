@@ -35,8 +35,11 @@ type GitContext struct {
 }
 
 type JJContext struct {
+	RepoPath      string `json:"repo_path,omitempty"`
+	WorkspaceName string `json:"workspace_name,omitempty"`
 	WorkspaceRoot string `json:"workspace_root"`
 	ChangeID      string `json:"change_id"`
+	CommitID      string `json:"commit_id,omitempty"`
 }
 
 type Actor struct {
@@ -49,6 +52,11 @@ type Actor struct {
 	PaneID           string      `json:"pane_id,omitempty"`
 	HerdrWorkspaceID string      `json:"herdr_workspace_id,omitempty"`
 	State            string      `json:"state"`
+	RepositoryID     string      `json:"repository_id"`
+	RepositoryRoot   string      `json:"repository_root"`
+	WorkspaceID      string      `json:"workspace_id"`
+	WorkspaceRoot    string      `json:"workspace_root"`
+	WorkspaceKind    string      `json:"workspace_kind"`
 	Git              *GitContext `json:"git,omitempty"`
 	JJ               *JJContext  `json:"jj,omitempty"`
 	Capabilities     []string    `json:"capabilities,omitempty"`
@@ -61,21 +69,45 @@ type IntentContext struct {
 	AssistantExcerpt string `json:"assistant_excerpt,omitempty"`
 }
 
+type FileSnapshot struct {
+	Path       string `json:"path"`
+	Exists     bool   `json:"exists"`
+	Kind       string `json:"kind,omitempty"`
+	SHA256     string `json:"sha256,omitempty"`
+	Size       int64  `json:"size,omitempty"`
+	ModifiedAt string `json:"modified_at,omitempty"`
+}
+
 type Intent struct {
-	ID           string        `json:"id"`
-	Actor        string        `json:"actor"`
-	ToolCallID   string        `json:"tool_call_id"`
-	Tool         string        `json:"tool"`
-	Operation    string        `json:"operation"`
-	Paths        []string      `json:"paths"`
-	CWD          string        `json:"cwd"`
-	WorkspaceKey string        `json:"workspace_key"`
-	Git          *GitContext   `json:"git,omitempty"`
-	JJ           *JJContext    `json:"jj,omitempty"`
-	Context      IntentContext `json:"context"`
-	StartedAt    time.Time     `json:"started_at"`
-	ExpiresAt    time.Time     `json:"expires_at"`
-	CompletedAt  *time.Time    `json:"completed_at,omitempty"`
+	ID                string         `json:"id"`
+	Actor             string         `json:"actor"`
+	SessionGeneration uint64         `json:"session_generation"`
+	TurnID            string         `json:"turn_id,omitempty"`
+	TurnIndex         *int           `json:"turn_index,omitempty"`
+	ToolCallID        string         `json:"tool_call_id"`
+	Tool              string         `json:"tool"`
+	Operation         string         `json:"operation"`
+	Paths             []string       `json:"paths"`
+	RelativePaths     []string       `json:"relative_paths,omitempty"`
+	CWD               string         `json:"cwd"`
+	RepositoryID      string         `json:"repository_id"`
+	RepositoryRoot    string         `json:"repository_root"`
+	WorkspaceID       string         `json:"workspace_id"`
+	WorkspaceRoot     string         `json:"workspace_root"`
+	WorkspaceKind     string         `json:"workspace_kind"`
+	WorkspaceKey      string         `json:"workspace_key"`
+	Git               *GitContext    `json:"git,omitempty"`
+	JJ                *JJContext     `json:"jj,omitempty"`
+	Context           IntentContext  `json:"context"`
+	Before            []FileSnapshot `json:"before,omitempty"`
+	After             []FileSnapshot `json:"after,omitempty"`
+	GitAfter          *GitContext    `json:"git_after,omitempty"`
+	JJAfter           *JJContext     `json:"jj_after,omitempty"`
+	Success           *bool          `json:"success,omitempty"`
+	Error             string         `json:"error,omitempty"`
+	StartedAt         time.Time      `json:"started_at"`
+	ExpiresAt         time.Time      `json:"expires_at"`
+	CompletedAt       *time.Time     `json:"completed_at,omitempty"`
 }
 
 type CollisionState string
@@ -130,6 +162,12 @@ type RegisterParams struct {
 	Actor Actor `json:"actor"`
 }
 
+type ScopeFilter struct {
+	RepositoryID string `json:"repository_id,omitempty"`
+	WorkspaceID  string `json:"workspace_id,omitempty"`
+	Directory    string `json:"directory,omitempty"`
+}
+
 type HeartbeatParams struct {
 	Address    string      `json:"address"`
 	State      string      `json:"state"`
@@ -163,7 +201,28 @@ type IntentBeginParams struct {
 }
 
 type IntentEndParams struct {
-	IntentID string `json:"intent_id"`
+	IntentID    string         `json:"intent_id"`
+	Success     bool           `json:"success"`
+	Error       string         `json:"error,omitempty"`
+	After       []FileSnapshot `json:"after,omitempty"`
+	GitAfter    *GitContext    `json:"git_after,omitempty"`
+	JJAfter     *JJContext     `json:"jj_after,omitempty"`
+	CompletedAt *time.Time     `json:"completed_at,omitempty"`
+}
+
+type SessionEvent struct {
+	ID                string          `json:"id"`
+	Actor             string          `json:"actor"`
+	SessionGeneration uint64          `json:"session_generation"`
+	Type              string          `json:"type"`
+	At                time.Time       `json:"at"`
+	TurnIndex         *int            `json:"turn_index,omitempty"`
+	Summary           string          `json:"summary,omitempty"`
+	Data              json.RawMessage `json:"data,omitempty"`
+}
+
+type SessionEventParams struct {
+	Event SessionEvent `json:"event"`
 }
 
 type TransitionParams struct {

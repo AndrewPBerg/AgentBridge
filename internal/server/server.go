@@ -13,12 +13,15 @@ import (
 	"time"
 
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
+	"github.com/AndrewPBerg/agent-bridge/internal/provenance"
 	"github.com/AndrewPBerg/agent-bridge/internal/state"
 )
 
 type Server struct {
-	engine *state.Engine
-	path   string
+	engine     *state.Engine
+	provenance *provenance.DB
+	projection *provenance.ProjectingAppender
+	path       string
 
 	mu          sync.Mutex
 	listener    net.Listener
@@ -28,7 +31,22 @@ type Server struct {
 }
 
 func New(engine *state.Engine, socketPath string) *Server {
-	return &Server{engine: engine, path: socketPath, connections: make(map[net.Conn]struct{})}
+	return NewWithProvenance(engine, nil, socketPath)
+}
+
+func NewWithProvenance(
+	engine *state.Engine,
+	database *provenance.DB,
+	socketPath string,
+	projection ...*provenance.ProjectingAppender,
+) *Server {
+	var projector *provenance.ProjectingAppender
+	if len(projection) > 0 {
+		projector = projection[0]
+	}
+	return &Server{
+		engine: engine, provenance: database, projection: projector, path: socketPath, connections: make(map[net.Conn]struct{}),
+	}
 }
 
 func (s *Server) Serve(ctx context.Context) error {
@@ -143,6 +161,18 @@ func failure(id, code string, err error) protocol.Response {
 	return protocol.Response{ID: id, Error: &protocol.RPCError{Code: code, Message: err.Error()}}
 }
 
+func (s *Server) waitForProvenance() error {
+	if s.projection == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.projection.WaitForCurrent(ctx); err != nil {
+		return fmt.Errorf("provenance projection has not caught up: %w (health: %+v)", err, s.projection.Health())
+	}
+	return nil
+}
+
 func (s *Server) dispatch(request protocol.Request) protocol.Response {
 	switch request.Method {
 	case "ping":
@@ -188,12 +218,18 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 		return success(request.ID, actor)
 	case "sessions.list":
 		value, err := params[struct {
-			IncludeStale bool `json:"include_stale"`
+			IncludeStale bool   `json:"include_stale"`
+			RepositoryID string `json:"repository_id"`
+			WorkspaceID  string `json:"workspace_id"`
+			Directory    string `json:"directory"`
 		}](request)
 		if err != nil {
 			return failure(request.ID, "invalid_params", err)
 		}
-		return success(request.ID, map[string]any{"actors": s.engine.Sessions(value.IncludeStale)})
+		actors := s.engine.SessionsScoped(value.IncludeStale, protocol.ScopeFilter{
+			RepositoryID: value.RepositoryID, WorkspaceID: value.WorkspaceID, Directory: value.Directory,
+		})
+		return success(request.ID, map[string]any{"actors": actors})
 	case "message.send":
 		value, err := params[protocol.SendParams](request)
 		if err != nil {
@@ -238,11 +274,233 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 		if err != nil {
 			return failure(request.ID, "invalid_params", err)
 		}
-		intent, err := s.engine.EndIntent(value.IntentID)
+		intent, err := s.engine.EndIntent(value)
 		if err != nil {
 			return failure(request.ID, "intent_failed", err)
 		}
 		return success(request.ID, intent)
+	case "session.event":
+		value, err := params[protocol.SessionEventParams](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		event, err := s.engine.RecordSessionEvent(value.Event)
+		if err != nil {
+			return failure(request.ID, "session_event_failed", err)
+		}
+		return success(request.ID, event)
+	case "provenance.scopes":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		scopes, err := s.provenance.Scopes()
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		return success(request.ID, scopes)
+	case "provenance.status":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		status, err := s.provenance.Status()
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		var health any
+		if s.projection != nil {
+			health = s.projection.Health()
+		}
+		return success(request.ID, map[string]any{"database": status, "projection": health})
+	case "provenance.who_changed":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		value, err := params[struct {
+			Path  string `json:"path"`
+			Limit int    `json:"limit"`
+		}](request)
+		if err != nil || value.Path == "" {
+			if err == nil {
+				err = errors.New("path is required")
+			}
+			return failure(request.ID, "invalid_params", err)
+		}
+		answer, err := s.provenance.WhoChanged(value.Path, value.Limit)
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		return success(request.ID, answer)
+	case "provenance.why":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		value, err := params[struct {
+			ID    string `json:"id"`
+			Limit int    `json:"limit"`
+		}](request)
+		if err != nil || value.ID == "" {
+			if err == nil {
+				err = errors.New("mutation id is required")
+			}
+			return failure(request.ID, "invalid_params", err)
+		}
+		answer, err := s.provenance.Why(value.ID, value.Limit)
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		return success(request.ID, answer)
+	case "provenance.agent":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		value, err := params[struct {
+			Actor        string `json:"actor"`
+			RepositoryID string `json:"repository_id"`
+			WorkspaceID  string `json:"workspace_id"`
+			Limit        int    `json:"limit"`
+		}](request)
+		if err != nil || value.Actor == "" {
+			if err == nil {
+				err = errors.New("actor is required")
+			}
+			return failure(request.ID, "invalid_params", err)
+		}
+		answer, err := s.provenance.AgentSummary(value.Actor, value.Limit, provenance.ActorScope{
+			RepositoryID: value.RepositoryID, WorkspaceID: value.WorkspaceID,
+		})
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		return success(request.ID, answer)
+	case "provenance.since_compaction":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		value, err := params[struct {
+			Actor        string `json:"actor"`
+			RepositoryID string `json:"repository_id"`
+			WorkspaceID  string `json:"workspace_id"`
+			Limit        int    `json:"limit"`
+		}](request)
+		if err != nil || value.Actor == "" {
+			if err == nil {
+				err = errors.New("actor is required")
+			}
+			return failure(request.ID, "invalid_params", err)
+		}
+		answer, err := s.provenance.SinceCompaction(value.Actor, value.Limit, provenance.ActorScope{
+			RepositoryID: value.RepositoryID, WorkspaceID: value.WorkspaceID,
+		})
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		return success(request.ID, answer)
+	case "provenance.mutations":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		value, err := params[struct {
+			Actor        string `json:"actor"`
+			Path         string `json:"path"`
+			RepositoryID string `json:"repository_id"`
+			WorkspaceID  string `json:"workspace_id"`
+			Limit        int    `json:"limit"`
+			Failed       bool   `json:"failed"`
+		}](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		records, err := s.provenance.ListMutations(provenance.MutationFilter{
+			Actor: value.Actor, Path: value.Path, RepositoryID: value.RepositoryID, WorkspaceID: value.WorkspaceID,
+			Limit: value.Limit, Failed: value.Failed,
+		})
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		return success(request.ID, map[string]any{"mutations": records})
+	case "provenance.explain":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		value, err := params[struct {
+			ID string `json:"id"`
+		}](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		record, err := s.provenance.Mutation(value.ID)
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		return success(request.ID, record)
+	case "provenance.timeline":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		value, err := params[struct {
+			Actor        string `json:"actor"`
+			RepositoryID string `json:"repository_id"`
+			WorkspaceID  string `json:"workspace_id"`
+			Type         string `json:"type"`
+			Limit        int    `json:"limit"`
+		}](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		records, err := s.provenance.Timeline(value.Actor, value.Type, value.Limit, provenance.ActorScope{
+			RepositoryID: value.RepositoryID, WorkspaceID: value.WorkspaceID,
+		})
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		return success(request.ID, map[string]any{"events": records})
+	case "provenance.session":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		value, err := params[struct {
+			Actor        string `json:"actor"`
+			RepositoryID string `json:"repository_id"`
+			WorkspaceID  string `json:"workspace_id"`
+			Limit        int    `json:"limit"`
+		}](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		records, err := s.provenance.SessionEvents(value.Actor, value.Limit, provenance.ActorScope{
+			RepositoryID: value.RepositoryID, WorkspaceID: value.WorkspaceID,
+		})
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		return success(request.ID, map[string]any{"session_events": records})
 	case "collision.transition":
 		value, err := params[protocol.TransitionParams](request)
 		if err != nil {

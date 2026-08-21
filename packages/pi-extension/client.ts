@@ -10,8 +10,7 @@ type Response<T> = { id: string; result?: T; error?: RPCError };
 
 export function defaultSocketPath(): string {
   if (process.env.AGENT_BRIDGE_SOCKET) return process.env.AGENT_BRIDGE_SOCKET;
-  const state =
-    process.env.AGENT_BRIDGE_STATE_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "agent-bridge");
+  const state = process.env.AGENT_BRIDGE_STATE_DIR || join(homedir(), ".agent-bridge");
   return join(state, "bridge.sock");
 }
 

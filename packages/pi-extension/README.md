@@ -30,21 +30,31 @@ The extension starts `agent-bridge serve` automatically when the socket is unava
 ## Commands
 
 ```text
-/bridge sessions
-/bridge name walkie
-/bridge send @talkie I will finish schema.ts first.
+/bus talk                              # modal recipient picker + composer
+/bus talk @talkie                      # modal composer, recipient preselected
+/bus talk @walkie,@talkie Message      # immediate multi-recipient send
+/bus talk --repo Message               # immediate send to active repo peers
+/bus list
+/bus name walkie
+/bus status
 ```
+
+The talk overlay supports multi-select and an `All in this repo` recipient. It shows harness, state, cwd, and Git/JJ identity before sending.
+
+`/bridge` remains as a deprecated compatibility alias (`sessions→list`, `send→talk`).
 
 ## Environment
 
 ```text
 AGENT_BRIDGE_BIN        daemon binary, default: agent-bridge
 AGENT_BRIDGE_SOCKET     explicit Unix socket path
-AGENT_BRIDGE_STATE_DIR  state directory override
+AGENT_BRIDGE_STATE_DIR  state directory override (default: ~/.agent-bridge)
 ```
 
 ## Prototype boundary
 
 Git repositories are first-class: the adapter reports repository/worktree roots, git/common directories, branch or detached HEAD, and supports `@git:<HEAD prefix>` selectors. Co-located JJ metadata is layered on top when available.
+
+Mutation provenance records before/after metadata and SHA-256 hashes (not file contents), plus turn boundaries and compaction summaries, in the daemon's local Turso read model.
 
 Attribution is exact for Pi's direct `edit`/`write` tools and conservative for recognized shell operations (`jj restore`, `git restore`, `git checkout --`, `rm`, `mv`, and `cp`). Arbitrary shell scripts and external editors remain best-effort because filesystem events do not carry a reliable agent identity.

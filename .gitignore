@@ -1,4 +1,5 @@
 /agent-bridge
+/.yosoi/
 /packages/pi-extension/node_modules/
 *.log
 *.sock

@@ -1,4 +1,3 @@
-import { realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import type { IntentContext, MutationIntent } from "./protocol";
 
@@ -18,12 +17,9 @@ const BASH_OPERATIONS: Array<{ prefix: string[]; operation: MutationIntent["oper
 ];
 
 function canonicalPath(cwd: string, path: string): string {
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
-  try {
-    return realpathSync(absolute);
-  } catch {
-    return absolute;
-  }
+  // Never realpath here: following a repository symlink could leak the target
+  // path and cause provenance hashing outside the workspace trust boundary.
+  return isAbsolute(path) ? resolve(path) : resolve(cwd, path);
 }
 
 function shellWords(command: string): string[] {
