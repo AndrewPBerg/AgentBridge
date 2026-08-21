@@ -1,0 +1,4 @@
+/agent-bridge
+/packages/pi-extension/node_modules/
+*.log
+*.sock
