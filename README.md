@@ -135,6 +135,6 @@ Pi exposes the concise client command:
 
 `/bridge` remains a deprecated compatibility alias.
 
-## Next harness adapters
+## Harness adapters
 
-The Pi adapter is operational. Codex, OpenCode, and Claude Code should use the same protocol through thin plugins/hooks plus skills. The daemon remains the only owner of queues, collision state, and durable identity.
+The Pi adapter is operational and remains the active product focus. Cross-harness adapters, including Codex, are intentionally deferred while provenance, Turso sync, and Pi workflows mature. The daemon remains the only owner of queues, collision state, and durable identity.

@@ -14,7 +14,7 @@ The TypeScript extension has direct lifecycle and tool hooks, context/session ac
 
 ## Codex CLI
 
-Status: viable; adapter spike next.
+Status: technically viable, intentionally deferred from the current roadmap.
 
 The installed Codex exposes stable `hooks` and `plugins` features. Its experimental app-server has a generated typed protocol and Unix/WebSocket transports. Relevant methods and notifications include:
 
@@ -30,7 +30,7 @@ hook/started, hook/completed
 item/reasoning/summary*
 ```
 
-This is enough for actor identity, turn/session indexing, file and command observation, mailbox injection, steer, and interrupt. The preferred spike is an app-server client because it provides structured events and control; hook scripts can provide a lighter fallback for ordinary interactive CLI sessions.
+This is enough for actor identity, turn/session indexing, file and command observation, mailbox injection, steer, and interrupt. If cross-harness work resumes later, an app-server client is the preferred spike because it provides structured events and control; hook scripts can provide a lighter fallback for ordinary interactive CLI sessions.
 
 Do not depend on unstable raw reasoning events. Index explicit reasoning summaries only when Codex emits them.
 
