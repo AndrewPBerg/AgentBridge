@@ -32,7 +32,7 @@ Goals:
 - [x] Remove stale terminology, compatibility residue, and undocumented prototype assumptions.
 - [x] Make source, installed adapter, installed skill, binary, and runtime versions inspectable.
 - [x] Add a deployment/version or `doctor` workflow that detects drift.
-- [ ] Keep the daemon, Pi adapter, and skill tests green under the strict quality gate.
+- [x] Keep the daemon, Pi adapter, and skill tests green under the strict quality gate.
 - [x] Preserve the product boundary documented in [the retrospective](retrospective.md).
 
 Exit condition: a contributor can identify, test, install, and verify the canonical daemon and Pi adapter without guessing which copy is authoritative.

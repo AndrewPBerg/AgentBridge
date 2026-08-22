@@ -218,16 +218,16 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 		return success(request.ID, actor)
 	case "sessions.list":
 		value, err := params[struct {
-			IncludeStale bool   `json:"include_stale"`
-			RepositoryID string `json:"repository_id"`
-			WorkspaceID  string `json:"workspace_id"`
-			Directory    string `json:"directory"`
+			IncludeStale   bool   `json:"include_stale"`
+			RepositoryUUID string `json:"repository_uuid"`
+			WorkspaceUUID  string `json:"workspace_uuid"`
+			Directory      string `json:"directory"`
 		}](request)
 		if err != nil {
 			return failure(request.ID, "invalid_params", err)
 		}
 		actors := s.engine.SessionsScoped(value.IncludeStale, protocol.ScopeFilter{
-			RepositoryID: value.RepositoryID, WorkspaceID: value.WorkspaceID, Directory: value.Directory,
+			RepositoryUUID: value.RepositoryUUID, WorkspaceUUID: value.WorkspaceUUID, Directory: value.Directory,
 		})
 		return success(request.ID, map[string]any{"actors": actors})
 	case "message.send":
@@ -289,6 +289,28 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 			return failure(request.ID, "session_event_failed", err)
 		}
 		return success(request.ID, event)
+	case "test.result":
+		value, err := params[struct {
+			Result protocol.TestResult `json:"result"`
+		}](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		result, err := s.engine.RecordTestResult(value.Result)
+		if err != nil {
+			return failure(request.ID, "test_result_failed", err)
+		}
+		return success(request.ID, result)
+	case "checkpoint.request":
+		value, err := params[protocol.CheckpointRequestParams](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		checkpoint, err := s.engine.RequestCheckpoint(value.Request)
+		if err != nil {
+			return failure(request.ID, "checkpoint_request_failed", err)
+		}
+		return success(request.ID, checkpoint)
 	case "provenance.scopes":
 		if s.provenance == nil {
 			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
@@ -301,6 +323,26 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 			return failure(request.ID, "provenance_query_failed", err)
 		}
 		return success(request.ID, scopes)
+	case "provenance.snapshot":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		value, err := params[struct {
+			Path string `json:"path"`
+		}](request)
+		if err != nil || value.Path == "" {
+			if err == nil {
+				err = errors.New("snapshot path is required")
+			}
+			return failure(request.ID, "invalid_params", err)
+		}
+		if err := s.provenance.Snapshot(value.Path); err != nil {
+			return failure(request.ID, "provenance_snapshot_failed", err)
+		}
+		return success(request.ID, map[string]any{"path": value.Path})
 	case "provenance.status":
 		if s.provenance == nil {
 			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
@@ -366,10 +408,10 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 			return failure(request.ID, "provenance_lagging", err)
 		}
 		value, err := params[struct {
-			Actor        string `json:"actor"`
-			RepositoryID string `json:"repository_id"`
-			WorkspaceID  string `json:"workspace_id"`
-			Limit        int    `json:"limit"`
+			Actor          string `json:"actor"`
+			RepositoryUUID string `json:"repository_uuid"`
+			WorkspaceUUID  string `json:"workspace_uuid"`
+			Limit          int    `json:"limit"`
 		}](request)
 		if err != nil || value.Actor == "" {
 			if err == nil {
@@ -378,7 +420,7 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 			return failure(request.ID, "invalid_params", err)
 		}
 		answer, err := s.provenance.AgentSummary(value.Actor, value.Limit, provenance.ActorScope{
-			RepositoryID: value.RepositoryID, WorkspaceID: value.WorkspaceID,
+			RepositoryUUID: value.RepositoryUUID, WorkspaceUUID: value.WorkspaceUUID,
 		})
 		if err != nil {
 			return failure(request.ID, "provenance_query_failed", err)
@@ -392,10 +434,10 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 			return failure(request.ID, "provenance_lagging", err)
 		}
 		value, err := params[struct {
-			Actor        string `json:"actor"`
-			RepositoryID string `json:"repository_id"`
-			WorkspaceID  string `json:"workspace_id"`
-			Limit        int    `json:"limit"`
+			Actor          string `json:"actor"`
+			RepositoryUUID string `json:"repository_uuid"`
+			WorkspaceUUID  string `json:"workspace_uuid"`
+			Limit          int    `json:"limit"`
 		}](request)
 		if err != nil || value.Actor == "" {
 			if err == nil {
@@ -404,7 +446,7 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 			return failure(request.ID, "invalid_params", err)
 		}
 		answer, err := s.provenance.SinceCompaction(value.Actor, value.Limit, provenance.ActorScope{
-			RepositoryID: value.RepositoryID, WorkspaceID: value.WorkspaceID,
+			RepositoryUUID: value.RepositoryUUID, WorkspaceUUID: value.WorkspaceUUID,
 		})
 		if err != nil {
 			return failure(request.ID, "provenance_query_failed", err)
@@ -418,18 +460,18 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 			return failure(request.ID, "provenance_lagging", err)
 		}
 		value, err := params[struct {
-			Actor        string `json:"actor"`
-			Path         string `json:"path"`
-			RepositoryID string `json:"repository_id"`
-			WorkspaceID  string `json:"workspace_id"`
-			Limit        int    `json:"limit"`
-			Failed       bool   `json:"failed"`
+			Actor          string `json:"actor"`
+			Path           string `json:"path"`
+			RepositoryUUID string `json:"repository_uuid"`
+			WorkspaceUUID  string `json:"workspace_uuid"`
+			Limit          int    `json:"limit"`
+			Failed         bool   `json:"failed"`
 		}](request)
 		if err != nil {
 			return failure(request.ID, "invalid_params", err)
 		}
 		records, err := s.provenance.ListMutations(provenance.MutationFilter{
-			Actor: value.Actor, Path: value.Path, RepositoryID: value.RepositoryID, WorkspaceID: value.WorkspaceID,
+			Actor: value.Actor, Path: value.Path, RepositoryUUID: value.RepositoryUUID, WorkspaceUUID: value.WorkspaceUUID,
 			Limit: value.Limit, Failed: value.Failed,
 		})
 		if err != nil {
@@ -462,17 +504,17 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 			return failure(request.ID, "provenance_lagging", err)
 		}
 		value, err := params[struct {
-			Actor        string `json:"actor"`
-			RepositoryID string `json:"repository_id"`
-			WorkspaceID  string `json:"workspace_id"`
-			Type         string `json:"type"`
-			Limit        int    `json:"limit"`
+			Actor          string `json:"actor"`
+			RepositoryUUID string `json:"repository_uuid"`
+			WorkspaceUUID  string `json:"workspace_uuid"`
+			Type           string `json:"type"`
+			Limit          int    `json:"limit"`
 		}](request)
 		if err != nil {
 			return failure(request.ID, "invalid_params", err)
 		}
 		records, err := s.provenance.Timeline(value.Actor, value.Type, value.Limit, provenance.ActorScope{
-			RepositoryID: value.RepositoryID, WorkspaceID: value.WorkspaceID,
+			RepositoryUUID: value.RepositoryUUID, WorkspaceUUID: value.WorkspaceUUID,
 		})
 		if err != nil {
 			return failure(request.ID, "provenance_query_failed", err)
@@ -486,16 +528,16 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 			return failure(request.ID, "provenance_lagging", err)
 		}
 		value, err := params[struct {
-			Actor        string `json:"actor"`
-			RepositoryID string `json:"repository_id"`
-			WorkspaceID  string `json:"workspace_id"`
-			Limit        int    `json:"limit"`
+			Actor          string `json:"actor"`
+			RepositoryUUID string `json:"repository_uuid"`
+			WorkspaceUUID  string `json:"workspace_uuid"`
+			Limit          int    `json:"limit"`
 		}](request)
 		if err != nil {
 			return failure(request.ID, "invalid_params", err)
 		}
 		records, err := s.provenance.SessionEvents(value.Actor, value.Limit, provenance.ActorScope{
-			RepositoryID: value.RepositoryID, WorkspaceID: value.WorkspaceID,
+			RepositoryUUID: value.RepositoryUUID, WorkspaceUUID: value.WorkspaceUUID,
 		})
 		if err != nil {
 			return failure(request.ID, "provenance_query_failed", err)

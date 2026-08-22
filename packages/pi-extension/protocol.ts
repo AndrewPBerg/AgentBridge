@@ -19,20 +19,20 @@ export type JjContext = {
 };
 
 export type ActorRecord = {
-  address: `pi:${string}`;
+  address: string;
   harness: "pi";
-  session_id: string;
+  session_uuid: string;
   session_file?: string;
   alias?: string;
   cwd: string;
   pane_id?: string;
   herdr_workspace_id?: string;
   state: "active" | "waiting" | "dead";
-  repository_id?: string;
-  repository_root?: string;
-  workspace_id?: string;
-  workspace_root?: string;
-  workspace_kind?: string;
+  repository_uuid?: string;
+  repository_root?: string | null;
+  workspace_uuid?: string;
+  workspace_root?: string | null;
+  workspace_kind?: string | null;
   git?: GitContext;
   jj?: JjContext;
   capabilities: string[];
@@ -66,11 +66,11 @@ export type MutationIntent = {
   paths: string[];
   relative_paths?: string[];
   cwd: string;
-  repository_id?: string;
-  repository_root?: string;
-  workspace_id?: string;
-  workspace_root?: string;
-  workspace_kind?: string;
+  repository_uuid?: string;
+  repository_root?: string | null;
+  workspace_uuid?: string;
+  workspace_root?: string | null;
+  workspace_kind?: string | null;
   workspace_key: string;
   git?: GitContext;
   jj?: JjContext;
@@ -95,6 +95,47 @@ export type SessionEvent = {
   turn_index?: number;
   summary?: string;
   data?: Record<string, unknown>;
+};
+
+export type TestResult = {
+  id: string;
+  actor: ActorRecord["address"];
+  session_generation: number;
+  turn_id?: string;
+  turn_index?: number;
+  tool_call_id?: string;
+  command: string;
+  cwd: string;
+  exit_code?: number;
+  started_at: string;
+  completed_at: string;
+  duration_ms?: number;
+  output_excerpt?: string;
+  output_sha256?: string;
+  output_bytes?: number;
+  output_truncated?: boolean;
+  repository_uuid: string;
+  workspace_uuid: string;
+  git?: GitContext;
+  jj?: JjContext;
+};
+
+export type CheckpointRequest = {
+  id: string;
+  actor: ActorRecord["address"];
+  session_generation: number;
+  repository_uuid: string;
+  workspace_uuid: string;
+  checkpoint_kind: string;
+  journal_start_sequence: number;
+  journal_end_sequence: number;
+  boundary_event_id?: string;
+  boundary_type?: string;
+  turn_id?: string;
+  turn_index?: number;
+  compaction_event_id?: string;
+  git?: GitContext;
+  jj?: JjContext;
 };
 
 export type CollisionState = "open" | "negotiating" | "yielded" | "resolved";

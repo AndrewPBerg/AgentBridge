@@ -9,7 +9,7 @@ function actor(session = "sender"): ActorRecord {
   return {
     address: `pi:${session}`,
     harness: "pi",
-    session_id: session,
+    session_uuid: session,
     cwd: "/repo",
     state: "active",
     capabilities: [],
@@ -115,6 +115,11 @@ describe("Go Agent Bridge adapter", () => {
           data: { reason: "threshold", tokens_before: 42_000 },
         }),
       }),
+    );
+    await pi.events.get("agent_settled")?.[0]?.({}, ctx);
+    expect(client.call).toHaveBeenCalledWith(
+      "session.event",
+      expect.objectContaining({ event: expect.objectContaining({ type: "agent.settled" }) }),
     );
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });

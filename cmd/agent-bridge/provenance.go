@@ -11,7 +11,14 @@ import (
 
 func provenanceCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: agent-bridge provenance <status|who-changed|why|agent|since-compaction|mutations|explain|timeline|session>")
+		return errors.New("usage: agent-bridge provenance <status|snapshot|who-changed|why|agent|since-compaction|mutations|explain|timeline|session>")
+	}
+	switch args[0] {
+	case "snapshot":
+		if len(args) != 2 {
+			return errors.New("usage: agent-bridge provenance snapshot <absolute-output-path>")
+		}
+		return callAndPrint("provenance.snapshot", map[string]any{"path": args[1]})
 	}
 	switch args[0] {
 	case "status":
@@ -48,7 +55,7 @@ func provenanceCommand(args []string) error {
 			return errors.New("usage: agent-bridge provenance agent [--limit N] <actor-or-alias>")
 		}
 		return callAndPrint("provenance.agent", map[string]any{
-			"actor": flags.Args()[0], "repository_id": *repositoryID, "workspace_id": *workspaceID, "limit": *limit,
+			"actor": flags.Args()[0], "repository_uuid": *repositoryID, "workspace_uuid": *workspaceID, "limit": *limit,
 		})
 	case "since-compaction":
 		flags := flag.NewFlagSet("provenance since-compaction", flag.ContinueOnError)
@@ -62,7 +69,7 @@ func provenanceCommand(args []string) error {
 			return errors.New("usage: agent-bridge provenance since-compaction [--limit N] <actor-or-alias>")
 		}
 		return callAndPrint("provenance.since_compaction", map[string]any{
-			"actor": flags.Args()[0], "repository_id": *repositoryID, "workspace_id": *workspaceID, "limit": *limit,
+			"actor": flags.Args()[0], "repository_uuid": *repositoryID, "workspace_uuid": *workspaceID, "limit": *limit,
 		})
 	case "mutations":
 		flags := flag.NewFlagSet("provenance mutations", flag.ContinueOnError)
@@ -76,7 +83,7 @@ func provenanceCommand(args []string) error {
 			return err
 		}
 		return callAndPrint("provenance.mutations", map[string]any{
-			"actor": *actor, "path": *path, "repository_id": *repositoryID, "workspace_id": *workspaceID,
+			"actor": *actor, "path": *path, "repository_uuid": *repositoryID, "workspace_uuid": *workspaceID,
 			"limit": *limit, "failed": *failed,
 		})
 	case "explain":
@@ -95,7 +102,7 @@ func provenanceCommand(args []string) error {
 			return err
 		}
 		return callAndPrint("provenance.timeline", map[string]any{
-			"actor": *actor, "repository_id": *repositoryID, "workspace_id": *workspaceID, "type": *eventType, "limit": *limit,
+			"actor": *actor, "repository_uuid": *repositoryID, "workspace_uuid": *workspaceID, "type": *eventType, "limit": *limit,
 		})
 	case "session":
 		flags := flag.NewFlagSet("provenance session", flag.ContinueOnError)
@@ -110,7 +117,7 @@ func provenanceCommand(args []string) error {
 			return errors.New("provenance session requires --actor")
 		}
 		return callAndPrint("provenance.session", map[string]any{
-			"actor": *actor, "repository_id": *repositoryID, "workspace_id": *workspaceID, "limit": *limit,
+			"actor": *actor, "repository_uuid": *repositoryID, "workspace_uuid": *workspaceID, "limit": *limit,
 		})
 	default:
 		return fmt.Errorf("unknown provenance command %q", args[0])

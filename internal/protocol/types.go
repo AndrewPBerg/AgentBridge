@@ -45,16 +45,16 @@ type JJContext struct {
 type Actor struct {
 	Address          string      `json:"address"`
 	Harness          string      `json:"harness"`
-	SessionID        string      `json:"session_id"`
+	SessionUUID      string      `json:"session_uuid"`
 	SessionFile      string      `json:"session_file,omitempty"`
 	Alias            string      `json:"alias,omitempty"`
 	CWD              string      `json:"cwd"`
 	PaneID           string      `json:"pane_id,omitempty"`
 	HerdrWorkspaceID string      `json:"herdr_workspace_id,omitempty"`
 	State            string      `json:"state"`
-	RepositoryID     string      `json:"repository_id"`
+	RepositoryUUID   string      `json:"repository_uuid"`
 	RepositoryRoot   string      `json:"repository_root"`
-	WorkspaceID      string      `json:"workspace_id"`
+	WorkspaceUUID    string      `json:"workspace_uuid"`
 	WorkspaceRoot    string      `json:"workspace_root"`
 	WorkspaceKind    string      `json:"workspace_kind"`
 	Git              *GitContext `json:"git,omitempty"`
@@ -63,6 +63,30 @@ type Actor struct {
 	Generation       uint64      `json:"generation"`
 	StartedAt        time.Time   `json:"started_at"`
 	HeartbeatAt      time.Time   `json:"heartbeat_at"`
+}
+
+// MarshalJSON keeps the default repository workspace explicit as null so
+// consumers can inherit repository_root and repository kind.
+func (actor Actor) MarshalJSON() ([]byte, error) {
+	type alias Actor
+	encoded, err := json.Marshal(alias(actor))
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return nil, err
+	}
+	if actor.RepositoryRoot == "" {
+		fields["repository_root"] = json.RawMessage("null")
+	}
+	if actor.WorkspaceRoot == "" {
+		fields["workspace_root"] = json.RawMessage("null")
+	}
+	if actor.WorkspaceKind == "" {
+		fields["workspace_kind"] = json.RawMessage("null")
+	}
+	return json.Marshal(fields)
 }
 
 type IntentContext struct {
@@ -90,9 +114,9 @@ type Intent struct {
 	Paths             []string       `json:"paths"`
 	RelativePaths     []string       `json:"relative_paths,omitempty"`
 	CWD               string         `json:"cwd"`
-	RepositoryID      string         `json:"repository_id"`
+	RepositoryUUID    string         `json:"repository_uuid"`
 	RepositoryRoot    string         `json:"repository_root"`
-	WorkspaceID       string         `json:"workspace_id"`
+	WorkspaceUUID     string         `json:"workspace_uuid"`
 	WorkspaceRoot     string         `json:"workspace_root"`
 	WorkspaceKind     string         `json:"workspace_kind"`
 	WorkspaceKey      string         `json:"workspace_key"`
@@ -108,6 +132,29 @@ type Intent struct {
 	StartedAt         time.Time      `json:"started_at"`
 	ExpiresAt         time.Time      `json:"expires_at"`
 	CompletedAt       *time.Time     `json:"completed_at,omitempty"`
+}
+
+// MarshalJSON applies the same sparse workspace representation to intents.
+func (intent Intent) MarshalJSON() ([]byte, error) {
+	type alias Intent
+	encoded, err := json.Marshal(alias(intent))
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return nil, err
+	}
+	if intent.RepositoryRoot == "" {
+		fields["repository_root"] = json.RawMessage("null")
+	}
+	if intent.WorkspaceRoot == "" {
+		fields["workspace_root"] = json.RawMessage("null")
+	}
+	if intent.WorkspaceKind == "" {
+		fields["workspace_kind"] = json.RawMessage("null")
+	}
+	return json.Marshal(fields)
 }
 
 type CollisionState string
@@ -132,6 +179,8 @@ type Collision struct {
 	UpdatedAt  time.Time      `json:"updated_at"`
 	ResolvedAt *time.Time     `json:"resolved_at,omitempty"`
 	Resolution string         `json:"resolution,omitempty"`
+	ResolvedBy string         `json:"resolved_by,omitempty"`
+	DeadActor  string         `json:"dead_actor,omitempty"`
 }
 
 type Message struct {
@@ -163,9 +212,9 @@ type RegisterParams struct {
 }
 
 type ScopeFilter struct {
-	RepositoryID string `json:"repository_id,omitempty"`
-	WorkspaceID  string `json:"workspace_id,omitempty"`
-	Directory    string `json:"directory,omitempty"`
+	RepositoryUUID string `json:"repository_uuid,omitempty"`
+	WorkspaceUUID  string `json:"workspace_uuid,omitempty"`
+	Directory      string `json:"directory,omitempty"`
 }
 
 type HeartbeatParams struct {
@@ -223,6 +272,51 @@ type SessionEvent struct {
 
 type SessionEventParams struct {
 	Event SessionEvent `json:"event"`
+}
+
+type TestResult struct {
+	ID                string      `json:"id"`
+	Actor             string      `json:"actor"`
+	SessionGeneration uint64      `json:"session_generation"`
+	TurnID            string      `json:"turn_id,omitempty"`
+	TurnIndex         *int        `json:"turn_index,omitempty"`
+	ToolCallID        string      `json:"tool_call_id,omitempty"`
+	Command           string      `json:"command"`
+	CWD               string      `json:"cwd"`
+	ExitCode          *int        `json:"exit_code,omitempty"`
+	StartedAt         time.Time   `json:"started_at"`
+	CompletedAt       time.Time   `json:"completed_at"`
+	DurationMillis    int64       `json:"duration_ms,omitempty"`
+	OutputExcerpt     string      `json:"output_excerpt,omitempty"`
+	OutputSHA256      string      `json:"output_sha256,omitempty"`
+	OutputBytes       int64       `json:"output_bytes,omitempty"`
+	OutputTruncated   bool        `json:"output_truncated,omitempty"`
+	RepositoryUUID    string      `json:"repository_uuid"`
+	WorkspaceUUID     string      `json:"workspace_uuid"`
+	Git               *GitContext `json:"git,omitempty"`
+	JJ                *JJContext  `json:"jj,omitempty"`
+}
+
+type CheckpointRequest struct {
+	ID                string      `json:"id"`
+	Actor             string      `json:"actor"`
+	SessionGeneration uint64      `json:"session_generation"`
+	RepositoryUUID    string      `json:"repository_uuid"`
+	WorkspaceUUID     string      `json:"workspace_uuid"`
+	CheckpointKind    string      `json:"checkpoint_kind"`
+	JournalStart      uint64      `json:"journal_start_sequence"`
+	JournalEnd        uint64      `json:"journal_end_sequence"`
+	BoundaryEventID   string      `json:"boundary_event_id,omitempty"`
+	BoundaryType      string      `json:"boundary_type,omitempty"`
+	TurnID            string      `json:"turn_id,omitempty"`
+	TurnIndex         *int        `json:"turn_index,omitempty"`
+	CompactionEventID string      `json:"compaction_event_id,omitempty"`
+	Git               *GitContext `json:"git,omitempty"`
+	JJ                *JJContext  `json:"jj,omitempty"`
+}
+
+type CheckpointRequestParams struct {
+	Request CheckpointRequest `json:"request"`
 }
 
 type TransitionParams struct {

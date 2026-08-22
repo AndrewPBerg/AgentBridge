@@ -13,7 +13,7 @@ type Recipient = {
 };
 
 export function sameRepository(current: ActorRecord, candidate: ActorRecord): boolean {
-  if (current.repository_id && candidate.repository_id) return current.repository_id === candidate.repository_id;
+  if (current.repository_uuid && candidate.repository_uuid) return current.repository_uuid === candidate.repository_uuid;
   if (current.git?.common_dir && candidate.git?.common_dir) return current.git.common_dir === candidate.git.common_dir;
   if (current.jj?.workspace_root && candidate.jj?.workspace_root) return current.jj.workspace_root === candidate.jj.workspace_root;
   return current.cwd === candidate.cwd;

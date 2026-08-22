@@ -46,11 +46,11 @@ func newTestEngine(t *testing.T) (*Engine, *memoryJournal, *time.Time) {
 func register(t *testing.T, engine *Engine, address string) protocol.Actor {
 	t.Helper()
 	actor, err := engine.Register(protocol.Actor{
-		Address:   address,
-		Harness:   "pi",
-		SessionID: address[3:],
-		CWD:       "/repo",
-		State:     "active",
+		Address:     address,
+		Harness:     "pi",
+		SessionUUID: address[3:],
+		CWD:         "/repo",
+		State:       "active",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -429,5 +429,22 @@ func TestConcurrentSendsAreRaceSafeAndUnique(t *testing.T) {
 			t.Fatalf("duplicate recipient sequence %d", message.RecipientSequence)
 		}
 		seen[message.RecipientSequence] = true
+	}
+}
+
+func TestSessionsMarksExpiredActorsDead(t *testing.T) {
+	engine, journal, now := newTestEngine(t)
+	register(t, engine, "pi:waiting")
+	*now = now.Add(defaultActorTTL + time.Second)
+
+	actors := engine.Sessions(true)
+	if len(actors) != 1 || actors[0].State != "dead" {
+		t.Fatalf("expired actor state = %#v", actors)
+	}
+	if len(journal.events) != 2 {
+		t.Fatalf("expected persisted death transition, got %d events", len(journal.events))
+	}
+	if live := engine.Sessions(false); len(live) != 0 {
+		t.Fatalf("expired actor still considered live: %#v", live)
 	}
 }

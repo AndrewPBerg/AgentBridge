@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +19,7 @@ import (
 	_ "turso.tech/database/tursogo"
 )
 
-const projectionSchemaVersion = 3
+const projectionSchemaVersion = 7
 
 type DB struct {
 	db   *sql.DB
@@ -62,7 +63,7 @@ func (d *DB) initialize() error {
 		) STRICT`,
 		`CREATE INDEX IF NOT EXISTS events_type_at ON events(type, at DESC)`,
 		`CREATE TABLE IF NOT EXISTS repositories (
-			id TEXT PRIMARY KEY,
+			id BLOB PRIMARY KEY,
 			root TEXT NOT NULL,
 			kind TEXT NOT NULL,
 			git_common_dir TEXT,
@@ -70,8 +71,8 @@ func (d *DB) initialize() error {
 			updated_sequence INTEGER NOT NULL
 		) STRICT`,
 		`CREATE TABLE IF NOT EXISTS workspaces (
-			id TEXT PRIMARY KEY,
-			repository_id TEXT NOT NULL REFERENCES repositories(id),
+			id BLOB PRIMARY KEY,
+			repository_uuid BLOB NOT NULL REFERENCES repositories(id),
 			root TEXT NOT NULL,
 			kind TEXT NOT NULL,
 			git_branch TEXT,
@@ -80,16 +81,15 @@ func (d *DB) initialize() error {
 			jj_change_id TEXT,
 			updated_sequence INTEGER NOT NULL
 		) STRICT`,
-		`CREATE INDEX IF NOT EXISTS workspaces_repository ON workspaces(repository_id, root)`,
+		`CREATE INDEX IF NOT EXISTS workspaces_repository ON workspaces(repository_uuid, root)`,
 		`CREATE TABLE IF NOT EXISTS actors (
-			address TEXT PRIMARY KEY,
+			session_uuid BLOB PRIMARY KEY,
 			harness TEXT NOT NULL,
-			session_id TEXT NOT NULL,
 			alias TEXT,
 			cwd TEXT NOT NULL,
-			repository_id TEXT,
+			repository_uuid BLOB,
 			repository_root TEXT,
-			workspace_id TEXT,
+			workspace_uuid BLOB,
 			workspace_root TEXT,
 			workspace_kind TEXT,
 			state TEXT NOT NULL,
@@ -103,7 +103,7 @@ func (d *DB) initialize() error {
 		) STRICT`,
 		`CREATE TABLE IF NOT EXISTS mutations (
 			id TEXT PRIMARY KEY,
-			actor TEXT NOT NULL,
+			actor BLOB NOT NULL,
 			session_generation INTEGER NOT NULL,
 			turn_id TEXT,
 			turn_index INTEGER,
@@ -111,9 +111,9 @@ func (d *DB) initialize() error {
 			tool TEXT NOT NULL,
 			operation TEXT NOT NULL,
 			cwd TEXT NOT NULL,
-			repository_id TEXT,
+			repository_uuid BLOB,
 			repository_root TEXT,
-			workspace_id TEXT,
+			workspace_uuid BLOB,
 			workspace_root TEXT,
 			workspace_kind TEXT,
 			workspace_key TEXT NOT NULL,
@@ -145,7 +145,7 @@ func (d *DB) initialize() error {
 		`CREATE INDEX IF NOT EXISTS mutation_paths_path ON mutation_paths(path, mutation_id)`,
 		`CREATE TABLE IF NOT EXISTS session_events (
 			id TEXT PRIMARY KEY,
-			actor TEXT NOT NULL,
+			actor BLOB NOT NULL,
 			session_generation INTEGER NOT NULL,
 			type TEXT NOT NULL,
 			at TEXT NOT NULL,
@@ -156,15 +156,76 @@ func (d *DB) initialize() error {
 		) STRICT`,
 		`CREATE INDEX IF NOT EXISTS session_events_actor_at ON session_events(actor, at DESC)`,
 		`CREATE TABLE IF NOT EXISTS collisions (
-			id TEXT PRIMARY KEY,
+			id BLOB PRIMARY KEY,
 			path TEXT NOT NULL,
 			state TEXT NOT NULL,
-			actors_json TEXT NOT NULL,
+			owner BLOB,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
+			resolved_at TEXT,
 			resolution TEXT,
+			resolved_by BLOB,
+			dead_actor BLOB,
 			data TEXT NOT NULL,
 			updated_sequence INTEGER NOT NULL
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS collision_actors (
+			collision_id BLOB NOT NULL REFERENCES collisions(id) ON DELETE CASCADE,
+			ordinal INTEGER NOT NULL,
+			session_uuid BLOB NOT NULL,
+			PRIMARY KEY(collision_id, ordinal)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS messages (
+			id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL,
+			from_actor BLOB NOT NULL,
+			to_actor BLOB NOT NULL,
+			body TEXT NOT NULL,
+			global_sequence INTEGER NOT NULL,
+			sender_sequence INTEGER NOT NULL,
+			recipient_sequence INTEGER NOT NULL,
+			client_sequence INTEGER,
+			session_generation INTEGER,
+			collision_id BLOB,
+			created_at TEXT NOT NULL,
+			acknowledged_at TEXT,
+			data TEXT NOT NULL,
+			event_sequence INTEGER NOT NULL
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS messages_actor_created ON messages(to_actor, created_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS test_results (
+			id TEXT PRIMARY KEY,
+			actor BLOB NOT NULL,
+			session_generation INTEGER NOT NULL,
+			turn_id TEXT,
+			turn_index INTEGER,
+			tool_call_id TEXT,
+			command TEXT NOT NULL,
+			cwd TEXT NOT NULL,
+			exit_code INTEGER,
+			started_at TEXT NOT NULL,
+			completed_at TEXT NOT NULL,
+			duration_ms INTEGER,
+			output_excerpt TEXT,
+			output_sha256 TEXT,
+			output_bytes INTEGER,
+			output_truncated INTEGER NOT NULL,
+			repository_uuid BLOB,
+			workspace_uuid BLOB,
+			data TEXT NOT NULL,
+			event_sequence INTEGER NOT NULL
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS checkpoint_requests (
+			id TEXT PRIMARY KEY,
+			actor BLOB NOT NULL,
+			session_generation INTEGER NOT NULL,
+			repository_uuid BLOB NOT NULL,
+			workspace_uuid BLOB NOT NULL,
+			checkpoint_kind TEXT NOT NULL,
+			journal_start_sequence INTEGER NOT NULL,
+			journal_end_sequence INTEGER NOT NULL,
+			data TEXT NOT NULL,
+			event_sequence INTEGER NOT NULL
 		) STRICT`,
 	}
 	for _, statement := range statements {
@@ -179,17 +240,21 @@ func (d *DB) initialize() error {
 		return err
 	}
 	for _, column := range []struct{ table, name, definition string }{
-		{"actors", "repository_id", "TEXT"},
+		{"actors", "repository_uuid", "BLOB"},
 		{"actors", "repository_root", "TEXT"},
-		{"actors", "workspace_id", "TEXT"},
+		{"actors", "workspace_uuid", "BLOB"},
 		{"actors", "workspace_root", "TEXT"},
 		{"actors", "workspace_kind", "TEXT"},
-		{"mutations", "repository_id", "TEXT"},
+		{"mutations", "repository_uuid", "BLOB"},
 		{"mutations", "repository_root", "TEXT"},
-		{"mutations", "workspace_id", "TEXT"},
+		{"mutations", "workspace_uuid", "BLOB"},
 		{"mutations", "workspace_root", "TEXT"},
 		{"mutations", "workspace_kind", "TEXT"},
 		{"mutations", "relative_paths_json", "TEXT NOT NULL DEFAULT '[]'"},
+		{"collisions", "owner", "BLOB"},
+		{"collisions", "resolved_at", "TEXT"},
+		{"collisions", "resolved_by", "BLOB"},
+		{"collisions", "dead_actor", "BLOB"},
 	} {
 		if err := d.ensureColumn(column.table, column.name, column.definition); err != nil {
 			return err
@@ -215,7 +280,48 @@ func (d *DB) ensureProjectionVersion() error {
 		return err
 	}
 	defer transaction.Rollback()
-	for _, table := range []string{"mutation_paths", "mutations", "session_events", "collisions", "actors", "workspaces", "repositories", "events"} {
+	// Migrate the collision projection before resetting the other read models.
+	// Older databases denormalized actors into actors_json and used prefixed text
+	// IDs; the journal remains the authoritative source for any rows that cannot
+	// be converted.
+	if version > 0 && version < 7 {
+		if err := migrateCollisions(transaction); err != nil {
+			return err
+		}
+	}
+	// Recreate the actor projection when moving from the text address model to
+	// the binary UUID key. The append-only journal remains the migration source.
+	if version < projectionSchemaVersion {
+		if _, err := transaction.Exec(`DROP TABLE IF EXISTS actors`); err != nil {
+			return fmt.Errorf("reset actors projection: %w", err)
+		}
+		if _, err := transaction.Exec(`CREATE TABLE actors (
+			session_uuid BLOB PRIMARY KEY,
+			harness TEXT NOT NULL,
+			alias TEXT,
+			cwd TEXT NOT NULL,
+			repository_uuid BLOB,
+			repository_root TEXT,
+			workspace_uuid BLOB,
+			workspace_root TEXT,
+			workspace_kind TEXT,
+			state TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			started_at TEXT NOT NULL,
+			heartbeat_at TEXT NOT NULL,
+			git_json TEXT,
+			jj_json TEXT,
+			capabilities_json TEXT NOT NULL,
+			updated_sequence INTEGER NOT NULL
+		) STRICT`); err != nil {
+			return fmt.Errorf("recreate actors projection: %w", err)
+		}
+	}
+	tables := []string{"mutation_paths", "mutations", "session_events", "messages", "test_results", "checkpoint_requests", "workspaces", "repositories", "events"}
+	if version == 0 || version >= 7 {
+		tables = append(tables, "collisions", "collision_actors")
+	}
+	for _, table := range tables {
 		if _, err := transaction.Exec(`DELETE FROM ` + table); err != nil {
 			return fmt.Errorf("reset provenance projection table %s: %w", table, err)
 		}
@@ -227,6 +333,82 @@ func (d *DB) ensureProjectionVersion() error {
 		return err
 	}
 	return transaction.Commit()
+}
+
+func migrateCollisions(transaction *sql.Tx) error {
+	columns, err := transaction.Query(`PRAGMA table_info(collisions)`)
+	if err != nil {
+		return err
+	}
+	legacy := false
+	for columns.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := columns.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			columns.Close()
+			return err
+		}
+		if name == "actors_json" {
+			legacy = true
+		}
+	}
+	if err := columns.Close(); err != nil {
+		return err
+	}
+	if !legacy {
+		return nil
+	}
+	type legacyCollision struct {
+		id, path, state, actors, createdAt, updatedAt string
+		owner, resolvedBy, deadActor                  []byte
+		resolvedAt, resolution, data                  string
+		sequence                                      int64
+	}
+	rows, err := transaction.Query(`SELECT id, path, state, actors_json, owner, created_at, updated_at, resolved_at, resolution, resolved_by, dead_actor, data, updated_sequence FROM collisions`)
+	if err != nil {
+		return fmt.Errorf("read legacy collisions: %w", err)
+	}
+	defer rows.Close()
+	var values []legacyCollision
+	for rows.Next() {
+		var value legacyCollision
+		if err := rows.Scan(&value.id, &value.path, &value.state, &value.actors, &value.owner, &value.createdAt, &value.updatedAt, &value.resolvedAt, &value.resolution, &value.resolvedBy, &value.deadActor, &value.data, &value.sequence); err != nil {
+			return err
+		}
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, err := transaction.Exec(`DROP TABLE IF EXISTS collision_actors`); err != nil {
+		return err
+	}
+	if _, err := transaction.Exec(`ALTER TABLE collisions RENAME TO collisions_legacy`); err != nil {
+		return err
+	}
+	if _, err := transaction.Exec(`CREATE TABLE collisions (id BLOB PRIMARY KEY, path TEXT NOT NULL, state TEXT NOT NULL, owner BLOB, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, resolved_at TEXT, resolution TEXT, resolved_by BLOB, dead_actor BLOB, data TEXT NOT NULL, updated_sequence INTEGER NOT NULL) STRICT`); err != nil {
+		return err
+	}
+	if _, err := transaction.Exec(`CREATE TABLE collision_actors (collision_id BLOB NOT NULL REFERENCES collisions(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, session_uuid BLOB NOT NULL, PRIMARY KEY(collision_id, ordinal)) STRICT`); err != nil {
+		return err
+	}
+	for _, value := range values {
+		id := uuidBlob(value.id)
+		if _, err := transaction.Exec(`INSERT INTO collisions(id, path, state, owner, created_at, updated_at, resolved_at, resolution, resolved_by, dead_actor, data, updated_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, value.path, value.state, value.owner, value.createdAt, value.updatedAt, nullable(value.resolvedAt), nullable(value.resolution), value.resolvedBy, value.deadActor, value.data, value.sequence); err != nil {
+			return err
+		}
+		var actors []string
+		if json.Unmarshal([]byte(value.actors), &actors) == nil {
+			for ordinal, actor := range actors {
+				if _, err := transaction.Exec(`INSERT INTO collision_actors(collision_id, ordinal, session_uuid) VALUES (?, ?, ?)`, id, ordinal, uuidBlob(actor)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	_, err = transaction.Exec(`DROP TABLE collisions_legacy`)
+	return err
 }
 
 func (d *DB) ensureColumn(table, column, definition string) error {
@@ -266,6 +448,51 @@ func secureDatabaseFiles(path string) error {
 
 func (d *DB) Close() error { return d.db.Close() }
 func (d *DB) Path() string { return d.path }
+
+// PruneNonUUIDActors removes legacy actor keys from the read model. The
+// append-only journal remains untouched and can be reprojected later.
+func (d *DB) PruneNonUUIDActors() error {
+	statements := []string{
+		`DELETE FROM actors WHERE length(session_uuid) != 16 OR (repository_uuid IS NOT NULL AND length(repository_uuid) != 16) OR (workspace_uuid IS NOT NULL AND length(workspace_uuid) != 16)`,
+		`DELETE FROM mutations WHERE (repository_uuid IS NOT NULL AND length(repository_uuid) != 16) OR (workspace_uuid IS NOT NULL AND length(workspace_uuid) != 16)`,
+		`DELETE FROM test_results WHERE (repository_uuid IS NOT NULL AND length(repository_uuid) != 16) OR (workspace_uuid IS NOT NULL AND length(workspace_uuid) != 16)`,
+		`DELETE FROM checkpoint_requests WHERE length(repository_uuid) != 16 OR length(workspace_uuid) != 16`,
+		`DELETE FROM workspaces WHERE length(id) != 16 OR length(repository_uuid) != 16`,
+		`DELETE FROM repositories WHERE length(id) != 16`,
+	}
+	for _, statement := range statements {
+		if _, err := d.db.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Snapshot creates a compact, consistent database copy through the same Turso
+// connection that owns the live file. Other processes can inspect the copy
+// without competing for the live engine lock.
+func (d *DB) Snapshot(path string) error {
+	if path == "" || filepath.IsAbs(path) == false {
+		return errors.New("snapshot path must be absolute")
+	}
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("snapshot path already exists: %s", path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create snapshot directory: %w", err)
+	}
+	// VACUUM INTO accepts a string literal, not a bind parameter.
+	literal := strings.ReplaceAll(path, "'", "''")
+	if _, err := d.db.Exec(`VACUUM INTO '` + literal + `'`); err != nil {
+		return fmt.Errorf("create provenance snapshot: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("secure provenance snapshot: %w", err)
+	}
+	return nil
+}
 
 func (d *DB) ProjectAll(events []protocol.Event) error {
 	for _, event := range events {
@@ -310,28 +537,33 @@ func (d *DB) projectDomain(transaction *sql.Tx, event protocol.Event) error {
 		if err := json.Unmarshal(event.Data, &actor); err != nil {
 			return err
 		}
-		if actor.RepositoryID == "" {
-			actor.RepositoryID, actor.RepositoryRoot, actor.WorkspaceID, actor.WorkspaceRoot, actor.WorkspaceKind = deriveScope(actor.CWD, actor.Git, actor.JJ)
+		if actor.RepositoryUUID == "" {
+			actor.RepositoryUUID, actor.RepositoryRoot, actor.WorkspaceUUID, actor.WorkspaceRoot, actor.WorkspaceKind = deriveScope(actor.CWD, actor.Git, actor.JJ)
 		}
-		if err := projectScope(transaction, event.Sequence, actor.RepositoryID, actor.RepositoryRoot, actor.WorkspaceID,
+		repositoryRoot := actor.RepositoryRoot
+		if repositoryRoot == "" {
+			repositoryRoot = actor.CWD
+		}
+		if err := projectScope(transaction, event.Sequence, actor.RepositoryUUID, repositoryRoot, actor.WorkspaceUUID,
 			actor.WorkspaceRoot, actor.WorkspaceKind, actor.Git, actor.JJ); err != nil {
 			return err
 		}
 		gitJSON, _ := marshalOptional(actor.Git)
 		jjJSON, _ := marshalOptional(actor.JJ)
 		capabilities, _ := json.Marshal(actor.Capabilities)
+		sessionUUID := uuidBlob(actor.Address)
 		_, err := transaction.Exec(`INSERT INTO actors(
-			address, harness, session_id, alias, cwd, repository_id, repository_root, workspace_id, workspace_root, workspace_kind,
+			session_uuid, harness, alias, cwd, repository_uuid, repository_root, workspace_uuid, workspace_root, workspace_kind,
 			state, generation, started_at, heartbeat_at, git_json, jj_json, capabilities_json, updated_sequence
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(address) DO UPDATE SET
-			alias=excluded.alias, cwd=excluded.cwd, repository_id=excluded.repository_id, repository_root=excluded.repository_root,
-			workspace_id=excluded.workspace_id, workspace_root=excluded.workspace_root, workspace_kind=excluded.workspace_kind,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(session_uuid) DO UPDATE SET
+			alias=excluded.alias, cwd=excluded.cwd, repository_uuid=excluded.repository_uuid, repository_root=excluded.repository_root,
+			workspace_uuid=excluded.workspace_uuid, workspace_root=excluded.workspace_root, workspace_kind=excluded.workspace_kind,
 			state=excluded.state, generation=excluded.generation, heartbeat_at=excluded.heartbeat_at,
 			git_json=excluded.git_json, jj_json=excluded.jj_json, capabilities_json=excluded.capabilities_json,
 			updated_sequence=excluded.updated_sequence`,
-			actor.Address, actor.Harness, actor.SessionID, nullable(actor.Alias), actor.CWD,
-			nullable(actor.RepositoryID), nullable(actor.RepositoryRoot), nullable(actor.WorkspaceID), nullable(actor.WorkspaceRoot), nullable(actor.WorkspaceKind),
+			sessionUUID, actor.Harness, nullable(actor.Alias), actor.CWD,
+			nullableUUID(actor.RepositoryUUID), nullable(actor.RepositoryRoot), nullableUUID(actor.WorkspaceUUID), nullable(actor.WorkspaceRoot), nullable(actor.WorkspaceKind),
 			actor.State, actor.Generation, actor.StartedAt.UTC().Format(time.RFC3339Nano), actor.HeartbeatAt.UTC().Format(time.RFC3339Nano),
 			gitJSON, jjJSON, string(capabilities), event.Sequence)
 		return err
@@ -341,6 +573,33 @@ func (d *DB) projectDomain(transaction *sql.Tx, event protocol.Event) error {
 			return err
 		}
 		return projectIntent(transaction, event.Sequence, intent)
+	case "message.enqueued":
+		var message protocol.Message
+		if err := json.Unmarshal(event.Data, &message); err != nil {
+			return err
+		}
+		_, err := transaction.Exec(`INSERT OR IGNORE INTO messages(
+			id, kind, from_actor, to_actor, body, global_sequence, sender_sequence, recipient_sequence,
+			client_sequence, session_generation, collision_id, created_at, data, event_sequence
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, message.ID, message.Kind, uuidBlob(message.From), uuidBlob(message.To), message.Body,
+			message.GlobalSequence, message.SenderSequence, message.RecipientSequence, message.ClientSequence, message.SessionGeneration,
+			nullableUUID(message.CollisionID), message.CreatedAt.UTC().Format(time.RFC3339Nano), string(event.Data), event.Sequence)
+		return err
+	case "message.acked":
+		var ack struct {
+			Actor      string    `json:"actor"`
+			MessageIDs []string  `json:"message_ids"`
+			At         time.Time `json:"at"`
+		}
+		if err := json.Unmarshal(event.Data, &ack); err != nil {
+			return err
+		}
+		for _, id := range ack.MessageIDs {
+			if _, err := transaction.Exec(`UPDATE messages SET acknowledged_at = ? WHERE id = ? AND to_actor = ?`, ack.At.UTC().Format(time.RFC3339Nano), id, uuidBlob(ack.Actor)); err != nil {
+				return err
+			}
+		}
+		return nil
 	case "session.event":
 		var sessionEvent protocol.SessionEvent
 		if err := json.Unmarshal(event.Data, &sessionEvent); err != nil {
@@ -352,24 +611,68 @@ func (d *DB) projectDomain(transaction *sql.Tx, event protocol.Event) error {
 		}
 		_, err := transaction.Exec(`INSERT OR REPLACE INTO session_events(
 			id, actor, session_generation, type, at, turn_index, summary, data, event_sequence
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, sessionEvent.ID, sessionEvent.Actor, sessionEvent.SessionGeneration,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, sessionEvent.ID, uuidBlob(sessionEvent.Actor), sessionEvent.SessionGeneration,
 			sessionEvent.Type, sessionEvent.At.UTC().Format(time.RFC3339Nano), sessionEvent.TurnIndex,
 			nullable(sessionEvent.Summary), string(data), event.Sequence)
+		return err
+	case "test.result":
+		var result protocol.TestResult
+		if err := json.Unmarshal(event.Data, &result); err != nil {
+			return err
+		}
+		_, err := transaction.Exec(`INSERT OR IGNORE INTO test_results(
+			id, actor, session_generation, turn_id, turn_index, tool_call_id, command, cwd, exit_code,
+			started_at, completed_at, duration_ms, output_excerpt, output_sha256, output_bytes, output_truncated,
+			repository_uuid, workspace_uuid, data, event_sequence
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, result.ID, uuidBlob(result.Actor),
+			result.SessionGeneration, nullable(result.TurnID), result.TurnIndex, nullable(result.ToolCallID), result.Command, result.CWD,
+			result.ExitCode, result.StartedAt.UTC().Format(time.RFC3339Nano), result.CompletedAt.UTC().Format(time.RFC3339Nano),
+			result.DurationMillis, nullable(result.OutputExcerpt), nullable(result.OutputSHA256), result.OutputBytes, result.OutputTruncated,
+			nullableUUID(result.RepositoryUUID), nullableUUID(result.WorkspaceUUID), string(event.Data), event.Sequence)
+		return err
+	case "checkpoint.requested":
+		var checkpoint protocol.CheckpointRequest
+		if err := json.Unmarshal(event.Data, &checkpoint); err != nil {
+			return err
+		}
+		_, err := transaction.Exec(`INSERT OR IGNORE INTO checkpoint_requests(
+			id, actor, session_generation, repository_uuid, workspace_uuid, checkpoint_kind,
+			journal_start_sequence, journal_end_sequence, data, event_sequence
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, checkpoint.ID, uuidBlob(checkpoint.Actor), checkpoint.SessionGeneration,
+			uuidBlob(checkpoint.RepositoryUUID), uuidBlob(checkpoint.WorkspaceUUID), checkpoint.CheckpointKind, checkpoint.JournalStart,
+			checkpoint.JournalEnd, string(event.Data), event.Sequence)
 		return err
 	case "collision.upserted":
 		var collision protocol.Collision
 		if err := json.Unmarshal(event.Data, &collision); err != nil {
 			return err
 		}
-		actors, _ := json.Marshal(collision.Actors)
+		collisionID := uuidBlob(collision.ID)
 		_, err := transaction.Exec(`INSERT INTO collisions(
-			id, path, state, actors_json, created_at, updated_at, resolution, data, updated_sequence
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at,
-			resolution=excluded.resolution, data=excluded.data, updated_sequence=excluded.updated_sequence`,
-			collision.ID, collision.Path, collision.State, string(actors), collision.CreatedAt.UTC().Format(time.RFC3339Nano),
-			collision.UpdatedAt.UTC().Format(time.RFC3339Nano), nullable(collision.Resolution), string(event.Data), event.Sequence)
-		return err
+			id, path, state, owner, created_at, updated_at, resolved_at,
+			resolution, resolved_by, dead_actor, data, updated_sequence
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET state=excluded.state, owner=excluded.owner,
+			updated_at=excluded.updated_at, resolved_at=excluded.resolved_at,
+			resolution=excluded.resolution, resolved_by=excluded.resolved_by,
+			dead_actor=excluded.dead_actor, data=excluded.data,
+			updated_sequence=excluded.updated_sequence`,
+			collisionID, collision.Path, collision.State, nullableUUID(collision.Owner),
+			collision.CreatedAt.UTC().Format(time.RFC3339Nano), collision.UpdatedAt.UTC().Format(time.RFC3339Nano),
+			nullableTime(collision.ResolvedAt), nullable(collision.Resolution), nullableUUID(collision.ResolvedBy),
+			nullableUUID(collision.DeadActor), string(event.Data), event.Sequence)
+		if err != nil {
+			return err
+		}
+		if _, err := transaction.Exec(`DELETE FROM collision_actors WHERE collision_id = ?`, collisionID); err != nil {
+			return err
+		}
+		for ordinal, actor := range collision.Actors {
+			if _, err := transaction.Exec(`INSERT INTO collision_actors(collision_id, ordinal, session_uuid) VALUES (?, ?, ?)`, collisionID, ordinal, uuidBlob(actor)); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	return nil
 }
@@ -393,11 +696,18 @@ func deriveScope(cwd string, git *protocol.GitContext, jj *protocol.JJContext) (
 		workspaceRoot = jj.WorkspaceRoot
 		kind = "jj-workspace"
 	}
-	repositorySum := sha256.Sum256([]byte(filepath.Clean(repositoryKey)))
-	repositoryID := fmt.Sprintf("repo:%x", repositorySum[:16])
-	workspaceSum := sha256.Sum256([]byte(filepath.Clean(repositoryID + "\x00" + workspaceRoot)))
-	workspaceID := fmt.Sprintf("workspace:%x", workspaceSum[:16])
+	repositoryID := deterministicUUID(filepath.Clean(repositoryKey))
+	workspaceID := deterministicUUID(filepath.Clean(repositoryID + "\x00" + workspaceRoot))
 	return repositoryID, filepath.Clean(repositoryRoot), workspaceID, filepath.Clean(workspaceRoot), kind
+}
+
+func deterministicUUID(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	bytes := sum[:16]
+	bytes[6] = (bytes[6] & 0x0f) | 0x50
+	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	encoded := hex.EncodeToString(bytes)
+	return encoded[:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:]
 }
 
 func projectScope(
@@ -409,6 +719,22 @@ func projectScope(
 ) error {
 	if repositoryID == "" || workspaceID == "" {
 		return nil
+	}
+	// Empty workspace fields inherit the repository scope. This keeps the
+	// persisted protocol sparse without losing the effective workspace values
+	// in the relational projection.
+	if workspaceRoot == "" {
+		workspaceRoot = repositoryRoot
+	}
+	if workspaceKind == "" {
+		workspaceKind = "directory"
+		if git != nil && jj != nil {
+			workspaceKind = "git-jj-workspace"
+		} else if git != nil {
+			workspaceKind = "git-worktree"
+		} else if jj != nil {
+			workspaceKind = "jj-workspace"
+		}
 	}
 	repositoryKind := "directory"
 	if git != nil && jj != nil {
@@ -428,26 +754,34 @@ func projectScope(
 	if _, err := transaction.Exec(`INSERT INTO repositories(id, root, kind, git_common_dir, jj_repo_path, updated_sequence)
 		VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET root=excluded.root, kind=excluded.kind,
 		git_common_dir=excluded.git_common_dir, jj_repo_path=excluded.jj_repo_path, updated_sequence=excluded.updated_sequence`,
-		repositoryID, repositoryRoot, repositoryKind, nullable(gitCommonDir), nullable(jjRepoPath), sequence); err != nil {
+		uuidBlob(repositoryID), repositoryRoot, repositoryKind, nullable(gitCommonDir), nullable(jjRepoPath), sequence); err != nil {
 		return err
 	}
-	_, err := transaction.Exec(`INSERT INTO workspaces(id, repository_id, root, kind, git_branch, git_head,
+	_, err := transaction.Exec(`INSERT INTO workspaces(id, repository_uuid, root, kind, git_branch, git_head,
 		jj_workspace_name, jj_change_id, updated_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET repository_id=excluded.repository_id, root=excluded.root, kind=excluded.kind,
+		ON CONFLICT(id) DO UPDATE SET repository_uuid=excluded.repository_uuid, root=excluded.root, kind=excluded.kind,
 		git_branch=excluded.git_branch, git_head=excluded.git_head, jj_workspace_name=excluded.jj_workspace_name,
 		jj_change_id=excluded.jj_change_id, updated_sequence=excluded.updated_sequence`,
-		workspaceID, repositoryID, workspaceRoot, workspaceKind, nullable(gitBranch), nullable(gitHead),
+		uuidBlob(workspaceID), uuidBlob(repositoryID), workspaceRoot, workspaceKind, nullable(gitBranch), nullable(gitHead),
 		nullable(jjWorkspaceName), nullable(jjChangeID), sequence)
 	return err
 }
 
 func projectIntent(transaction *sql.Tx, sequence uint64, intent protocol.Intent) error {
-	if intent.RepositoryID == "" {
-		intent.RepositoryID, intent.RepositoryRoot, intent.WorkspaceID, intent.WorkspaceRoot, intent.WorkspaceKind = deriveScope(intent.CWD, intent.Git, intent.JJ)
+	if intent.RepositoryUUID == "" {
+		intent.RepositoryUUID, intent.RepositoryRoot, intent.WorkspaceUUID, intent.WorkspaceRoot, intent.WorkspaceKind = deriveScope(intent.CWD, intent.Git, intent.JJ)
+	}
+	repositoryRoot := intent.RepositoryRoot
+	if repositoryRoot == "" {
+		repositoryRoot = intent.CWD
+	}
+	workspaceRoot := intent.WorkspaceRoot
+	if workspaceRoot == "" {
+		workspaceRoot = repositoryRoot
 	}
 	if len(intent.RelativePaths) == 0 {
 		for _, path := range intent.Paths {
-			relative, err := filepath.Rel(intent.WorkspaceRoot, path)
+			relative, err := filepath.Rel(workspaceRoot, path)
 			if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 				intent.RelativePaths = append(intent.RelativePaths, filepath.Clean(path))
 			} else {
@@ -455,7 +789,7 @@ func projectIntent(transaction *sql.Tx, sequence uint64, intent protocol.Intent)
 			}
 		}
 	}
-	if err := projectScope(transaction, sequence, intent.RepositoryID, intent.RepositoryRoot, intent.WorkspaceID,
+	if err := projectScope(transaction, sequence, intent.RepositoryUUID, repositoryRoot, intent.WorkspaceUUID,
 		intent.WorkspaceRoot, intent.WorkspaceKind, intent.Git, intent.JJ); err != nil {
 		return err
 	}
@@ -477,16 +811,16 @@ func projectIntent(transaction *sql.Tx, sequence uint64, intent protocol.Intent)
 	}
 	_, err := transaction.Exec(`INSERT INTO mutations(
 		id, actor, session_generation, turn_id, turn_index, tool_call_id, tool, operation, cwd,
-		repository_id, repository_root, workspace_id, workspace_root, workspace_kind, workspace_key, paths_json, relative_paths_json,
+		repository_uuid, repository_root, workspace_uuid, workspace_root, workspace_kind, workspace_key, paths_json, relative_paths_json,
 		assistant_excerpt, started_at, completed_at, success, error, before_json, after_json,
 		git_before_json, git_after_json, jj_before_json, jj_after_json, updated_sequence
 	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET completed_at=excluded.completed_at, success=excluded.success,
 		error=excluded.error, after_json=excluded.after_json, git_after_json=excluded.git_after_json,
 		jj_after_json=excluded.jj_after_json, updated_sequence=excluded.updated_sequence`,
-		intent.ID, intent.Actor, intent.SessionGeneration, nullable(intent.TurnID), intent.TurnIndex,
+		intent.ID, uuidBlob(intent.Actor), intent.SessionGeneration, nullable(intent.TurnID), intent.TurnIndex,
 		intent.ToolCallID, intent.Tool, intent.Operation, intent.CWD,
-		nullable(intent.RepositoryID), nullable(intent.RepositoryRoot), nullable(intent.WorkspaceID), nullable(intent.WorkspaceRoot), nullable(intent.WorkspaceKind),
+		nullableUUID(intent.RepositoryUUID), nullable(intent.RepositoryRoot), nullableUUID(intent.WorkspaceUUID), nullable(intent.WorkspaceRoot), nullable(intent.WorkspaceKind),
 		intent.WorkspaceKey, string(paths), string(relativePaths), nullable(intent.Context.AssistantExcerpt),
 		intent.StartedAt.UTC().Format(time.RFC3339Nano), completedAt, success, nullable(intent.Error),
 		string(before), string(after), gitBefore, gitAfter, jjBefore, jjAfter, sequence)
@@ -552,6 +886,13 @@ func nullable(value string) any {
 		return nil
 	}
 	return value
+}
+
+func nullableTime(value *time.Time) any {
+	if value == nil {
+		return nil
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 type ProjectionHealth struct {
@@ -711,26 +1052,58 @@ func (d *DB) ResolveActor(selector string) (string, error) {
 	return d.ResolveActorScoped(selector, "", "")
 }
 
+func nullableUUID(value string) any {
+	if value == "" {
+		return nil
+	}
+	return uuidBlob(value)
+}
+
+func uuidBlob(value string) []byte {
+	value = strings.TrimSpace(value)
+	candidate := value
+	for _, prefix := range []string{"pi:", "col:", "repo:", "workspace:"} {
+		if strings.HasPrefix(candidate, prefix) && len(strings.ReplaceAll(candidate[len(prefix):], "-", "")) == 32 {
+			candidate = candidate[len(prefix):]
+			break
+		}
+	}
+	compact := strings.ReplaceAll(candidate, "-", "")
+	if len(compact) == 32 {
+		if decoded, err := hex.DecodeString(compact); err == nil {
+			return decoded
+		}
+	}
+	return []byte(value)
+}
+
+func uuidString(value []byte) string {
+	if len(value) != 16 {
+		return string(value)
+	}
+	return fmt.Sprintf("%s-%s-%s-%s-%s", hex.EncodeToString(value[:4]), hex.EncodeToString(value[4:6]), hex.EncodeToString(value[6:8]), hex.EncodeToString(value[8:10]), hex.EncodeToString(value[10:]))
+}
+
 func (d *DB) ResolveActorScoped(selector, repositoryID, workspaceID string) (string, error) {
 	normalized := strings.TrimPrefix(strings.TrimSpace(selector), "@")
-	var address string
-	err := d.db.QueryRow(`SELECT address FROM actors WHERE address = ?`, normalized).Scan(&address)
+	var sessionUUID []byte
+	err := d.db.QueryRow(`SELECT session_uuid FROM actors WHERE session_uuid = ?`, uuidBlob(normalized)).Scan(&sessionUUID)
 	if err == nil {
-		return address, nil
+		return uuidString(sessionUUID), nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
-	query := `SELECT address FROM actors WHERE alias = ?`
+	query := `SELECT session_uuid FROM actors WHERE alias = ?`
 	arguments := []any{normalized}
 	if workspaceID != "" {
-		query += ` AND workspace_id = ?`
-		arguments = append(arguments, workspaceID)
+		query += ` AND workspace_uuid = ?`
+		arguments = append(arguments, uuidBlob(workspaceID))
 	} else if repositoryID != "" {
-		query += ` AND repository_id = ?`
-		arguments = append(arguments, repositoryID)
+		query += ` AND repository_uuid = ?`
+		arguments = append(arguments, uuidBlob(repositoryID))
 	}
-	query += ` ORDER BY address LIMIT 2`
+	query += ` ORDER BY session_uuid LIMIT 2`
 	rows, err := d.db.Query(query, arguments...)
 	if err != nil {
 		return "", err
@@ -738,11 +1111,11 @@ func (d *DB) ResolveActorScoped(selector, repositoryID, workspaceID string) (str
 	defer rows.Close()
 	var matches []string
 	for rows.Next() {
-		var match string
+		var match []byte
 		if err := rows.Scan(&match); err != nil {
 			return "", err
 		}
-		matches = append(matches, match)
+		matches = append(matches, uuidString(match))
 	}
 	if len(matches) == 0 {
 		return "", fmt.Errorf("unknown persisted actor %q", selector)

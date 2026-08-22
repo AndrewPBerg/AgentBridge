@@ -7,7 +7,7 @@ function actor(session: string, options: Partial<ActorRecord> = {}): ActorRecord
   return {
     address: `pi:${session}`,
     harness: "pi",
-    session_id: session,
+    session_uuid: session,
     cwd: "/repo",
     state: "active",
     git: {

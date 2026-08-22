@@ -296,18 +296,18 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
       } else if (action === "agent") {
         if (!params.target) throw new Error("bridge_provenance agent requires an actor or @alias in target");
         method = "provenance.agent";
-        request = { actor: params.target, repository_id: params.repositoryId, workspace_id: params.workspaceId, limit };
+        request = { actor: params.target, repository_uuid: params.repositoryId, workspace_uuid: params.workspaceId, limit };
       } else if (action === "since-compaction") {
         if (!params.target) throw new Error("bridge_provenance since-compaction requires an actor or @alias in target");
         method = "provenance.since_compaction";
-        request = { actor: params.target, repository_id: params.repositoryId, workspace_id: params.workspaceId, limit };
+        request = { actor: params.target, repository_uuid: params.repositoryId, workspace_uuid: params.workspaceId, limit };
       } else if (action === "mutations") {
         method = "provenance.mutations";
         request = {
           actor: params.target,
           path: params.path,
-          repository_id: params.repositoryId,
-          workspace_id: params.workspaceId,
+          repository_uuid: params.repositoryId,
+          workspace_uuid: params.workspaceId,
           limit,
           failed: Boolean(params.failed),
         };
@@ -319,15 +319,15 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
         method = "provenance.timeline";
         request = {
           actor: params.target,
-          repository_id: params.repositoryId,
-          workspace_id: params.workspaceId,
+          repository_uuid: params.repositoryId,
+          workspace_uuid: params.workspaceId,
           type: params.eventType,
           limit,
         };
       } else if (action === "session") {
         if (!params.target) throw new Error("bridge_provenance session requires an actor or @alias in target");
         method = "provenance.session";
-        request = { actor: params.target, repository_id: params.repositoryId, workspace_id: params.workspaceId, limit };
+        request = { actor: params.target, repository_uuid: params.repositoryId, workspace_uuid: params.workspaceId, limit };
       } else {
         throw new Error(`Unknown provenance action ${JSON.stringify(action)}`);
       }
@@ -492,14 +492,14 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     sessionEventSequence = 0;
     currentTurnIndex = undefined;
     await ensureDaemon(client);
-    const sessionId = ctx.sessionManager.getSessionId();
+    const sessionId = randomUUID();
     const now = new Date().toISOString();
     const [git, jj] = await Promise.all([inspectGit(pi, ctx.cwd), inspectJj(pi, ctx.cwd)]);
     actor = await call<ActorRecord>("actor.register", {
       actor: {
-        address: `pi:${sessionId}`,
+        address: sessionId,
         harness: "pi",
-        session_id: sessionId,
+        session_uuid: sessionId,
         session_file: ctx.sessionManager.getSessionFile(),
         cwd: ctx.cwd,
         pane_id: ctx.mode === "tui" ? process.env.HERDR_PANE_ID : undefined,
@@ -611,7 +611,9 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
   });
 
   pi.on("agent_settled", async () => {
-    if (!actor || pendingAcknowledgements.size === 0) return;
+    if (!actor) return;
+    await recordSessionEvent("agent.settled", { turnIndex: currentTurnIndex }).catch((error) => reportError(sessionCtx, error));
+    if (pendingAcknowledgements.size === 0) return;
     const messageIds = [...pendingAcknowledgements];
     await call("mailbox.ack", { actor: actor.address, message_ids: messageIds });
     for (const id of messageIds) {

@@ -40,6 +40,31 @@ func (r *recordingAppender) Append(event protocol.Event) error {
 	return nil
 }
 
+func TestUUIDProjectionUsesBinaryColumnsAndNormalizedCollisionActors(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "agent-bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	checks := map[string]string{"repositories": "id", "workspaces": "id", "actors": "session_uuid", "mutations": "actor", "session_events": "actor", "collisions": "id", "collision_actors": "collision_id", "messages": "from_actor", "test_results": "actor"}
+	for table, column := range checks {
+		var kind string
+		if err := database.db.QueryRow(`SELECT type FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&kind); err != nil {
+			t.Fatalf("%s.%s: %v", table, column, err)
+		}
+		if kind != "BLOB" {
+			t.Errorf("%s.%s has type %q, want BLOB", table, column, kind)
+		}
+	}
+	var actorsJSON int
+	if err := database.db.QueryRow(`SELECT count(*) FROM pragma_table_info('collisions') WHERE name = 'actors_json'`).Scan(&actorsJSON); err != nil {
+		t.Fatal(err)
+	}
+	if actorsJSON != 0 {
+		t.Fatal("collisions still has denormalized actors_json")
+	}
+}
+
 func TestQueryWaitCannotMissConcurrentDurableAppendTail(t *testing.T) {
 	database, err := Open(filepath.Join(t.TempDir(), "agent-bridge.db"))
 	if err != nil {
@@ -49,7 +74,7 @@ func TestQueryWaitCannotMissConcurrentDurableAppendTail(t *testing.T) {
 	primary := &blockingAppender{entered: make(chan struct{}), release: make(chan struct{})}
 	projector := NewProjectingAppender(primary, database)
 	defer projector.Close()
-	actor := protocol.Actor{Address: "pi:race", Harness: "pi", SessionID: "race", CWD: "/repo", State: "active", StartedAt: time.Now(), HeartbeatAt: time.Now()}
+	actor := protocol.Actor{Address: "pi:race", Harness: "pi", SessionUUID: "race", CWD: "/repo", State: "active", StartedAt: time.Now(), HeartbeatAt: time.Now()}
 	projectionEvent := event(t, 1, "actor.upserted", actor)
 	appendDone := make(chan error, 1)
 	go func() { appendDone <- projector.Append(projectionEvent) }()
@@ -87,7 +112,7 @@ func TestAsyncProjectorBackpressuresWithoutSequenceGaps(t *testing.T) {
 	projector := newProjectingAppender(primary, database, 1)
 	for sequence := uint64(1); sequence <= 100; sequence++ {
 		actor := protocol.Actor{
-			Address: "pi:actor", Harness: "pi", SessionID: "actor", CWD: "/repo", State: "active",
+			Address: "pi:actor", Harness: "pi", SessionUUID: "actor", CWD: "/repo", State: "active",
 			StartedAt: time.Now(), HeartbeatAt: time.Now(),
 		}
 		if err := projector.Append(event(t, sequence, "actor.upserted", actor)); err != nil {
@@ -116,7 +141,7 @@ func TestAsyncProjectorWaitsForReadYourWrites(t *testing.T) {
 	defer database.Close()
 	projector := NewProjectingAppender(&recordingAppender{}, database)
 	defer projector.Close()
-	actor := protocol.Actor{Address: "pi:wait", Harness: "pi", SessionID: "wait", CWD: "/repo", State: "active", StartedAt: time.Now(), HeartbeatAt: time.Now()}
+	actor := protocol.Actor{Address: "pi:wait", Harness: "pi", SessionUUID: "wait", CWD: "/repo", State: "active", StartedAt: time.Now(), HeartbeatAt: time.Now()}
 	if err := projector.Append(event(t, 1, "actor.upserted", actor)); err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +164,7 @@ func TestAsyncProjectorFlushesOnClose(t *testing.T) {
 	defer database.Close()
 	primary := &recordingAppender{}
 	projector := NewProjectingAppender(primary, database)
-	actor := protocol.Actor{Address: "pi:async", Harness: "pi", SessionID: "async", CWD: "/repo", State: "active", StartedAt: time.Now(), HeartbeatAt: time.Now()}
+	actor := protocol.Actor{Address: "pi:async", Harness: "pi", SessionUUID: "async", CWD: "/repo", State: "active", StartedAt: time.Now(), HeartbeatAt: time.Now()}
 	if err := projector.Append(event(t, 1, "actor.upserted", actor)); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +185,7 @@ func TestProjectionSchemaUpgradeResetsReadModelForJournalBackfill(t *testing.T) 
 		t.Fatal(err)
 	}
 	now := time.Now()
-	actor := protocol.Actor{Address: "pi:migrate", Harness: "pi", SessionID: "migrate", CWD: "/repo", State: "active", StartedAt: now, HeartbeatAt: now}
+	actor := protocol.Actor{Address: "pi:migrate", Harness: "pi", SessionUUID: "migrate", CWD: "/repo", State: "active", StartedAt: now, HeartbeatAt: now}
 	projectionEvent := event(t, 1, "actor.upserted", actor)
 	if err := database.Project(projectionEvent); err != nil {
 		t.Fatal(err)
@@ -196,8 +221,8 @@ func TestCanonicalActorAddressCannotBeShadowedByAlias(t *testing.T) {
 	}
 	defer database.Close()
 	now := time.Now()
-	real := protocol.Actor{Address: "pi:real", Harness: "pi", SessionID: "real", CWD: "/repo", State: "active", StartedAt: now, HeartbeatAt: now}
-	shadow := protocol.Actor{Address: "pi:other", Harness: "pi", SessionID: "other", Alias: "pi:real", CWD: "/repo", State: "active", StartedAt: now, HeartbeatAt: now}
+	real := protocol.Actor{Address: "pi:real", Harness: "pi", SessionUUID: "real", CWD: "/repo", State: "active", StartedAt: now, HeartbeatAt: now}
+	shadow := protocol.Actor{Address: "pi:other", Harness: "pi", SessionUUID: "other", Alias: "pi:real", CWD: "/repo", State: "active", StartedAt: now, HeartbeatAt: now}
 	if err := database.ProjectAll([]protocol.Event{
 		event(t, 1, "actor.upserted", real),
 		event(t, 2, "actor.upserted", shadow),
@@ -218,13 +243,13 @@ func TestPersistedAliasRequiresScopeWhenAmbiguous(t *testing.T) {
 	defer database.Close()
 	now := time.Now()
 	left := protocol.Actor{
-		Address: "pi:left", Harness: "pi", SessionID: "left", Alias: "builder", CWD: "/repo", State: "active",
-		RepositoryID: "repo:1", RepositoryRoot: "/repo", WorkspaceID: "workspace:left", WorkspaceRoot: "/repo", WorkspaceKind: "git-worktree",
+		Address: "pi:left", Harness: "pi", SessionUUID: "left", Alias: "builder", CWD: "/repo", State: "active",
+		RepositoryUUID: "repo:1", RepositoryRoot: "/repo", WorkspaceUUID: "workspace:left", WorkspaceRoot: "/repo", WorkspaceKind: "git-worktree",
 		StartedAt: now, HeartbeatAt: now,
 	}
 	right := protocol.Actor{
-		Address: "pi:right", Harness: "pi", SessionID: "right", Alias: "builder", CWD: "/repo-right", State: "active",
-		RepositoryID: "repo:1", RepositoryRoot: "/repo", WorkspaceID: "workspace:right", WorkspaceRoot: "/repo-right", WorkspaceKind: "git-worktree",
+		Address: "pi:right", Harness: "pi", SessionUUID: "right", Alias: "builder", CWD: "/repo-right", State: "active",
+		RepositoryUUID: "repo:1", RepositoryRoot: "/repo", WorkspaceUUID: "workspace:right", WorkspaceRoot: "/repo-right", WorkspaceKind: "git-worktree",
 		StartedAt: now, HeartbeatAt: now,
 	}
 	if err := database.ProjectAll([]protocol.Event{
@@ -235,14 +260,14 @@ func TestPersistedAliasRequiresScopeWhenAmbiguous(t *testing.T) {
 	if _, err := database.ResolveActor("@builder"); err == nil {
 		t.Fatal("ambiguous unscoped alias unexpectedly resolved")
 	}
-	resolved, err := database.ResolveActorScoped("@builder", "", left.WorkspaceID)
+	resolved, err := database.ResolveActorScoped("@builder", "", left.WorkspaceUUID)
 	if err != nil || resolved != left.Address {
 		t.Fatalf("workspace-scoped alias = %q, %v", resolved, err)
 	}
 	if _, err := database.AgentSummary("@builder", 10); err == nil {
 		t.Fatal("unscoped agent summary unexpectedly accepted ambiguous alias")
 	}
-	summary, err := database.AgentSummary("@builder", 10, ActorScope{WorkspaceID: left.WorkspaceID})
+	summary, err := database.AgentSummary("@builder", 10, ActorScope{WorkspaceUUID: left.WorkspaceUUID})
 	if err != nil || summary.Actor != left.Address {
 		t.Fatalf("scoped agent summary = %#v, %v", summary, err)
 	}
@@ -255,7 +280,7 @@ func TestMutationOrderingUsesStableSequenceTieBreaker(t *testing.T) {
 	}
 	defer database.Close()
 	now := time.Now().UTC()
-	actor := protocol.Actor{Address: "pi:order", Harness: "pi", SessionID: "order", CWD: "/repo", State: "active", StartedAt: now, HeartbeatAt: now}
+	actor := protocol.Actor{Address: "pi:order", Harness: "pi", SessionUUID: "order", CWD: "/repo", State: "active", StartedAt: now, HeartbeatAt: now}
 	intent := func(id string) protocol.Intent {
 		return protocol.Intent{ID: id, Actor: actor.Address, ToolCallID: id, Tool: "edit", Operation: "edit", Paths: []string{"/repo/x"}, CWD: "/repo", StartedAt: now, ExpiresAt: now.Add(time.Minute)}
 	}
@@ -279,8 +304,8 @@ func TestTursoProjectionAndQueries(t *testing.T) {
 	defer database.Close()
 	now := time.Date(2026, 8, 21, 4, 0, 0, 0, time.UTC)
 	actor := protocol.Actor{
-		Address: "pi:session", Harness: "pi", SessionID: "session", Alias: "walkie", CWD: "/repo", State: "active",
-		RepositoryID: "repo:test", RepositoryRoot: "/repo", WorkspaceID: "workspace:test", WorkspaceRoot: "/repo", WorkspaceKind: "git-jj-workspace",
+		Address: "pi:session", Harness: "pi", SessionUUID: "session", Alias: "walkie", CWD: "/repo", State: "active",
+		RepositoryUUID: "repo:test", RepositoryRoot: "/repo", WorkspaceUUID: "workspace:test", WorkspaceRoot: "/repo", WorkspaceKind: "git-jj-workspace",
 		Generation: 7, StartedAt: now, HeartbeatAt: now,
 		Git: &protocol.GitContext{RepoRoot: "/repo", WorktreeRoot: "/repo", Branch: "main", Head: "abcdef"},
 		JJ:  &protocol.JJContext{WorkspaceRoot: "/repo", ChangeID: "qpvuntsm"},
@@ -289,7 +314,7 @@ func TestTursoProjectionAndQueries(t *testing.T) {
 		ID: "intent-1", Actor: actor.Address, SessionGeneration: 7, TurnID: "pi:session:7:turn:3", TurnIndex: func() *int { value := 3; return &value }(),
 		ToolCallID: "tool-1", Tool: "edit", Operation: "edit",
 		Paths: []string{"/repo/schema.ts"}, RelativePaths: []string{"schema.ts"}, CWD: "/repo",
-		RepositoryID: actor.RepositoryID, RepositoryRoot: actor.RepositoryRoot, WorkspaceID: actor.WorkspaceID,
+		RepositoryUUID: actor.RepositoryUUID, RepositoryRoot: actor.RepositoryRoot, WorkspaceUUID: actor.WorkspaceUUID,
 		WorkspaceRoot: actor.WorkspaceRoot, WorkspaceKind: actor.WorkspaceKind, WorkspaceKey: "/repo", Git: actor.Git, JJ: actor.JJ,
 		Context:   protocol.IntentContext{AssistantExcerpt: "Updating the schema"},
 		Before:    []protocol.FileSnapshot{{Path: "/repo/schema.ts", Exists: true, Kind: "file", SHA256: "before", Size: 10}},
@@ -334,7 +359,7 @@ func TestTursoProjectionAndQueries(t *testing.T) {
 		t.Fatalf("status = %#v", status)
 	}
 	scopes, err := database.Scopes()
-	if err != nil || len(scopes.Repositories) != 1 || len(scopes.Workspaces) != 1 || scopes.Workspaces[0].ID != actor.WorkspaceID {
+	if err != nil || len(scopes.Repositories) != 1 || len(scopes.Workspaces) != 1 || scopes.Workspaces[0].ID != actor.WorkspaceUUID {
 		t.Fatalf("scopes = %#v, %v", scopes, err)
 	}
 	mutations, err := database.ListMutations(MutationFilter{Actor: "@walkie", Path: "/repo/schema.ts"})

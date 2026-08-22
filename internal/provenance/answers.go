@@ -13,7 +13,11 @@ type CollisionRecord struct {
 	Actors     json.RawMessage `json:"actors"`
 	CreatedAt  string          `json:"created_at"`
 	UpdatedAt  string          `json:"updated_at"`
+	Owner      string          `json:"owner,omitempty"`
+	ResolvedAt string          `json:"resolved_at,omitempty"`
 	Resolution string          `json:"resolution,omitempty"`
+	ResolvedBy string          `json:"resolved_by,omitempty"`
+	DeadActor  string          `json:"dead_actor,omitempty"`
 	Data       json.RawMessage `json:"data"`
 }
 
@@ -83,7 +87,7 @@ func (d *DB) Why(id string, limit int) (WhyAnswer, error) {
 
 func (d *DB) AgentSummary(actor string, limit int, scopes ...ActorScope) (AgentAnswer, error) {
 	scope := selectedScope(scopes)
-	resolved, err := d.ResolveActorScoped(actor, scope.RepositoryID, scope.WorkspaceID)
+	resolved, err := d.ResolveActorScoped(actor, scope.RepositoryUUID, scope.WorkspaceUUID)
 	if err != nil {
 		return AgentAnswer{}, err
 	}
@@ -100,7 +104,7 @@ func (d *DB) AgentSummary(actor string, limit int, scopes ...ActorScope) (AgentA
 
 func (d *DB) SinceCompaction(actor string, limit int, scopes ...ActorScope) (SinceCompactionAnswer, error) {
 	scope := selectedScope(scopes)
-	resolved, err := d.ResolveActorScoped(actor, scope.RepositoryID, scope.WorkspaceID)
+	resolved, err := d.ResolveActorScoped(actor, scope.RepositoryUUID, scope.WorkspaceUUID)
 	if err != nil {
 		return SinceCompactionAnswer{}, err
 	}
@@ -110,7 +114,7 @@ func (d *DB) SinceCompaction(actor string, limit int, scopes ...ActorScope) (Sin
 	var summary, data string
 	err = d.db.QueryRow(`SELECT id, actor, session_generation, type, at, turn_index,
 		COALESCE(summary, ''), data, event_sequence FROM session_events
-		WHERE actor = ? AND type = 'session.compacted' ORDER BY at DESC, event_sequence DESC, id DESC LIMIT 1`, resolved).Scan(
+		WHERE actor = ? AND type = 'session.compacted' ORDER BY at DESC, event_sequence DESC, id DESC LIMIT 1`, uuidBlob(resolved)).Scan(
 		&compaction.ID, &compaction.Actor, &compaction.SessionGeneration, &compaction.Type, &compaction.At,
 		&turnIndex, &summary, &data, &compaction.EventSequence,
 	)
@@ -136,12 +140,12 @@ func (d *DB) SinceCompaction(actor string, limit int, scopes ...ActorScope) (Sin
 
 	rows, err := d.db.Query(`SELECT
 		id, actor, session_generation, COALESCE(turn_id, ''), turn_index, tool_call_id, tool, operation, cwd,
-		COALESCE(repository_id, ''), COALESCE(repository_root, ''), COALESCE(workspace_id, ''),
+		COALESCE(repository_uuid, ''), COALESCE(repository_root, ''), COALESCE(workspace_uuid, ''),
 		COALESCE(workspace_root, ''), COALESCE(workspace_kind, ''), workspace_key, paths_json, relative_paths_json,
 		COALESCE(assistant_excerpt, ''), started_at, COALESCE(completed_at, ''), success,
 		COALESCE(error, ''), before_json, after_json, COALESCE(git_before_json, ''), COALESCE(git_after_json, ''),
 		COALESCE(jj_before_json, ''), COALESCE(jj_after_json, ''), updated_sequence
-		FROM mutations WHERE actor = ? AND started_at >= ? ORDER BY started_at DESC, updated_sequence DESC, id DESC LIMIT ?`, resolved, compaction.At, normalizedLimit(limit))
+		FROM mutations WHERE actor = ? AND started_at >= ? ORDER BY started_at DESC, updated_sequence DESC, id DESC LIMIT ?`, uuidBlob(resolved), compaction.At, normalizedLimit(limit))
 	if err != nil {
 		return SinceCompactionAnswer{}, err
 	}
@@ -158,7 +162,7 @@ func (d *DB) SinceCompaction(actor string, limit int, scopes ...ActorScope) (Sin
 	}
 	eventRows, err := d.db.Query(`SELECT id, actor, session_generation, type, at, turn_index,
 		COALESCE(summary, ''), data, event_sequence FROM session_events
-		WHERE actor = ? AND at >= ? ORDER BY at DESC, event_sequence DESC, id DESC LIMIT ?`, resolved, compaction.At, normalizedLimit(limit))
+		WHERE actor = ? AND at >= ? ORDER BY at DESC, event_sequence DESC, id DESC LIMIT ?`, uuidBlob(resolved), compaction.At, normalizedLimit(limit))
 	if err != nil {
 		return SinceCompactionAnswer{}, err
 	}
@@ -182,8 +186,9 @@ func (d *DB) SinceCompaction(actor string, limit int, scopes ...ActorScope) (Sin
 }
 
 func (d *DB) collisionsForPath(path string, limit int) ([]CollisionRecord, error) {
-	rows, err := d.db.Query(`SELECT id, path, state, actors_json, created_at, updated_at,
-		COALESCE(resolution, ''), data FROM collisions WHERE path = ? ORDER BY updated_at DESC, updated_sequence DESC, id DESC LIMIT ?`, path, normalizedLimit(limit))
+	rows, err := d.db.Query(`SELECT id, path, state, created_at, updated_at,
+		owner, COALESCE(resolved_at, ''), COALESCE(resolution, ''), resolved_by, dead_actor, data
+		FROM collisions WHERE path = ? ORDER BY updated_at DESC, updated_sequence DESC, id DESC LIMIT ?`, path, normalizedLimit(limit))
 	if err != nil {
 		return nil, err
 	}
@@ -191,12 +196,37 @@ func (d *DB) collisionsForPath(path string, limit int) ([]CollisionRecord, error
 	result := make([]CollisionRecord, 0)
 	for rows.Next() {
 		var record CollisionRecord
-		var actors, data string
-		if err := rows.Scan(&record.ID, &record.Path, &record.State, &actors, &record.CreatedAt,
-			&record.UpdatedAt, &record.Resolution, &data); err != nil {
+		var collisionID, data []byte
+		var owner, resolvedBy, deadActor []byte
+		if err := rows.Scan(&collisionID, &record.Path, &record.State, &record.CreatedAt,
+			&record.UpdatedAt, &owner, &record.ResolvedAt, &record.Resolution, &resolvedBy, &deadActor, &data); err != nil {
 			return nil, err
 		}
-		record.Actors = json.RawMessage(actors)
+		record.ID = uuidString(collisionID)
+		actorRows, err := d.db.Query(`SELECT session_uuid FROM collision_actors WHERE collision_id = ? ORDER BY ordinal`, collisionID)
+		if err != nil {
+			return nil, err
+		}
+		actors := make([]string, 0, 2)
+		for actorRows.Next() {
+			var actor []byte
+			if err := actorRows.Scan(&actor); err != nil {
+				actorRows.Close()
+				return nil, err
+			}
+			actors = append(actors, uuidString(actor))
+		}
+		if err := actorRows.Close(); err != nil {
+			return nil, err
+		}
+		encodedActors, err := json.Marshal(actors)
+		if err != nil {
+			return nil, err
+		}
+		record.Actors = encodedActors
+		record.Owner = uuidString(owner)
+		record.ResolvedBy = uuidString(resolvedBy)
+		record.DeadActor = uuidString(deadActor)
 		record.Data = json.RawMessage(data)
 		result = append(result, record)
 	}

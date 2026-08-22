@@ -10,7 +10,7 @@ func TestGitWorktreesShareRepositoryButNotWorkspace(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
 	registerGit := func(address, root, branch string) protocol.Actor {
 		actor, err := engine.Register(protocol.Actor{
-			Address: address, Harness: "pi", SessionID: address[3:], CWD: root, State: "active",
+			Address: address, Harness: "pi", SessionUUID: address[3:], CWD: root, State: "active",
 			Git: &protocol.GitContext{RepoRoot: "/repo", WorktreeRoot: root, CommonDir: "/repo/.git", Branch: branch},
 		})
 		if err != nil {
@@ -20,11 +20,11 @@ func TestGitWorktreesShareRepositoryButNotWorkspace(t *testing.T) {
 	}
 	main := registerGit("pi:main", "/repo", "main")
 	feature := registerGit("pi:feature", "/repo-feature", "feature")
-	if main.RepositoryID != feature.RepositoryID {
-		t.Fatalf("same Git common dir produced different repositories: %s != %s", main.RepositoryID, feature.RepositoryID)
+	if main.RepositoryUUID != feature.RepositoryUUID {
+		t.Fatalf("same Git common dir produced different repositories: %s != %s", main.RepositoryUUID, feature.RepositoryUUID)
 	}
-	if main.WorkspaceID == feature.WorkspaceID {
-		t.Fatalf("different worktrees produced the same workspace: %s", main.WorkspaceID)
+	if main.WorkspaceUUID == feature.WorkspaceUUID {
+		t.Fatalf("different worktrees produced the same workspace: %s", main.WorkspaceUUID)
 	}
 }
 
@@ -32,7 +32,7 @@ func TestAliasResolutionPrefersSenderWorkspaceThenRepository(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
 	actor := func(address, root string) protocol.Actor {
 		value, err := engine.Register(protocol.Actor{
-			Address: address, Harness: "pi", SessionID: address[3:], CWD: root, State: "active",
+			Address: address, Harness: "pi", SessionUUID: address[3:], CWD: root, State: "active",
 			Git: &protocol.GitContext{RepoRoot: "/repo", WorktreeRoot: root, CommonDir: "/repo/.git"},
 		})
 		if err != nil {
@@ -61,7 +61,7 @@ func TestAliasResolutionPrefersSenderWorkspaceThenRepository(t *testing.T) {
 func TestIntentGetsRepositoryRelativePathsAndDirectoryScope(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
 	actor, err := engine.Register(protocol.Actor{
-		Address: "pi:worker", Harness: "pi", SessionID: "worker", CWD: "/repo", State: "active",
+		Address: "pi:worker", Harness: "pi", SessionUUID: "worker", CWD: "/repo", State: "active",
 		Git: &protocol.GitContext{RepoRoot: "/repo", WorktreeRoot: "/repo", CommonDir: "/repo/.git"},
 	})
 	if err != nil {
@@ -75,7 +75,7 @@ func TestIntentGetsRepositoryRelativePathsAndDirectoryScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	stored := engine.intents[intent.ID]
-	if stored.RepositoryID != actor.RepositoryID || stored.WorkspaceID != actor.WorkspaceID {
+	if stored.RepositoryUUID != actor.RepositoryUUID || stored.WorkspaceUUID != actor.WorkspaceUUID {
 		t.Fatalf("intent scope mismatch: %#v vs %#v", stored, actor)
 	}
 	if len(stored.RelativePaths) != 1 || stored.RelativePaths[0] != "src/schema.ts" {

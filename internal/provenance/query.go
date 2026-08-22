@@ -18,9 +18,9 @@ type MutationRecord struct {
 	Tool              string          `json:"tool"`
 	Operation         string          `json:"operation"`
 	CWD               string          `json:"cwd"`
-	RepositoryID      string          `json:"repository_id,omitempty"`
+	RepositoryUUID    string          `json:"repository_uuid,omitempty"`
 	RepositoryRoot    string          `json:"repository_root,omitempty"`
-	WorkspaceID       string          `json:"workspace_id,omitempty"`
+	WorkspaceUUID     string          `json:"workspace_uuid,omitempty"`
 	WorkspaceRoot     string          `json:"workspace_root,omitempty"`
 	WorkspaceKind     string          `json:"workspace_kind,omitempty"`
 	WorkspaceKey      string          `json:"workspace_key"`
@@ -41,8 +41,8 @@ type MutationRecord struct {
 }
 
 type ActorScope struct {
-	RepositoryID string
-	WorkspaceID  string
+	RepositoryUUID string
+	WorkspaceUUID  string
 }
 
 func selectedScope(scopes []ActorScope) ActorScope {
@@ -53,12 +53,12 @@ func selectedScope(scopes []ActorScope) ActorScope {
 }
 
 type MutationFilter struct {
-	Actor        string
-	Path         string
-	RepositoryID string
-	WorkspaceID  string
-	Limit        int
-	Failed       bool
+	Actor          string
+	Path           string
+	RepositoryUUID string
+	WorkspaceUUID  string
+	Limit          int
+	Failed         bool
 }
 
 type EventRecord struct {
@@ -90,7 +90,7 @@ type RepositoryRecord struct {
 
 type WorkspaceRecord struct {
 	ID              string `json:"id"`
-	RepositoryID    string `json:"repository_id"`
+	RepositoryUUID  string `json:"repository_uuid"`
 	Root            string `json:"root"`
 	Kind            string `json:"kind"`
 	GitBranch       string `json:"git_branch,omitempty"`
@@ -133,7 +133,7 @@ func (d *DB) Scopes() (ScopeRecords, error) {
 	if err := repositories.Close(); err != nil {
 		return result, err
 	}
-	workspaces, err := d.db.Query(`SELECT id, repository_id, root, kind, COALESCE(git_branch, ''), COALESCE(git_head, ''),
+	workspaces, err := d.db.Query(`SELECT id, repository_uuid, root, kind, COALESCE(git_branch, ''), COALESCE(git_head, ''),
 		COALESCE(jj_workspace_name, ''), COALESCE(jj_change_id, '') FROM workspaces ORDER BY root, id`)
 	if err != nil {
 		return result, err
@@ -141,7 +141,7 @@ func (d *DB) Scopes() (ScopeRecords, error) {
 	defer workspaces.Close()
 	for workspaces.Next() {
 		var record WorkspaceRecord
-		if err := workspaces.Scan(&record.ID, &record.RepositoryID, &record.Root, &record.Kind, &record.GitBranch,
+		if err := workspaces.Scan(&record.ID, &record.RepositoryUUID, &record.Root, &record.Kind, &record.GitBranch,
 			&record.GitHead, &record.JJWorkspaceName, &record.JJChangeID); err != nil {
 			return result, err
 		}
@@ -175,20 +175,20 @@ func (d *DB) ListMutations(filter MutationFilter) ([]MutationRecord, error) {
 	conditions := []string{"1=1"}
 	arguments := make([]any, 0, 4)
 	if filter.Actor != "" {
-		actor, err := d.ResolveActorScoped(filter.Actor, filter.RepositoryID, filter.WorkspaceID)
+		actor, err := d.ResolveActorScoped(filter.Actor, filter.RepositoryUUID, filter.WorkspaceUUID)
 		if err != nil {
 			return nil, err
 		}
 		conditions = append(conditions, "m.actor = ?")
-		arguments = append(arguments, actor)
+		arguments = append(arguments, uuidBlob(actor))
 	}
-	if filter.RepositoryID != "" {
-		conditions = append(conditions, "m.repository_id = ?")
-		arguments = append(arguments, filter.RepositoryID)
+	if filter.RepositoryUUID != "" {
+		conditions = append(conditions, "m.repository_uuid = ?")
+		arguments = append(arguments, uuidBlob(filter.RepositoryUUID))
 	}
-	if filter.WorkspaceID != "" {
-		conditions = append(conditions, "m.workspace_id = ?")
-		arguments = append(arguments, filter.WorkspaceID)
+	if filter.WorkspaceUUID != "" {
+		conditions = append(conditions, "m.workspace_uuid = ?")
+		arguments = append(arguments, uuidBlob(filter.WorkspaceUUID))
 	}
 	if filter.Path != "" {
 		conditions = append(conditions, "EXISTS (SELECT 1 FROM mutation_paths p WHERE p.mutation_id = m.id AND p.path = ?)")
@@ -200,7 +200,7 @@ func (d *DB) ListMutations(filter MutationFilter) ([]MutationRecord, error) {
 	arguments = append(arguments, limit)
 	rows, err := d.db.Query(`SELECT
 		m.id, m.actor, m.session_generation, COALESCE(m.turn_id, ''), m.turn_index, m.tool_call_id, m.tool, m.operation, m.cwd,
-		COALESCE(m.repository_id, ''), COALESCE(m.repository_root, ''), COALESCE(m.workspace_id, ''),
+		COALESCE(m.repository_uuid, ''), COALESCE(m.repository_root, ''), COALESCE(m.workspace_uuid, ''),
 		COALESCE(m.workspace_root, ''), COALESCE(m.workspace_kind, ''), m.workspace_key,
 		m.paths_json, m.relative_paths_json, COALESCE(m.assistant_excerpt, ''), m.started_at, COALESCE(m.completed_at, ''),
 		m.success, COALESCE(m.error, ''), m.before_json, m.after_json,
@@ -225,7 +225,7 @@ func (d *DB) ListMutations(filter MutationFilter) ([]MutationRecord, error) {
 func (d *DB) Mutation(id string) (MutationRecord, error) {
 	row := d.db.QueryRow(`SELECT
 		id, actor, session_generation, COALESCE(turn_id, ''), turn_index, tool_call_id, tool, operation, cwd,
-		COALESCE(repository_id, ''), COALESCE(repository_root, ''), COALESCE(workspace_id, ''),
+		COALESCE(repository_uuid, ''), COALESCE(repository_root, ''), COALESCE(workspace_uuid, ''),
 		COALESCE(workspace_root, ''), COALESCE(workspace_kind, ''), workspace_key,
 		paths_json, relative_paths_json, COALESCE(assistant_excerpt, ''), started_at, COALESCE(completed_at, ''),
 		success, COALESCE(error, ''), before_json, after_json,
@@ -250,7 +250,7 @@ func scanMutation(row scanner) (MutationRecord, error) {
 	var success sql.NullBool
 	var turnIndex sql.NullInt64
 	err := row.Scan(&record.ID, &record.Actor, &record.SessionGeneration, &record.TurnID, &turnIndex, &record.ToolCallID, &record.Tool,
-		&record.Operation, &record.CWD, &record.RepositoryID, &record.RepositoryRoot, &record.WorkspaceID,
+		&record.Operation, &record.CWD, &record.RepositoryUUID, &record.RepositoryRoot, &record.WorkspaceUUID,
 		&record.WorkspaceRoot, &record.WorkspaceKind, &record.WorkspaceKey, &paths, &relativePaths, &record.AssistantExcerpt,
 		&record.StartedAt, &record.CompletedAt, &success, &record.Error, &before, &after,
 		&gitBefore, &gitAfter, &jjBefore, &jjAfter, &record.UpdatedSequence)
@@ -291,7 +291,7 @@ func (d *DB) Timeline(actor, eventType string, limit int, scopes ...ActorScope) 
 	arguments := make([]any, 0, 3)
 	if actor != "" {
 		scope := selectedScope(scopes)
-		resolved, err := d.ResolveActorScoped(actor, scope.RepositoryID, scope.WorkspaceID)
+		resolved, err := d.ResolveActorScoped(actor, scope.RepositoryUUID, scope.WorkspaceUUID)
 		if err != nil {
 			return nil, err
 		}
@@ -326,12 +326,12 @@ func (d *DB) SessionEvents(actor string, limit int, scopes ...ActorScope) ([]Ses
 		limit = 100
 	}
 	scope := selectedScope(scopes)
-	resolved, err := d.ResolveActorScoped(actor, scope.RepositoryID, scope.WorkspaceID)
+	resolved, err := d.ResolveActorScoped(actor, scope.RepositoryUUID, scope.WorkspaceUUID)
 	if err != nil {
 		return nil, err
 	}
 	rows, err := d.db.Query(`SELECT id, actor, session_generation, type, at, turn_index,
-		COALESCE(summary, ''), data, event_sequence FROM session_events WHERE actor = ? ORDER BY at DESC, event_sequence DESC, id DESC LIMIT ?`, resolved, limit)
+		COALESCE(summary, ''), data, event_sequence FROM session_events WHERE actor = ? ORDER BY at DESC, event_sequence DESC, id DESC LIMIT ?`, uuidBlob(resolved), limit)
 	if err != nil {
 		return nil, err
 	}

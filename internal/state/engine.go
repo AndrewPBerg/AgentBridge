@@ -42,6 +42,7 @@ type Engine struct {
 	mailboxes          map[string][]string
 	collisions         map[string]protocol.Collision
 	collisionByKey     map[string]string
+	checkpoints        map[string]protocol.CheckpointRequest
 }
 
 type Options struct {
@@ -76,6 +77,7 @@ func New(journal Appender, events []protocol.Event, options Options) (*Engine, e
 		mailboxes:          make(map[string][]string),
 		collisions:         make(map[string]protocol.Collision),
 		collisionByKey:     make(map[string]string),
+		checkpoints:        make(map[string]protocol.CheckpointRequest),
 	}
 	for _, event := range events {
 		if event.Sequence <= engine.eventSequence {
@@ -152,6 +154,16 @@ func (e *Engine) apply(event protocol.Event) error {
 		if _, err := decode[protocol.SessionEvent](event); err != nil {
 			return err
 		}
+	case "test.result":
+		if _, err := decode[protocol.TestResult](event); err != nil {
+			return err
+		}
+	case "checkpoint.requested":
+		request, err := decode[protocol.CheckpointRequest](event)
+		if err != nil {
+			return err
+		}
+		e.checkpoints[request.ID] = request
 	case "message.acked":
 		ack, err := decode[ackEvent](event)
 		if err != nil {
@@ -175,8 +187,8 @@ func (e *Engine) apply(event protocol.Event) error {
 func (e *Engine) Register(actor protocol.Actor) (protocol.Actor, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if actor.Address == "" || actor.Harness == "" || actor.SessionID == "" || actor.CWD == "" {
-		return protocol.Actor{}, errors.New("address, harness, session_id, and cwd are required")
+	if actor.Address == "" || actor.Harness == "" || actor.SessionUUID == "" || actor.CWD == "" {
+		return protocol.Actor{}, errors.New("address, harness, session_uuid, and cwd are required")
 	}
 	previous := e.actors[actor.Address]
 	if actor.Alias == "" {
@@ -242,8 +254,8 @@ func (e *Engine) SetAlias(address, alias string) (protocol.Actor, error) {
 		return protocol.Actor{}, errors.New("alias is required")
 	}
 	for _, candidate := range e.actors {
-		if candidate.Address != address && candidate.Alias == alias && candidate.WorkspaceID == actor.WorkspaceID && e.active(candidate) {
-			return protocol.Actor{}, fmt.Errorf("alias @%s is already active in workspace %s", alias, actor.WorkspaceID)
+		if candidate.Address != address && candidate.Alias == alias && candidate.WorkspaceUUID == actor.WorkspaceUUID && e.active(candidate) {
+			return protocol.Actor{}, fmt.Errorf("alias @%s is already active in workspace %s", alias, actor.WorkspaceUUID)
 		}
 	}
 	actor.Alias = alias
@@ -257,6 +269,23 @@ func (e *Engine) active(actor protocol.Actor) bool {
 	return actor.State != "dead" && e.now().Sub(actor.HeartbeatAt) <= e.actorTTL
 }
 
+// expireStaleLocked makes the persisted actor state agree with the liveness
+// check. Staleness used to be only a filter, which left old actors reporting
+// their last state (often "waiting") forever when stale sessions were listed.
+func (e *Engine) expireStaleLocked() {
+	now := e.now().UTC()
+	for address, actor := range e.actors {
+		if actor.State == "dead" || now.Sub(actor.HeartbeatAt) <= e.actorTTL {
+			continue
+		}
+		actor.State = "dead"
+		e.actors[address] = actor
+		// A failed append should not make an actor appear live again in this
+		// process; the next journal replay will retain the prior state instead.
+		_ = e.record("actor.upserted", actor)
+	}
+}
+
 func (e *Engine) Sessions(includeStale bool) []protocol.Actor {
 	return e.SessionsScoped(includeStale, protocol.ScopeFilter{})
 }
@@ -264,15 +293,16 @@ func (e *Engine) Sessions(includeStale bool) []protocol.Actor {
 func (e *Engine) SessionsScoped(includeStale bool, scope protocol.ScopeFilter) []protocol.Actor {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.expireStaleLocked()
 	actors := make([]protocol.Actor, 0, len(e.actors))
 	for _, actor := range e.actors {
 		if !includeStale && !e.active(actor) {
 			continue
 		}
-		if scope.RepositoryID != "" && actor.RepositoryID != scope.RepositoryID {
+		if scope.RepositoryUUID != "" && actor.RepositoryUUID != scope.RepositoryUUID {
 			continue
 		}
-		if scope.WorkspaceID != "" && actor.WorkspaceID != scope.WorkspaceID {
+		if scope.WorkspaceUUID != "" && actor.WorkspaceUUID != scope.WorkspaceUUID {
 			continue
 		}
 		if scope.Directory != "" && !underDirectory(actor.CWD, scope.Directory) && !e.actorTouchesDirectory(actor.Address, scope.Directory) {
@@ -306,7 +336,7 @@ func (e *Engine) resolve(selector, senderAddress string) (protocol.Actor, error)
 	sender := e.actors[senderAddress]
 	var matches []protocol.Actor
 	for _, actor := range e.actors {
-		matched := actor.SessionID == normalized
+		matched := actor.SessionUUID == normalized
 		if strings.HasPrefix(normalized, "change:") && actor.JJ != nil {
 			matched = strings.HasPrefix(actor.JJ.ChangeID, strings.TrimPrefix(normalized, "change:"))
 		} else if strings.HasPrefix(normalized, "git:") && actor.Git != nil {
@@ -318,12 +348,12 @@ func (e *Engine) resolve(selector, senderAddress string) (protocol.Actor, error)
 			matches = append(matches, actor)
 		}
 	}
-	if len(matches) > 1 && sender.WorkspaceID != "" {
-		workspace := filterActors(matches, func(actor protocol.Actor) bool { return actor.WorkspaceID == sender.WorkspaceID })
+	if len(matches) > 1 && sender.WorkspaceUUID != "" {
+		workspace := filterActors(matches, func(actor protocol.Actor) bool { return actor.WorkspaceUUID == sender.WorkspaceUUID })
 		if len(workspace) > 0 {
 			matches = workspace
 		} else {
-			repository := filterActors(matches, func(actor protocol.Actor) bool { return actor.RepositoryID == sender.RepositoryID })
+			repository := filterActors(matches, func(actor protocol.Actor) bool { return actor.RepositoryUUID == sender.RepositoryUUID })
 			if len(repository) > 0 {
 				matches = repository
 			}
@@ -486,7 +516,7 @@ func (e *Engine) ensureCollision(left, right protocol.Intent, path string) (prot
 	}
 	now := e.now().UTC()
 	collision := protocol.Collision{
-		ID:        randomID("col"),
+		ID:        randomUUID(),
 		Key:       key,
 		Path:      path,
 		Actors:    actors,
@@ -551,6 +581,69 @@ func (e *Engine) EndIntent(params protocol.IntentEndParams) (protocol.Intent, er
 		return protocol.Intent{}, err
 	}
 	return intent, nil
+}
+
+func (e *Engine) RecordTestResult(result protocol.TestResult) (protocol.TestResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.actors[result.Actor]; !ok {
+		return protocol.TestResult{}, fmt.Errorf("unknown actor %q", result.Actor)
+	}
+	if result.ID == "" || result.Command == "" {
+		return protocol.TestResult{}, errors.New("test result id and command are required")
+	}
+	if result.CompletedAt.IsZero() {
+		result.CompletedAt = e.now().UTC()
+	}
+	if result.StartedAt.IsZero() {
+		result.StartedAt = result.CompletedAt
+	}
+	if err := e.record("test.result", result); err != nil {
+		return protocol.TestResult{}, err
+	}
+	return result, nil
+}
+
+func (e *Engine) RequestCheckpoint(request protocol.CheckpointRequest) (protocol.CheckpointRequest, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if existing, ok := e.checkpoints[request.ID]; ok {
+		return existing, nil
+	}
+	actor, ok := e.actors[request.Actor]
+	if !ok {
+		return protocol.CheckpointRequest{}, fmt.Errorf("unknown actor %q", request.Actor)
+	}
+	if request.ID == "" || request.CheckpointKind == "" {
+		return protocol.CheckpointRequest{}, errors.New("checkpoint id and kind are required")
+	}
+	if request.SessionGeneration == 0 {
+		request.SessionGeneration = actor.Generation
+	}
+	if request.RepositoryUUID == "" {
+		request.RepositoryUUID = actor.RepositoryUUID
+	}
+	if request.WorkspaceUUID == "" {
+		request.WorkspaceUUID = actor.WorkspaceUUID
+	}
+	if request.JournalEnd == 0 {
+		request.JournalEnd = e.eventSequence
+	}
+	if request.JournalStart == 0 {
+		request.JournalStart = request.JournalEnd
+		for _, previous := range e.checkpoints {
+			if previous.Actor == request.Actor && previous.SessionGeneration == request.SessionGeneration && previous.RepositoryUUID == request.RepositoryUUID && previous.WorkspaceUUID == request.WorkspaceUUID && previous.CheckpointKind == request.CheckpointKind && previous.JournalEnd < request.JournalStart {
+				request.JournalStart = previous.JournalEnd + 1
+			}
+		}
+	}
+	if request.JournalStart > request.JournalEnd {
+		return protocol.CheckpointRequest{}, errors.New("checkpoint journal range is invalid")
+	}
+	if err := e.record("checkpoint.requested", request); err != nil {
+		return protocol.CheckpointRequest{}, err
+	}
+	return request, nil
 }
 
 func (e *Engine) RecordSessionEvent(event protocol.SessionEvent) (protocol.SessionEvent, error) {
@@ -745,4 +838,15 @@ func randomID(prefix string) string {
 		panic(err)
 	}
 	return prefix + ":" + hex.EncodeToString(value[:])
+}
+
+func randomUUID() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		panic(err)
+	}
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	encoded := hex.EncodeToString(value[:])
+	return encoded[:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:]
 }

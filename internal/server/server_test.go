@@ -33,7 +33,7 @@ func TestUnixSocketRoundTrip(t *testing.T) {
 	bridge := client.New(path)
 	var registered protocol.Actor
 	if err := bridge.Call(context.Background(), "actor.register", protocol.RegisterParams{Actor: protocol.Actor{
-		Address: "pi:test", Harness: "pi", SessionID: "test", CWD: "/repo",
+		Address: "pi:test", Harness: "pi", SessionUUID: "test", CWD: "/repo",
 	}}, &registered); err != nil {
 		t.Fatal(err)
 	}

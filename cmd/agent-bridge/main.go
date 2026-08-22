@@ -118,7 +118,7 @@ func sessions(args []string) error {
 		return err
 	}
 	return callAndPrint("sessions.list", map[string]any{
-		"include_stale": *includeStale, "repository_id": *repositoryID, "workspace_id": *workspaceID, "directory": *directory,
+		"include_stale": *includeStale, "repository_uuid": *repositoryID, "workspace_uuid": *workspaceID, "directory": *directory,
 	})
 }
 
