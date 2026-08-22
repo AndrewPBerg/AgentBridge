@@ -182,6 +182,32 @@ describe("Go Agent Bridge adapter", () => {
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });
 
+  it("declares agent and human checkpoints through the daemon", async () => {
+    const pi = createMockPi();
+    const client = mockClient((method) => {
+      if (method === "checkpoint.request") {
+        return { id: "checkpoint:test", actor: "pi:sender", checkpoint_kind: "settled" };
+      }
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.events.get("turn_start")?.[0]?.({ turnIndex: 4, timestamp: Date.now() }, ctx);
+    const tool = pi.tools.get("bridge_checkpoint");
+    await tool.execute("checkpoint-call", { kind: "settled" });
+    expect(client.call).toHaveBeenCalledWith(
+      "checkpoint.request",
+      expect.objectContaining({
+        request: expect.objectContaining({ actor: "pi:sender", declared_by: "agent", checkpoint_kind: "settled", turn_index: 4 }),
+      }),
+    );
+    await pi.commands.get("checkpoint").handler("handoff", ctx);
+    expect(client.call).toHaveBeenCalledWith(
+      "checkpoint.request",
+      expect.objectContaining({ request: expect.objectContaining({ declared_by: "human", checkpoint_kind: "handoff" }) }),
+    );
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
   it("exposes persisted provenance as a first-class read-only Pi tool", async () => {
     const pi = createMockPi();
     const client = mockClient((method) => {

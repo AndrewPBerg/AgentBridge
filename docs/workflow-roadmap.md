@@ -324,7 +324,9 @@ When peers share the workspace or repository:
 
 `jj op restore` must never be the normal agent rewind mechanism. Even `jj undo` and `jj op revert` become unsafe when operations from multiple actors or workspaces are interleaved. Prefer selective tree restoration or forward repair.
 
-## Workflow implementation phases
+## Deferred workflow implementation phases
+
+The phases below describe later JJ/safety integration. They do not supersede the immediate checkpoint substrate in the primary roadmap; checkpoint declaration and deterministic evidence come first.
 
 ### Workflow Phase 0 — Guidance and observability
 
@@ -521,18 +523,17 @@ Each resource made safely shareable removes another reason to create a workspace
 
 Exit condition: WTF is invoked because policy found a real isolation requirement, not merely because a second agent exists.
 
-### Workflow Phase 8 — Contention-activated semantics
+### Workflow Phase 8 — Optional semantic enrichment (deferred)
 
-Integrate this roadmap with the primary semantic-checkpoint roadmap:
+This phase is not a prerequisite for the core work-unit/checkpoint workflow. If revisited later:
 
-- no model calls for ordinary solo work;
-- activate extraction when multiple actors share a repository;
-- prioritize exact mutation and stale-baseline evidence when actors share a workspace;
-- extract objective, decisions, constraints, affected modules, abandoned approaches, and handoff context;
-- cite deterministic journal/checkpoint evidence; and
+- keep agent- and human-authored work-unit state authoritative;
+- treat model extraction as an optional sidecar;
+- cite deterministic journal/checkpoint evidence;
+- keep enrichment bounded and regenerable; and
 - never treat model output as coordination truth.
 
-Exit condition: agents can retrieve a compact explanation of another actor, work unit, or JJ change without loading full transcripts or invoking another model.
+Do not add contention admission, smart triggers, extraction queues, or retrieval injection until the deterministic workflow has demonstrated a need for them.
 
 ## Shared workspace versus WTF decision table
 
@@ -609,24 +610,24 @@ Put stable norms in the prompt, recipes in skills, mechanics in the adapter, and
 
 ## Immediate next implementation slice
 
-The next disciplined slice is **atomic exact-path mutation admission**, followed immediately by observed-baseline protection.
+The next disciplined slice is the **agent- and human-declared checkpoint substrate**. Checkpoints stand alone initially, but conceptually are child evidence records that a WorkUnit can own or link through an optional `work_unit_id`. An explicit checkpoint records an immutable evidence boundary, while WorkUnit composition, `/work <objective>`, and top-level ordering follow afterward.
 
 Why first:
 
-- it directly converts current collision observation into pre-damage safety;
-- it is deterministic and token-free;
-- it makes same-workspace execution materially safer without semantic indexing;
-- it restores the strongest lesson from the first prototype; and
-- every later work-unit, rewind, and WTF decision can build on the same admission evidence.
+- it establishes durable provenance without model dependence;
+- it gives agents and humans explicit stopping points;
+- it keeps checkpoint identity and evidence independently testable; and
+- it provides the stable child records from which future WorkUnits can be composed.
 
 Suggested order:
 
-1. extend protocol types with admission result and lease state;
-2. make `intent.begin` atomically decide `grant | wait | warn | block`;
-3. enforce the result in Pi `tool_call`;
-4. expire leases on completion, failure, cancellation, and actor death;
-5. add replay tests;
-6. record read observations and expected baselines; and
-7. block high-confidence stale whole-file writes.
+1. add the minimal checkpoint protocol and declaration path;
+2. capture agent/human declaration source and immutable evidence identity;
+3. project deterministic evidence references and latest-checkpoint queries; and
+4. add replay, idempotency, and immutability tests.
 
-Only after that should the workflow automatically snapshot, create semantic work units, or shrink workspace isolation defaults.
+WorkUnit composition should later add the mutable objective/lifecycle envelope and `/work <objective>` behavior. Reserve known verbs such as `status`, `list`, `stop`, `handoff`, `resume`, and `attach` for future subcommands, with quoting/disambiguation for objectives beginning with them.
+
+### Later safety work
+
+Defer atomic mutation admission, path leases, and observed-baseline protection until the core workflow is useful. Preserve the existing collision observation behavior in the meantime; when implemented, admission should remain deterministic, auditable, and independent of semantic sidecars.

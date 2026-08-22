@@ -11,7 +11,7 @@ import (
 
 func provenanceCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: agent-bridge provenance <status|snapshot|who-changed|why|agent|since-compaction|mutations|explain|timeline|session>")
+		return errors.New("usage: agent-bridge provenance <status|snapshot|checkpoints|who-changed|why|agent|since-compaction|mutations|explain|timeline|session>")
 	}
 	switch args[0] {
 	case "snapshot":
@@ -23,6 +23,22 @@ func provenanceCommand(args []string) error {
 	switch args[0] {
 	case "status":
 		return callAndPrint("provenance.status", map[string]any{})
+	case "checkpoint":
+		if len(args) != 2 {
+			return errors.New("usage: agent-bridge provenance checkpoint <checkpoint-id>")
+		}
+		return callAndPrint("provenance.checkpoint", map[string]any{"id": args[1]})
+	case "checkpoints":
+		flags := flag.NewFlagSet("provenance checkpoints", flag.ContinueOnError)
+		workUnitUUID := flags.String("work-unit", "", "optional WorkUnit UUID filter")
+		limit := flags.Int("limit", 50, "maximum records")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		if len(flags.Args()) != 0 {
+			return errors.New("usage: agent-bridge provenance checkpoints [--work-unit UUID] [--limit N]")
+		}
+		return callAndPrint("provenance.checkpoints", map[string]any{"work_unit_uuid": *workUnitUUID, "limit": *limit})
 	case "who-changed":
 		flags := flag.NewFlagSet("provenance who-changed", flag.ContinueOnError)
 		limit := flags.Int("limit", 20, "maximum records")

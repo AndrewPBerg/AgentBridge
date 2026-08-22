@@ -212,7 +212,7 @@ func TestCanonicalAddressAcceptsMailWhileActorIsStale(t *testing.T) {
 }
 
 func TestCollisionLifecycleDeduplicatesAndCanResolve(t *testing.T) {
-	engine, _, now := newTestEngine(t)
+	engine, journal, now := newTestEngine(t)
 	register(t, engine, "pi:a")
 	register(t, engine, "pi:b")
 	base := func(id, actor string) protocol.Intent {
@@ -266,6 +266,28 @@ func TestCollisionLifecycleDeduplicatesAndCanResolve(t *testing.T) {
 		Resolution:  "b owns shared.go",
 	}); err != nil {
 		t.Fatal(err)
+	}
+	var transitions []protocol.CollisionTransitionEvent
+	for _, event := range journal.events {
+		if event.Type != "collision.transitioned" {
+			continue
+		}
+		value, err := decode[protocol.CollisionTransitionEvent](event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transitions = append(transitions, value)
+	}
+	if len(transitions) != 3 || transitions[2].To != protocol.CollisionResolved {
+		t.Fatalf("collision transitions = %#v", transitions)
+	}
+	replayed, err := New(&memoryJournal{}, journal.events, Options{Now: time.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedCollision := replayed.collisions[collision.ID]
+	if replayedCollision.State != protocol.CollisionResolved || replayedCollision.ResolvedBy != "pi:b" || replayedCollision.Resolution != "b owns shared.go" {
+		t.Fatalf("replayed collision = %#v", replayedCollision)
 	}
 
 	*now = now.Add(time.Second)
@@ -429,6 +451,49 @@ func TestConcurrentSendsAreRaceSafeAndUnique(t *testing.T) {
 			t.Fatalf("duplicate recipient sequence %d", message.RecipientSequence)
 		}
 		seen[message.RecipientSequence] = true
+	}
+}
+
+func TestDeadCollisionNotifiesSurvivorAndReplays(t *testing.T) {
+	engine, journal, _ := newTestEngine(t)
+	register(t, engine, "pi:a")
+	register(t, engine, "pi:b")
+	intent := func(id, actor string) protocol.Intent {
+		return protocol.Intent{ID: id, Actor: actor, ToolCallID: id, Tool: "edit", Operation: "write", Paths: []string{"/repo/shared.go"}, CWD: "/repo"}
+	}
+	if _, err := engine.BeginIntent(intent("a", "pi:a")); err != nil {
+		t.Fatal(err)
+	}
+	collisions, err := engine.BeginIntent(intent("b", "pi:b"))
+	if err != nil || len(collisions) != 1 {
+		t.Fatalf("collision = %#v, err = %v", collisions, err)
+	}
+	collision := collisions[0]
+	if _, err := engine.Heartbeat(protocol.HeartbeatParams{Address: "pi:b", State: "dead"}); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := engine.Poll("pi:a", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadMessages := 0
+	for _, message := range messages {
+		if message.Kind == "collision-dead" {
+			deadMessages++
+			if message.CollisionID != collision.ID {
+				t.Fatalf("dead notification collision = %q, want %q", message.CollisionID, collision.ID)
+			}
+		}
+	}
+	if deadMessages != 1 {
+		t.Fatalf("dead notifications = %d, want 1: %#v", deadMessages, messages)
+	}
+	replayed, err := New(&memoryJournal{}, journal.events, Options{Now: time.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := replayed.collisions[collision.ID].DeadActor; got != "pi:b" {
+		t.Fatalf("replayed dead actor = %q", got)
 	}
 }
 

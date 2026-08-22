@@ -77,7 +77,23 @@ type Status struct {
 	Workspaces        int64  `json:"workspaces"`
 	Mutations         int64  `json:"mutations"`
 	SessionEvents     int64  `json:"session_events"`
+	Checkpoints       int64  `json:"checkpoints"`
 	Collisions        int64  `json:"collisions"`
+}
+
+type CheckpointRecord struct {
+	ID                string          `json:"id"`
+	Actor             string          `json:"actor"`
+	DeclaredBy        string          `json:"declared_by"`
+	SessionGeneration uint64          `json:"session_generation"`
+	RepositoryUUID    string          `json:"repository_uuid"`
+	WorkspaceUUID     string          `json:"workspace_uuid"`
+	WorkUnitUUID      string          `json:"work_unit_uuid,omitempty"`
+	CheckpointKind    string          `json:"checkpoint_kind"`
+	JournalStart      uint64          `json:"journal_start_sequence"`
+	JournalEnd        uint64          `json:"journal_end_sequence"`
+	Data              json.RawMessage `json:"data"`
+	EventSequence     uint64          `json:"event_sequence"`
 }
 
 type RepositoryRecord struct {
@@ -124,10 +140,12 @@ func (d *DB) Scopes() (ScopeRecords, error) {
 	}
 	for repositories.Next() {
 		var record RepositoryRecord
-		if err := repositories.Scan(&record.ID, &record.Root, &record.Kind, &record.GitCommonDir, &record.JJRepoPath); err != nil {
+		var id []byte
+		if err := repositories.Scan(&id, &record.Root, &record.Kind, &record.GitCommonDir, &record.JJRepoPath); err != nil {
 			repositories.Close()
 			return result, err
 		}
+		record.ID = uuidString(id)
 		result.Repositories = append(result.Repositories, record)
 	}
 	if err := repositories.Close(); err != nil {
@@ -141,10 +159,13 @@ func (d *DB) Scopes() (ScopeRecords, error) {
 	defer workspaces.Close()
 	for workspaces.Next() {
 		var record WorkspaceRecord
-		if err := workspaces.Scan(&record.ID, &record.RepositoryUUID, &record.Root, &record.Kind, &record.GitBranch,
+		var id, repositoryUUID []byte
+		if err := workspaces.Scan(&id, &repositoryUUID, &record.Root, &record.Kind, &record.GitBranch,
 			&record.GitHead, &record.JJWorkspaceName, &record.JJChangeID); err != nil {
 			return result, err
 		}
+		record.ID = uuidString(id)
+		record.RepositoryUUID = uuidString(repositoryUUID)
 		result.Workspaces = append(result.Workspaces, record)
 	}
 	return result, workspaces.Err()
@@ -160,11 +181,70 @@ func (d *DB) Status() (Status, error) {
 		(SELECT COUNT(*) FROM workspaces),
 		(SELECT COUNT(*) FROM mutations),
 		(SELECT COUNT(*) FROM session_events),
+		(SELECT COUNT(*) FROM checkpoint_requests),
 		(SELECT COUNT(*) FROM collisions)`).Scan(
 		&status.ProjectedSequence, &status.Events, &status.Actors, &status.Repositories, &status.Workspaces,
-		&status.Mutations, &status.SessionEvents, &status.Collisions,
+		&status.Mutations, &status.SessionEvents, &status.Checkpoints, &status.Collisions,
 	)
 	return status, err
+}
+
+func (d *DB) ListCheckpoints(workUnitUUID string, limit int) ([]CheckpointRecord, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 50
+	}
+	query := `SELECT id, actor, declared_by, session_generation, repository_uuid, workspace_uuid,
+		COALESCE(work_unit_uuid, ''), checkpoint_kind, journal_start_sequence, journal_end_sequence,
+		data, event_sequence FROM checkpoint_requests`
+	arguments := []any{}
+	if workUnitUUID != "" {
+		query += ` WHERE work_unit_uuid = ?`
+		arguments = append(arguments, uuidBlob(workUnitUUID))
+	}
+	query += ` ORDER BY journal_end_sequence DESC, event_sequence DESC, id DESC LIMIT ?`
+	arguments = append(arguments, limit)
+	rows, err := d.db.Query(query, arguments...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]CheckpointRecord, 0)
+	for rows.Next() {
+		record, err := scanCheckpoint(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, record)
+	}
+	return result, rows.Err()
+}
+
+func (d *DB) Checkpoint(id string) (CheckpointRecord, error) {
+	row := d.db.QueryRow(`SELECT id, actor, declared_by, session_generation, repository_uuid, workspace_uuid,
+		COALESCE(work_unit_uuid, ''), checkpoint_kind, journal_start_sequence, journal_end_sequence,
+		data, event_sequence FROM checkpoint_requests WHERE id = ?`, id)
+	record, err := scanCheckpoint(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CheckpointRecord{}, fmt.Errorf("unknown checkpoint %q", id)
+	}
+	return record, err
+}
+
+func scanCheckpoint(row scanner) (CheckpointRecord, error) {
+	var record CheckpointRecord
+	var actor, repository, workspace, workUnit []byte
+	var data string
+	err := row.Scan(&record.ID, &actor, &record.DeclaredBy, &record.SessionGeneration, &repository, &workspace,
+		&workUnit, &record.CheckpointKind, &record.JournalStart, &record.JournalEnd, &data, &record.EventSequence)
+	if err != nil {
+		return CheckpointRecord{}, err
+	}
+	record.Actor = uuidString(actor)
+	record.RepositoryUUID = uuidString(repository)
+	record.WorkspaceUUID = uuidString(workspace)
+	record.WorkUnitUUID = uuidString(workUnit)
+	record.Data = json.RawMessage(data)
+	return record, nil
 }
 
 func (d *DB) ListMutations(filter MutationFilter) ([]MutationRecord, error) {
@@ -245,18 +325,22 @@ type scanner interface {
 
 func scanMutation(row scanner) (MutationRecord, error) {
 	var record MutationRecord
+	var actor, repositoryUUID, workspaceUUID []byte
 	var paths, relativePaths, before, after string
 	var gitBefore, gitAfter, jjBefore, jjAfter string
 	var success sql.NullBool
 	var turnIndex sql.NullInt64
-	err := row.Scan(&record.ID, &record.Actor, &record.SessionGeneration, &record.TurnID, &turnIndex, &record.ToolCallID, &record.Tool,
-		&record.Operation, &record.CWD, &record.RepositoryUUID, &record.RepositoryRoot, &record.WorkspaceUUID,
+	err := row.Scan(&record.ID, &actor, &record.SessionGeneration, &record.TurnID, &turnIndex, &record.ToolCallID, &record.Tool,
+		&record.Operation, &record.CWD, &repositoryUUID, &record.RepositoryRoot, &workspaceUUID,
 		&record.WorkspaceRoot, &record.WorkspaceKind, &record.WorkspaceKey, &paths, &relativePaths, &record.AssistantExcerpt,
 		&record.StartedAt, &record.CompletedAt, &success, &record.Error, &before, &after,
 		&gitBefore, &gitAfter, &jjBefore, &jjAfter, &record.UpdatedSequence)
 	if err != nil {
 		return MutationRecord{}, err
 	}
+	record.Actor = uuidString(actor)
+	record.RepositoryUUID = uuidString(repositoryUUID)
+	record.WorkspaceUUID = uuidString(workspaceUUID)
 	record.Paths = json.RawMessage(paths)
 	record.RelativePaths = json.RawMessage(relativePaths)
 	record.Before = json.RawMessage(before)
@@ -339,12 +423,14 @@ func (d *DB) SessionEvents(actor string, limit int, scopes ...ActorScope) ([]Ses
 	result := make([]SessionRecord, 0)
 	for rows.Next() {
 		var record SessionRecord
+		var actor []byte
 		var turnIndex sql.NullInt64
 		var data string
-		if err := rows.Scan(&record.ID, &record.Actor, &record.SessionGeneration, &record.Type, &record.At,
+		if err := rows.Scan(&record.ID, &actor, &record.SessionGeneration, &record.Type, &record.At,
 			&turnIndex, &record.Summary, &data, &record.EventSequence); err != nil {
 			return nil, err
 		}
+		record.Actor = uuidString(actor)
 		if turnIndex.Valid {
 			value := int(turnIndex.Int64)
 			record.TurnIndex = &value

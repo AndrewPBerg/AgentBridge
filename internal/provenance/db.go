@@ -19,7 +19,7 @@ import (
 	_ "turso.tech/database/tursogo"
 )
 
-const projectionSchemaVersion = 7
+const projectionSchemaVersion = 8
 
 type DB struct {
 	db   *sql.DB
@@ -218,9 +218,11 @@ func (d *DB) initialize() error {
 		`CREATE TABLE IF NOT EXISTS checkpoint_requests (
 			id TEXT PRIMARY KEY,
 			actor BLOB NOT NULL,
+			declared_by TEXT NOT NULL DEFAULT 'agent',
 			session_generation INTEGER NOT NULL,
 			repository_uuid BLOB NOT NULL,
 			workspace_uuid BLOB NOT NULL,
+			work_unit_uuid BLOB,
 			checkpoint_kind TEXT NOT NULL,
 			journal_start_sequence INTEGER NOT NULL,
 			journal_end_sequence INTEGER NOT NULL,
@@ -255,6 +257,8 @@ func (d *DB) initialize() error {
 		{"collisions", "resolved_at", "TEXT"},
 		{"collisions", "resolved_by", "BLOB"},
 		{"collisions", "dead_actor", "BLOB"},
+		{"checkpoint_requests", "declared_by", "TEXT NOT NULL DEFAULT 'agent'"},
+		{"checkpoint_requests", "work_unit_uuid", "BLOB"},
 	} {
 		if err := d.ensureColumn(column.table, column.name, column.definition); err != nil {
 			return err
@@ -273,48 +277,23 @@ func (d *DB) ensureProjectionVersion() error {
 		return err
 	}
 	if version >= projectionSchemaVersion {
-		return nil
+		var columnType string
+		err := d.db.QueryRow(`SELECT type FROM pragma_table_info('messages') WHERE name = 'from_actor'`).Scan(&columnType)
+		if err == nil && strings.EqualFold(columnType, "BLOB") {
+			return nil
+		}
+		// A prior version may have recorded the new projection version before
+		// actually rebuilding legacy TEXT tables. Force the binary rebuild.
+		version = projectionSchemaVersion - 1
 	}
 	transaction, err := d.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer transaction.Rollback()
-	// Migrate the collision projection before resetting the other read models.
-	// Older databases denormalized actors into actors_json and used prefixed text
-	// IDs; the journal remains the authoritative source for any rows that cannot
-	// be converted.
-	if version > 0 && version < 7 {
-		if err := migrateCollisions(transaction); err != nil {
-			return err
-		}
-	}
-	// Recreate the actor projection when moving from the text address model to
-	// the binary UUID key. The append-only journal remains the migration source.
 	if version < projectionSchemaVersion {
-		if _, err := transaction.Exec(`DROP TABLE IF EXISTS actors`); err != nil {
-			return fmt.Errorf("reset actors projection: %w", err)
-		}
-		if _, err := transaction.Exec(`CREATE TABLE actors (
-			session_uuid BLOB PRIMARY KEY,
-			harness TEXT NOT NULL,
-			alias TEXT,
-			cwd TEXT NOT NULL,
-			repository_uuid BLOB,
-			repository_root TEXT,
-			workspace_uuid BLOB,
-			workspace_root TEXT,
-			workspace_kind TEXT,
-			state TEXT NOT NULL,
-			generation INTEGER NOT NULL,
-			started_at TEXT NOT NULL,
-			heartbeat_at TEXT NOT NULL,
-			git_json TEXT,
-			jj_json TEXT,
-			capabilities_json TEXT NOT NULL,
-			updated_sequence INTEGER NOT NULL
-		) STRICT`); err != nil {
-			return fmt.Errorf("recreate actors projection: %w", err)
+		if err := recreateBinaryProjectionTables(transaction); err != nil {
+			return err
 		}
 	}
 	tables := []string{"mutation_paths", "mutations", "session_events", "messages", "test_results", "checkpoint_requests", "workspaces", "repositories", "events"}
@@ -333,6 +312,42 @@ func (d *DB) ensureProjectionVersion() error {
 		return err
 	}
 	return transaction.Commit()
+}
+
+func recreateBinaryProjectionTables(transaction *sql.Tx) error {
+	// Projection state is disposable: the journal is the migration source. Drop
+	// every UUID-bearing table together so old TEXT schemas cannot reject the
+	// binary projection during backfill.
+	for _, table := range []string{"checkpoint_requests", "test_results", "messages", "collision_actors", "collisions", "session_events", "mutation_paths", "mutations", "actors", "workspaces", "repositories"} {
+		if _, err := transaction.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
+			return fmt.Errorf("drop legacy projection table %s: %w", table, err)
+		}
+	}
+	statements := []string{
+		`CREATE TABLE repositories (id BLOB PRIMARY KEY, root TEXT NOT NULL, kind TEXT NOT NULL, git_common_dir TEXT, jj_repo_path TEXT, updated_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE workspaces (id BLOB PRIMARY KEY, repository_uuid BLOB NOT NULL REFERENCES repositories(id), root TEXT NOT NULL, kind TEXT NOT NULL, git_branch TEXT, git_head TEXT, jj_workspace_name TEXT, jj_change_id TEXT, updated_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE INDEX workspaces_repository ON workspaces(repository_uuid, root)`,
+		`CREATE TABLE actors (session_uuid BLOB PRIMARY KEY, harness TEXT NOT NULL, alias TEXT, cwd TEXT NOT NULL, repository_uuid BLOB, repository_root TEXT, workspace_uuid BLOB, workspace_root TEXT, workspace_kind TEXT, state TEXT NOT NULL, generation INTEGER NOT NULL, started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, git_json TEXT, jj_json TEXT, capabilities_json TEXT NOT NULL, updated_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE mutations (id TEXT PRIMARY KEY, actor BLOB NOT NULL, session_generation INTEGER NOT NULL, turn_id TEXT, turn_index INTEGER, tool_call_id TEXT NOT NULL, tool TEXT NOT NULL, operation TEXT NOT NULL, cwd TEXT NOT NULL, repository_uuid BLOB, repository_root TEXT, workspace_uuid BLOB, workspace_root TEXT, workspace_kind TEXT, workspace_key TEXT NOT NULL, paths_json TEXT NOT NULL, relative_paths_json TEXT NOT NULL, assistant_excerpt TEXT, started_at TEXT NOT NULL, completed_at TEXT, success INTEGER, error TEXT, before_json TEXT NOT NULL, after_json TEXT NOT NULL, git_before_json TEXT, git_after_json TEXT, jj_before_json TEXT, jj_after_json TEXT, updated_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE INDEX mutations_actor_started ON mutations(actor, started_at DESC)`,
+		`CREATE INDEX mutations_started ON mutations(started_at DESC)`,
+		`CREATE TABLE mutation_paths (mutation_id TEXT NOT NULL REFERENCES mutations(id) ON DELETE CASCADE, path TEXT NOT NULL, ordinal INTEGER NOT NULL, before_json TEXT, after_json TEXT, PRIMARY KEY(mutation_id, path)) STRICT`,
+		`CREATE INDEX mutation_paths_path ON mutation_paths(path, mutation_id)`,
+		`CREATE TABLE session_events (id TEXT PRIMARY KEY, actor BLOB NOT NULL, session_generation INTEGER NOT NULL, type TEXT NOT NULL, at TEXT NOT NULL, turn_index INTEGER, summary TEXT, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE INDEX session_events_actor_at ON session_events(actor, at DESC)`,
+		`CREATE TABLE collisions (id BLOB PRIMARY KEY, path TEXT NOT NULL, state TEXT NOT NULL, owner BLOB, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, resolved_at TEXT, resolution TEXT, resolved_by BLOB, dead_actor BLOB, data TEXT NOT NULL, updated_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE collision_actors (collision_id BLOB NOT NULL REFERENCES collisions(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, session_uuid BLOB NOT NULL, PRIMARY KEY(collision_id, ordinal)) STRICT`,
+		`CREATE TABLE messages (id TEXT PRIMARY KEY, kind TEXT NOT NULL, from_actor BLOB NOT NULL, to_actor BLOB NOT NULL, body TEXT NOT NULL, global_sequence INTEGER NOT NULL, sender_sequence INTEGER NOT NULL, recipient_sequence INTEGER NOT NULL, client_sequence INTEGER, session_generation INTEGER, collision_id BLOB, created_at TEXT NOT NULL, acknowledged_at TEXT, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE INDEX messages_actor_created ON messages(to_actor, created_at DESC)`,
+		`CREATE TABLE test_results (id TEXT PRIMARY KEY, actor BLOB NOT NULL, session_generation INTEGER NOT NULL, turn_id TEXT, turn_index INTEGER, tool_call_id TEXT, command TEXT NOT NULL, cwd TEXT NOT NULL, exit_code INTEGER, started_at TEXT NOT NULL, completed_at TEXT NOT NULL, duration_ms INTEGER, output_excerpt TEXT, output_sha256 TEXT, output_bytes INTEGER, output_truncated INTEGER NOT NULL, repository_uuid BLOB, workspace_uuid BLOB, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE checkpoint_requests (id TEXT PRIMARY KEY, actor BLOB NOT NULL, declared_by TEXT NOT NULL, session_generation INTEGER NOT NULL, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, work_unit_uuid BLOB, checkpoint_kind TEXT NOT NULL, journal_start_sequence INTEGER NOT NULL, journal_end_sequence INTEGER NOT NULL, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
+	}
+	for _, statement := range statements {
+		if _, err := transaction.Exec(statement); err != nil {
+			return fmt.Errorf("recreate binary projection: %w", err)
+		}
+	}
+	return nil
 }
 
 func migrateCollisions(transaction *sql.Tx) error {
@@ -362,7 +377,8 @@ func migrateCollisions(transaction *sql.Tx) error {
 	type legacyCollision struct {
 		id, path, state, actors, createdAt, updatedAt string
 		owner, resolvedBy, deadActor                  []byte
-		resolvedAt, resolution, data                  string
+		resolvedAt, resolution                        sql.NullString
+		data                                          string
 		sequence                                      int64
 	}
 	rows, err := transaction.Query(`SELECT id, path, state, actors_json, owner, created_at, updated_at, resolved_at, resolution, resolved_by, dead_actor, data, updated_sequence FROM collisions`)
@@ -395,7 +411,7 @@ func migrateCollisions(transaction *sql.Tx) error {
 	}
 	for _, value := range values {
 		id := uuidBlob(value.id)
-		if _, err := transaction.Exec(`INSERT INTO collisions(id, path, state, owner, created_at, updated_at, resolved_at, resolution, resolved_by, dead_actor, data, updated_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, value.path, value.state, value.owner, value.createdAt, value.updatedAt, nullable(value.resolvedAt), nullable(value.resolution), value.resolvedBy, value.deadActor, value.data, value.sequence); err != nil {
+		if _, err := transaction.Exec(`INSERT INTO collisions(id, path, state, owner, created_at, updated_at, resolved_at, resolution, resolved_by, dead_actor, data, updated_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, value.path, value.state, value.owner, value.createdAt, value.updatedAt, nullableNullString(value.resolvedAt), nullableNullString(value.resolution), value.resolvedBy, value.deadActor, value.data, value.sequence); err != nil {
 			return err
 		}
 		var actors []string
@@ -409,6 +425,13 @@ func migrateCollisions(transaction *sql.Tx) error {
 	}
 	_, err = transaction.Exec(`DROP TABLE collisions_legacy`)
 	return err
+}
+
+func nullableNullString(value sql.NullString) any {
+	if !value.Valid {
+		return nil
+	}
+	return value.String
 }
 
 func (d *DB) ensureColumn(table, column, definition string) error {
@@ -456,7 +479,7 @@ func (d *DB) PruneNonUUIDActors() error {
 		`DELETE FROM actors WHERE length(session_uuid) != 16 OR (repository_uuid IS NOT NULL AND length(repository_uuid) != 16) OR (workspace_uuid IS NOT NULL AND length(workspace_uuid) != 16)`,
 		`DELETE FROM mutations WHERE (repository_uuid IS NOT NULL AND length(repository_uuid) != 16) OR (workspace_uuid IS NOT NULL AND length(workspace_uuid) != 16)`,
 		`DELETE FROM test_results WHERE (repository_uuid IS NOT NULL AND length(repository_uuid) != 16) OR (workspace_uuid IS NOT NULL AND length(workspace_uuid) != 16)`,
-		`DELETE FROM checkpoint_requests WHERE length(repository_uuid) != 16 OR length(workspace_uuid) != 16`,
+		`DELETE FROM checkpoint_requests WHERE length(repository_uuid) != 16 OR length(workspace_uuid) != 16 OR (work_unit_uuid IS NOT NULL AND length(work_unit_uuid) != 16)`,
 		`DELETE FROM workspaces WHERE length(id) != 16 OR length(repository_uuid) != 16`,
 		`DELETE FROM repositories WHERE length(id) != 16`,
 	}
@@ -519,6 +542,13 @@ func (d *DB) Project(event protocol.Event) error {
 		return err
 	}
 	if inserted == 0 {
+		var existingType, existingData string
+		if err := transaction.QueryRow(`SELECT type, data FROM events WHERE sequence = ?`, event.Sequence).Scan(&existingType, &existingData); err != nil {
+			return fmt.Errorf("check duplicate provenance event %d: %w", event.Sequence, err)
+		}
+		if existingType != event.Type || existingData != string(event.Data) {
+			return fmt.Errorf("conflicting provenance event sequence %d", event.Sequence)
+		}
 		return nil
 	}
 	if err := d.projectDomain(transaction, event); err != nil {
@@ -635,13 +665,52 @@ func (d *DB) projectDomain(transaction *sql.Tx, event protocol.Event) error {
 		if err := json.Unmarshal(event.Data, &checkpoint); err != nil {
 			return err
 		}
-		_, err := transaction.Exec(`INSERT OR IGNORE INTO checkpoint_requests(
-			id, actor, session_generation, repository_uuid, workspace_uuid, checkpoint_kind,
+		workUnitUUID, err := checkpointWorkUnitUUID(checkpoint.WorkUnitUUID)
+		if err != nil {
+			return err
+		}
+		_, err = transaction.Exec(`INSERT OR IGNORE INTO checkpoint_requests(
+			id, actor, declared_by, session_generation, repository_uuid, workspace_uuid, work_unit_uuid, checkpoint_kind,
 			journal_start_sequence, journal_end_sequence, data, event_sequence
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, checkpoint.ID, uuidBlob(checkpoint.Actor), checkpoint.SessionGeneration,
-			uuidBlob(checkpoint.RepositoryUUID), uuidBlob(checkpoint.WorkspaceUUID), checkpoint.CheckpointKind, checkpoint.JournalStart,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, checkpoint.ID, uuidBlob(checkpoint.Actor), checkpoint.DeclaredBy, checkpoint.SessionGeneration,
+			uuidBlob(checkpoint.RepositoryUUID), uuidBlob(checkpoint.WorkspaceUUID), workUnitUUID, checkpoint.CheckpointKind, checkpoint.JournalStart,
 			checkpoint.JournalEnd, string(event.Data), event.Sequence)
 		return err
+	case "collision.actor_dead":
+		var dead protocol.CollisionActorDeadEvent
+		if err := json.Unmarshal(event.Data, &dead); err != nil {
+			return err
+		}
+		result, err := transaction.Exec(`UPDATE collisions SET dead_actor = ?, updated_at = ?, data = ?, updated_sequence = ? WHERE id = ?`, nullableUUID(dead.Actor), dead.At.UTC().Format(time.RFC3339Nano), string(event.Data), event.Sequence, uuidBlob(dead.CollisionID))
+		if err != nil {
+			return err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if count != 1 {
+			return fmt.Errorf("collision actor-dead event references unknown collision %q", dead.CollisionID)
+		}
+		return nil
+	case "collision.transitioned":
+		var transition protocol.CollisionTransitionEvent
+		if err := json.Unmarshal(event.Data, &transition); err != nil {
+			return err
+		}
+		result, err := transaction.Exec(`UPDATE collisions SET state = ?, owner = ?, updated_at = ?, resolved_at = CASE WHEN ? = ? THEN ? ELSE resolved_at END, resolution = ?, resolved_by = CASE WHEN ? = ? THEN ? ELSE resolved_by END, data = ?, updated_sequence = ? WHERE id = ?`,
+			transition.To, nullableUUID(transition.Owner), transition.At.UTC().Format(time.RFC3339Nano), transition.To, protocol.CollisionResolved, transition.At.UTC().Format(time.RFC3339Nano), nullable(transition.Resolution), transition.To, protocol.CollisionResolved, nullableUUID(transition.Actor), string(event.Data), event.Sequence, uuidBlob(transition.CollisionID))
+		if err != nil {
+			return err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if count != 1 {
+			return fmt.Errorf("collision transition references unknown collision %q", transition.CollisionID)
+		}
+		return nil
 	case "collision.upserted":
 		var collision protocol.Collision
 		if err := json.Unmarshal(event.Data, &collision); err != nil {
@@ -908,7 +977,11 @@ type ProjectingAppender struct {
 	db                *DB
 	queue             chan protocol.Event
 	done              chan struct{}
+	closing           chan struct{}
+	stop              chan struct{}
+	appenders         sync.WaitGroup
 	mu                sync.Mutex
+	closed            bool
 	lastErr           error
 	journalSequence   uint64
 	projectedSequence uint64
@@ -938,6 +1011,8 @@ func newProjectingAppender(primary interface{ Append(protocol.Event) error }, da
 		db:                database,
 		queue:             make(chan protocol.Event, capacity),
 		done:              make(chan struct{}),
+		closing:           make(chan struct{}),
+		stop:              make(chan struct{}),
 		journalSequence:   max(initial, projected),
 		projectedSequence: projected,
 		notify:            make(chan struct{}),
@@ -947,10 +1022,17 @@ func newProjectingAppender(primary interface{ Append(protocol.Event) error }, da
 }
 
 func (p *ProjectingAppender) Append(event protocol.Event) error {
-	// Serialize the durable append with journalSequence publication. Queries
-	// taking the same lock can observe either the old tail before persistence or
-	// the new tail after persistence, never the ambiguous window between them.
+	// Serialize the durable append with journalSequence publication. Register
+	// the sender before releasing mu so Close cannot race it with shutdown.
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return errors.New("provenance projection is closed")
+	}
+	p.appenders.Add(1)
+	defer p.appenders.Done()
+	// Keep the publication lock across the durable append. WaitForCurrent must
+	// not observe a pre-append tail while an append is in flight.
 	if err := p.primary.Append(event); err != nil {
 		p.mu.Unlock()
 		return err
@@ -958,10 +1040,15 @@ func (p *ProjectingAppender) Append(event protocol.Event) error {
 	p.journalSequence = max(p.journalSequence, event.Sequence)
 	p.signalLocked()
 	p.mu.Unlock()
-	// Backpressure rather than drop: the journal is already durable, and every
-	// projected sequence must remain contiguous so CLI answers are trustworthy.
-	p.queue <- event
-	return nil
+	// The journal is already durable. If shutdown wins while this sender is
+	// waiting for queue space, return without risking a send on a closed queue;
+	// the next startup replays the journal and rebuilds the projection.
+	select {
+	case p.queue <- event:
+		return nil
+	case <-p.closing:
+		return errors.New("provenance projection is shutting down")
+	}
 }
 
 func (p *ProjectingAppender) projectLoop() {
@@ -971,7 +1058,15 @@ func (p *ProjectingAppender) projectLoop() {
 		for {
 			if err := p.db.Project(event); err != nil {
 				p.recordProjectionError(event.Sequence, err)
-				time.Sleep(backoff)
+				timer := time.NewTimer(backoff)
+				select {
+				case <-p.stop:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return
+				case <-timer.C:
+				}
 				backoff = min(backoff*2, time.Second)
 				continue
 			}
@@ -1037,8 +1132,20 @@ func (p *ProjectingAppender) Health() ProjectionHealth {
 
 func (p *ProjectingAppender) Close() {
 	p.once.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		close(p.closing)
+		p.mu.Unlock()
+		p.appenders.Wait()
 		close(p.queue)
-		<-p.done
+		select {
+		case <-p.done:
+			return
+		case <-time.After(5 * time.Second):
+			// A permanently unprojectable event must not make shutdown hang.
+			close(p.stop)
+			<-p.done
+		}
 	})
 }
 
@@ -1057,6 +1164,17 @@ func nullableUUID(value string) any {
 		return nil
 	}
 	return uuidBlob(value)
+}
+
+func checkpointWorkUnitUUID(value string) (any, error) {
+	if value == "" {
+		return nil, nil
+	}
+	blob := uuidBlob(value)
+	if len(blob) != 16 || blob[8]&0xc0 != 0x80 || blob[6]>>4 == 0 || blob[6]>>4 > 5 {
+		return nil, fmt.Errorf("invalid checkpoint work_unit_uuid %q", value)
+	}
+	return blob, nil
 }
 
 func uuidBlob(value string) []byte {

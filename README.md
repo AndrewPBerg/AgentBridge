@@ -63,6 +63,8 @@ agent-bridge scopes
 agent-bridge sessions --workspace <workspace-id>
 agent-bridge send --from pi:01K... --id pi:01K:1:1 --sequence 1 @walkie "Can you yield schema.ts?"
 agent-bridge request mailbox.poll '{"actor":"pi:01K..."}'
+agent-bridge provenance checkpoints --limit 20
+agent-bridge provenance checkpoint <checkpoint-id>
 agent-bridge provenance who-changed /repo/file.ts
 agent-bridge provenance why <mutation-id>
 agent-bridge provenance agent @walkie
@@ -111,7 +113,7 @@ Adapters assign `client_sequence` before asynchronous work begins. Mailbox polli
 
 Adapters automatically report mutating tool calls with `intent.begin`; agents do not manually claim files. A matching canonical path from another recent actor creates one open collision and two durable collision messages. Direct communication between the participants moves it to `negotiating`. An adapter or agent can then transition it to `yielded` or `resolved`.
 
-The daemon reports collision state; harness policy decides whether a specific operation is warning-only or blocked. Destructive restore/reset operations should eventually use a stricter policy than ordinary edits.
+The daemon reports collision state; harness policy decides whether a specific operation is warning-only or blocked. If a participant dies while a collision remains active, the surviving participant receives a durable notification; Agent Bridge does not choose ownership or resolve the collision. Those decisions remain with the agents. Destructive restore/reset operations should eventually use a stricter policy than ordinary edits.
 
 ## Repository layout
 

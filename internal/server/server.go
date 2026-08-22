@@ -311,6 +311,46 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 			return failure(request.ID, "checkpoint_request_failed", err)
 		}
 		return success(request.ID, checkpoint)
+	case "provenance.checkpoint":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		value, err := params[struct {
+			ID string `json:"id"`
+		}](request)
+		if err != nil || value.ID == "" {
+			if err == nil {
+				err = errors.New("checkpoint ID is required")
+			}
+			return failure(request.ID, "invalid_params", err)
+		}
+		checkpoint, err := s.provenance.Checkpoint(value.ID)
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		return success(request.ID, checkpoint)
+	case "provenance.checkpoints":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		value, err := params[struct {
+			WorkUnitUUID string `json:"work_unit_uuid,omitempty"`
+			Limit        int    `json:"limit,omitempty"`
+		}](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		checkpoints, err := s.provenance.ListCheckpoints(value.WorkUnitUUID, value.Limit)
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		return success(request.ID, map[string]any{"checkpoints": checkpoints})
 	case "provenance.scopes":
 		if s.provenance == nil {
 			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))

@@ -110,12 +110,13 @@ func (d *DB) SinceCompaction(actor string, limit int, scopes ...ActorScope) (Sin
 	}
 	answer := SinceCompactionAnswer{Actor: resolved, Mutations: make([]MutationRecord, 0), SessionEvents: make([]SessionRecord, 0)}
 	var compaction SessionRecord
+	var compactionActor []byte
 	var turnIndex sql.NullInt64
 	var summary, data string
 	err = d.db.QueryRow(`SELECT id, actor, session_generation, type, at, turn_index,
 		COALESCE(summary, ''), data, event_sequence FROM session_events
 		WHERE actor = ? AND type = 'session.compacted' ORDER BY at DESC, event_sequence DESC, id DESC LIMIT 1`, uuidBlob(resolved)).Scan(
-		&compaction.ID, &compaction.Actor, &compaction.SessionGeneration, &compaction.Type, &compaction.At,
+		&compaction.ID, &compactionActor, &compaction.SessionGeneration, &compaction.Type, &compaction.At,
 		&turnIndex, &summary, &data, &compaction.EventSequence,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -130,6 +131,7 @@ func (d *DB) SinceCompaction(actor string, limit int, scopes ...ActorScope) (Sin
 	if err != nil {
 		return SinceCompactionAnswer{}, err
 	}
+	compaction.Actor = uuidString(compactionActor)
 	if turnIndex.Valid {
 		value := int(turnIndex.Int64)
 		compaction.TurnIndex = &value
@@ -169,12 +171,14 @@ func (d *DB) SinceCompaction(actor string, limit int, scopes ...ActorScope) (Sin
 	defer eventRows.Close()
 	for eventRows.Next() {
 		var record SessionRecord
+		var actor []byte
 		var index sql.NullInt64
 		var eventData string
-		if err := eventRows.Scan(&record.ID, &record.Actor, &record.SessionGeneration, &record.Type, &record.At,
+		if err := eventRows.Scan(&record.ID, &actor, &record.SessionGeneration, &record.Type, &record.At,
 			&index, &record.Summary, &eventData, &record.EventSequence); err != nil {
 			return SinceCompactionAnswer{}, err
 		}
+		record.Actor = uuidString(actor)
 		if index.Valid {
 			value := int(index.Int64)
 			record.TurnIndex = &value

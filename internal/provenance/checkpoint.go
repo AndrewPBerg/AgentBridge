@@ -14,7 +14,9 @@ import (
 type CheckpointIdentity struct {
 	RepositoryUUID    string `json:"repository_uuid"`
 	WorkspaceUUID     string `json:"workspace_uuid"`
+	WorkUnitUUID      string `json:"work_unit_uuid,omitempty"`
 	Actor             string `json:"actor"`
+	DeclaredBy        string `json:"declared_by"`
 	SessionGeneration uint64 `json:"session_generation"`
 	JournalStart      uint64 `json:"journal_start_sequence"`
 	JournalEnd        uint64 `json:"journal_end_sequence"`
@@ -23,13 +25,17 @@ type CheckpointIdentity struct {
 }
 
 func CheckpointID(request protocol.CheckpointRequest, evidence any) (string, error) {
+	if request.DeclaredBy == "" {
+		request.DeclaredBy = "agent"
+	}
 	encoded, err := json.Marshal(evidence)
 	if err != nil {
 		return "", fmt.Errorf("encode checkpoint evidence: %w", err)
 	}
 	evidenceSum := sha256.Sum256(encoded)
 	identity := CheckpointIdentity{
-		RepositoryUUID: request.RepositoryUUID, WorkspaceUUID: request.WorkspaceUUID, Actor: request.Actor,
+		RepositoryUUID: request.RepositoryUUID, WorkspaceUUID: request.WorkspaceUUID, WorkUnitUUID: request.WorkUnitUUID,
+		Actor: request.Actor, DeclaredBy: request.DeclaredBy,
 		SessionGeneration: request.SessionGeneration, JournalStart: request.JournalStart,
 		JournalEnd: request.JournalEnd, CheckpointKind: request.CheckpointKind,
 		EvidenceHash: hex.EncodeToString(evidenceSum[:]),

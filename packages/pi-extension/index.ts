@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -7,7 +7,7 @@ import { inspectGit } from "./git";
 import { listHerdrAgents } from "./herdr";
 import { inferIntentContext, inferMutation } from "./intent";
 import { inspectJj } from "./jj";
-import type { ActorRecord, BridgeMessage, Collision, CollisionState, MutationIntent, SessionEvent } from "./protocol";
+import type { ActorRecord, BridgeMessage, CheckpointRequest, Collision, CollisionState, MutationIntent, SessionEvent } from "./protocol";
 import { BRIDGE_MESSAGE_TYPE } from "./protocol";
 import { snapshotFiles } from "./provenance";
 import { initialTalkTargets, sameRepository, showTalkModal } from "./talk-modal";
@@ -167,6 +167,30 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
       data: options.data,
     };
     await call("session.event", { event });
+  }
+
+  async function requestCheckpoint(declaredBy: "agent" | "human", kind: string, workUnitUUID?: string): Promise<CheckpointRequest> {
+    if (!actor) throw new Error("Agent Bridge is not attached to an active session");
+    const boundary = `${actor.address}:${generation}:${kind}:${currentTurnIndex ?? "session"}`;
+    const id = `checkpoint:${createHash("sha256").update(boundary).digest("hex")}`;
+    return call<CheckpointRequest>("checkpoint.request", {
+      request: {
+        id,
+        actor: actor.address,
+        declared_by: declaredBy,
+        session_generation: generation,
+        repository_uuid: actor.repository_uuid,
+        workspace_uuid: actor.workspace_uuid,
+        work_unit_uuid: workUnitUUID,
+        checkpoint_kind: kind,
+        boundary_event_id: boundary,
+        boundary_type: "explicit",
+        turn_id: currentTurnIndex === undefined ? undefined : `${actor.address}:${generation}:turn:${currentTurnIndex}`,
+        turn_index: currentTurnIndex,
+        git: actor.git,
+        jj: actor.jj,
+      },
+    });
   }
 
   async function send(to: string, body: string): Promise<BridgeMessage> {
@@ -339,6 +363,26 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
   });
 
   pi.registerTool({
+    name: "bridge_checkpoint",
+    label: "Agent Bridge Checkpoint",
+    description: "Declare an immutable, evidence-linked checkpoint at a meaningful stopping point.",
+    promptSnippet: "Use bridge_checkpoint when you reach a meaningful stopping point or need a durable handoff boundary.",
+    parameters: Type.Object({
+      kind: Type.String({ description: "Checkpoint kind, for example settled, handoff, test, or manual." }),
+      workUnitUUID: Type.Optional(Type.String({ description: "Optional WorkUnit UUID to link this checkpoint to." })),
+    }),
+    async execute(_toolCallId, params) {
+      const kind = String(params.kind ?? "").trim();
+      if (!kind) throw new Error("Checkpoint kind is required");
+      const checkpoint = await requestCheckpoint("agent", kind, params.workUnitUUID ? String(params.workUnitUUID) : undefined);
+      return {
+        content: [{ type: "text", text: `Checkpoint ${checkpoint.id} recorded.` }],
+        details: { checkpoint },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "bridge_collision",
     label: "Agent Bridge Collision",
     description: "Transition an automatic collision to negotiating, yielded, or resolved after peer coordination.",
@@ -480,6 +524,26 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     handler: handleBus,
   });
 
+  pi.registerCommand("checkpoint", {
+    description: "Declare a human checkpoint: /checkpoint [kind]",
+    getArgumentCompletions: (prefix: string) => {
+      if (prefix.trim().includes(" ")) return null;
+      const normalized = prefix.trim();
+      return ["manual", "settled", "handoff", "test"]
+        .filter((value) => value.startsWith(normalized))
+        .map((value) => ({ value, label: value }));
+    },
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const kind = String(args ?? "").trim() || "manual";
+      try {
+        const checkpoint = await requestCheckpoint("human", kind);
+        ctx.ui.notify(`Checkpoint ${checkpoint.id} recorded.`, "info");
+      } catch (error) {
+        reportError(ctx, error);
+      }
+    },
+  });
+
   pi.on("before_agent_start", (event) => ({
     systemPrompt: `${event.systemPrompt}\n\nAgent Bridge automatically detects shared-workspace file collisions. When it reports one, do not revert unfamiliar edits; coordinate using bridge_message, then record yield or resolution using bridge_collision. You never declare edit intent manually.`,
   }));
@@ -517,6 +581,7 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
           "mutation-provenance",
           "provenance-query",
           "session-events",
+          "checkpoint-declaration",
         ],
         generation,
         started_at: now,

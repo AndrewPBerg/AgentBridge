@@ -123,9 +123,11 @@ export type TestResult = {
 export type CheckpointRequest = {
   id: string;
   actor: ActorRecord["address"];
+  declared_by?: "agent" | "human" | "system";
   session_generation: number;
   repository_uuid: string;
   workspace_uuid: string;
+  work_unit_uuid?: string;
   checkpoint_kind: string;
   journal_start_sequence: number;
   journal_end_sequence: number;

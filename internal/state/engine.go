@@ -43,6 +43,7 @@ type Engine struct {
 	collisions         map[string]protocol.Collision
 	collisionByKey     map[string]string
 	checkpoints        map[string]protocol.CheckpointRequest
+	poisoned           error
 }
 
 type Options struct {
@@ -80,8 +81,8 @@ func New(journal Appender, events []protocol.Event, options Options) (*Engine, e
 		checkpoints:        make(map[string]protocol.CheckpointRequest),
 	}
 	for _, event := range events {
-		if event.Sequence <= engine.eventSequence {
-			return nil, fmt.Errorf("event sequence %d is not increasing", event.Sequence)
+		if event.Sequence != engine.eventSequence+1 {
+			return nil, fmt.Errorf("event sequence %d is not contiguous after %d", event.Sequence, engine.eventSequence)
 		}
 		if err := engine.apply(event); err != nil {
 			return nil, fmt.Errorf("replay event %d: %w", event.Sequence, err)
@@ -92,6 +93,9 @@ func New(journal Appender, events []protocol.Event, options Options) (*Engine, e
 }
 
 func (e *Engine) record(eventType string, value any) error {
+	if e.poisoned != nil {
+		return fmt.Errorf("state engine is poisoned: %w", e.poisoned)
+	}
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -107,7 +111,11 @@ func (e *Engine) record(eventType string, value any) error {
 		return err
 	}
 	if err := e.apply(event); err != nil {
-		return err
+		// The journal append is already durable. Continuing would reuse the
+		// sequence or operate on state that no longer matches the journal.
+		e.eventSequence = event.Sequence
+		e.poisoned = fmt.Errorf("apply durable event %d: %w", event.Sequence, err)
+		return e.poisoned
 	}
 	e.eventSequence = event.Sequence
 	return nil
@@ -140,6 +148,41 @@ func (e *Engine) apply(event protocol.Event) error {
 		}
 		e.collisions[collision.ID] = collision
 		e.collisionByKey[collision.Key] = collision.ID
+	case "collision.actor_dead":
+		dead, err := decode[protocol.CollisionActorDeadEvent](event)
+		if err != nil {
+			return err
+		}
+		collision, ok := e.collisions[dead.CollisionID]
+		if !ok {
+			return fmt.Errorf("dead-actor event references unknown collision %q", dead.CollisionID)
+		}
+		collision.DeadActor = dead.Actor
+		collision.UpdatedAt = dead.At.UTC()
+		e.collisions[collision.ID] = collision
+	case "collision.transitioned":
+		transition, err := decode[protocol.CollisionTransitionEvent](event)
+		if err != nil {
+			return err
+		}
+		collision, ok := e.collisions[transition.CollisionID]
+		if !ok {
+			return fmt.Errorf("collision transition references unknown collision %q", transition.CollisionID)
+		}
+		if collision.State != transition.From {
+			return fmt.Errorf("collision %q transition expected state %s, got %s", transition.CollisionID, transition.From, collision.State)
+		}
+		collision.State = transition.To
+		collision.Owner = transition.Owner
+		collision.YieldedBy = transition.YieldedBy
+		collision.Resolution = transition.Resolution
+		collision.UpdatedAt = transition.At.UTC()
+		if transition.To == protocol.CollisionResolved {
+			at := transition.At.UTC()
+			collision.ResolvedAt = &at
+			collision.ResolvedBy = transition.Actor
+		}
+		e.collisions[collision.ID] = collision
 	case "message.enqueued":
 		message, err := decode[protocol.Message](event)
 		if err != nil {
@@ -235,10 +278,14 @@ func (e *Engine) Heartbeat(params protocol.HeartbeatParams) (protocol.Actor, err
 		actor.Generation = params.Generation
 	}
 	actor = normalizeActorScope(actor)
+	wasDead := actor.State == "dead"
 	// Presence is lease-based and intentionally ephemeral. Journaling a fsynced
 	// heartbeat every two seconds would grow the log and serialize all clients
 	// behind disk latency; sessions re-register after daemon restart.
 	e.actors[actor.Address] = actor
+	if wasDead {
+		e.notifyDeadCollisionsLocked(actor.Address)
+	}
 	return actor, nil
 }
 
@@ -265,6 +312,25 @@ func (e *Engine) SetAlias(address, alias string) (protocol.Actor, error) {
 	return actor, nil
 }
 
+func (e *Engine) notifyDeadCollisionsLocked(deadActor string) {
+	for _, collision := range e.collisions {
+		if collision.DeadActor != "" || collision.State == protocol.CollisionResolved || (collision.Actors[0] != deadActor && collision.Actors[1] != deadActor) {
+			continue
+		}
+		at := e.now().UTC()
+		if err := e.record("collision.actor_dead", protocol.CollisionActorDeadEvent{CollisionID: collision.ID, Actor: deadActor, At: at}); err != nil {
+			continue
+		}
+		for _, recipient := range collision.Actors {
+			if recipient == deadActor {
+				continue
+			}
+			message := e.nextMessage("agent-bridge", recipient, "collision-dead", fmt.Sprintf("Agent %s is no longer alive while collision %s remains active on %s. Reassess ownership before continuing.", deadActor, collision.ID, collision.Path), protocol.SendParams{ID: collision.ID + ":dead:" + recipient}, collision.ID)
+			_ = e.enqueue(message)
+		}
+	}
+}
+
 func (e *Engine) active(actor protocol.Actor) bool {
 	return actor.State != "dead" && e.now().Sub(actor.HeartbeatAt) <= e.actorTTL
 }
@@ -282,7 +348,9 @@ func (e *Engine) expireStaleLocked() {
 		e.actors[address] = actor
 		// A failed append should not make an actor appear live again in this
 		// process; the next journal replay will retain the prior state instead.
-		_ = e.record("actor.upserted", actor)
+		if err := e.record("actor.upserted", actor); err == nil {
+			e.notifyDeadCollisionsLocked(address)
+		}
 	}
 }
 
@@ -446,9 +514,10 @@ func (e *Engine) markNegotiating(left, right string) error {
 		if collision.State != protocol.CollisionOpen || !sameActors(collision.Actors, left, right) {
 			continue
 		}
-		collision.State = protocol.CollisionNegotiating
-		collision.UpdatedAt = e.now().UTC()
-		if err := e.record("collision.upserted", collision); err != nil {
+		at := e.now().UTC()
+		if err := e.record("collision.transitioned", protocol.CollisionTransitionEvent{
+			CollisionID: collision.ID, Actor: left, From: collision.State, To: protocol.CollisionNegotiating, At: at,
+		}); err != nil {
 			return err
 		}
 	}
@@ -607,15 +676,19 @@ func (e *Engine) RecordTestResult(result protocol.TestResult) (protocol.TestResu
 func (e *Engine) RequestCheckpoint(request protocol.CheckpointRequest) (protocol.CheckpointRequest, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if existing, ok := e.checkpoints[request.ID]; ok {
-		return existing, nil
-	}
+	originalJournalStart, originalJournalEnd := request.JournalStart, request.JournalEnd
 	actor, ok := e.actors[request.Actor]
 	if !ok {
 		return protocol.CheckpointRequest{}, fmt.Errorf("unknown actor %q", request.Actor)
 	}
 	if request.ID == "" || request.CheckpointKind == "" {
 		return protocol.CheckpointRequest{}, errors.New("checkpoint id and kind are required")
+	}
+	if request.DeclaredBy == "" {
+		request.DeclaredBy = "agent"
+	}
+	if request.DeclaredBy != "agent" && request.DeclaredBy != "human" && request.DeclaredBy != "system" {
+		return protocol.CheckpointRequest{}, fmt.Errorf("invalid checkpoint declarer %q", request.DeclaredBy)
 	}
 	if request.SessionGeneration == 0 {
 		request.SessionGeneration = actor.Generation
@@ -626,8 +699,22 @@ func (e *Engine) RequestCheckpoint(request protocol.CheckpointRequest) (protocol
 	if request.WorkspaceUUID == "" {
 		request.WorkspaceUUID = actor.WorkspaceUUID
 	}
+	for name, value := range map[string]string{
+		"repository_uuid": request.RepositoryUUID,
+		"workspace_uuid":  request.WorkspaceUUID,
+		"work_unit_uuid":  request.WorkUnitUUID,
+	} {
+		if value != "" {
+			if err := protocol.ValidateUUID(value); err != nil {
+				return protocol.CheckpointRequest{}, fmt.Errorf("%s: %w", name, err)
+			}
+		}
+	}
 	if request.JournalEnd == 0 {
 		request.JournalEnd = e.eventSequence
+	}
+	if request.JournalEnd > e.eventSequence {
+		return protocol.CheckpointRequest{}, fmt.Errorf("checkpoint journal end %d is ahead of current sequence %d", request.JournalEnd, e.eventSequence)
 	}
 	if request.JournalStart == 0 {
 		request.JournalStart = request.JournalEnd
@@ -639,6 +726,16 @@ func (e *Engine) RequestCheckpoint(request protocol.CheckpointRequest) (protocol
 	}
 	if request.JournalStart > request.JournalEnd {
 		return protocol.CheckpointRequest{}, errors.New("checkpoint journal range is invalid")
+	}
+	if existing, ok := e.checkpoints[request.ID]; ok {
+		if existing.Actor != request.Actor || existing.DeclaredBy != request.DeclaredBy || existing.SessionGeneration != request.SessionGeneration ||
+			existing.RepositoryUUID != request.RepositoryUUID || existing.WorkspaceUUID != request.WorkspaceUUID || existing.WorkUnitUUID != request.WorkUnitUUID ||
+			existing.CheckpointKind != request.CheckpointKind || existing.BoundaryEventID != request.BoundaryEventID || existing.BoundaryType != request.BoundaryType ||
+			existing.TurnID != request.TurnID || existing.CompactionEventID != request.CompactionEventID ||
+			(originalJournalStart != 0 && existing.JournalStart != request.JournalStart) || (originalJournalEnd != 0 && existing.JournalEnd != request.JournalEnd) {
+			return protocol.CheckpointRequest{}, fmt.Errorf("checkpoint ID %q conflicts with an existing checkpoint", request.ID)
+		}
+		return existing, nil
 	}
 	if err := e.record("checkpoint.requested", request); err != nil {
 		return protocol.CheckpointRequest{}, err
@@ -670,6 +767,7 @@ func (e *Engine) Poll(actor string, limit int) ([]protocol.Message, error) {
 	if _, ok := e.actors[actor]; !ok {
 		return nil, fmt.Errorf("unknown actor %q", actor)
 	}
+	e.expireStaleLocked()
 	messages := make([]protocol.Message, 0)
 	for _, id := range e.mailboxes[actor] {
 		message := e.messages[id]
@@ -784,16 +882,21 @@ func (e *Engine) Transition(params protocol.TransitionParams) (protocol.Collisio
 		}
 		collision.State = params.State
 		collision.Resolution = strings.TrimSpace(params.Resolution)
+		collision.ResolvedBy = params.Actor
 		now := e.now().UTC()
 		collision.ResolvedAt = &now
 	default:
 		return protocol.Collision{}, fmt.Errorf("invalid collision transition %q", params.State)
 	}
-	collision.UpdatedAt = e.now().UTC()
-	if err := e.record("collision.upserted", collision); err != nil {
+	at := e.now().UTC()
+	if err := e.record("collision.transitioned", protocol.CollisionTransitionEvent{
+		CollisionID: collision.ID, Actor: params.Actor, From: e.collisions[params.CollisionID].State,
+		To: collision.State, Owner: collision.Owner, YieldedBy: collision.YieldedBy,
+		Resolution: collision.Resolution, At: at,
+	}); err != nil {
 		return protocol.Collision{}, err
 	}
-	return collision, nil
+	return e.collisions[params.CollisionID], nil
 }
 
 func sameActors(pair [2]string, left, right string) bool {

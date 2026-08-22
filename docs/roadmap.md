@@ -4,7 +4,7 @@
 
 Agent Bridge is a local coordination control plane for independently launched coding agents. Near-term work should strengthen the Pi vertical slice, preserve deterministic provenance as truth, and add semantic understanding only when concurrent work makes its cost useful.
 
-The next major capability is **contention-activated semantic indexing**: cheap, fast Codex Spark jobs turn bounded session and provenance slices into evidence-linked structured claims while two or more agents are active in the same repository.
+The next major capability is an **agent-authored checkpoint and work-unit substrate**: agents can declare meaningful stopping points, preserve evidence-linked task state, and later organize that work into an explicitly ordered workflow. Semantic extraction is optional enrichment, not coordination truth.
 
 ## Landed foundation
 
@@ -37,149 +37,49 @@ Goals:
 
 Exit condition: a contributor can identify, test, install, and verify the canonical daemon and Pi adapter without guessing which copy is authoritative.
 
-## Phase 1 — Semantic checkpoint substrate
+## Phase 1 — Agent-authored checkpoints
 
-Build semantic indexing as an asynchronous read model. The coordination journal remains authoritative; model output is derived and may be regenerated.
+Build checkpoints first as a deterministic, standalone provenance substrate. A checkpoint may be declared by an agent or human and does not require a WorkUnit at creation. Conceptually, a WorkUnit owns or links to its child checkpoints; WorkUnits are simply a later composition layer that adds mutable objectives, lifecycle state, and top-level ordering. The coordination journal remains authoritative; checkpoint records are immutable evidence boundaries.
 
-### Checkpoint identity
+### Checkpoint declaration
 
-Every checkpoint should be tied to deterministic evidence:
+An agent can explicitly declare an internal checkpoint at a meaningful stopping point, and a human can declare one through the same API. The declaration source should be recorded as `agent` or `human`; automatic system boundaries can be added later without changing the model.
 
-- [ ] repository and workspace IDs;
+### Checkpoint identity and evidence
+
+Every immutable checkpoint should be tied to deterministic evidence:
+
+- [ ] repository and workspace UUIDs;
 - [ ] actor address and session generation;
 - [ ] journal start/end sequence;
 - [ ] Pi turn or compaction boundary when available;
 - [ ] Git HEAD and optional JJ change/commit identity;
 - [ ] mutation, message, collision, and test-result references; and
-- [ ] extractor model, prompt, and schema versions.
+- [ ] optional `work_unit_id` linkage; and
+- [ ] agent- or human-authored metadata at that boundary.
 
-### Structured output
+The declarer may explicitly say, “this is a good stopping point; checkpoint this.” Automatic boundaries such as settlement, compaction, handoff, and shutdown can be added later, but must use the same immutable model.
 
-Spark should propose bounded semantic claims such as:
+### WorkUnits and ordering come later
 
-- [ ] objective;
-- [ ] decisions and rationale;
-- [ ] constraints;
-- [ ] completed work;
-- [ ] affected modules;
-- [ ] abandoned approaches;
-- [ ] unresolved questions; and
-- [ ] handoff context.
+A future WorkUnit will compose checkpoints with an objective, optional policy/context/acceptance/owner/scope, mutable lifecycle state, and handoff metadata. The top-level workflow will order WorkUnits; checkpoints do not define workflow order. Do not build a separate semantic-processing queue yet. Any durable queue for extraction or execution can later be derived from workflow ordering rather than becoming an independent source of truth.
 
-Each claim should cite deterministic evidence and carry confidence. It must never overwrite observed provenance or be presented as ground truth.
+### Derived enrichment
 
-### Durable queue
+Semantic claims, model summaries, and extraction runs are optional derived data. They may be regenerated, versioned, or discarded without changing the checkpoint or observed provenance. No model availability or semantic processor may sit on the coordination path.
 
-Use a retry-safe queue keyed by approximately:
+Exit condition: a fixture session can create and replay immutable agent- and human-declared checkpoints, preserve evidence links, and query the latest checkpoint deterministically.
 
-```text
-repository_id
-+ actor
-+ session_generation
-+ journal_end_sequence
-+ checkpoint_kind
-```
+### Immediate implementation slice
 
-Requirements:
+1. add the minimal checkpoint protocol and declaration path;
+2. capture agent/human declaration source and immutable evidence identity;
+3. project deterministic evidence references and latest-checkpoint queries; and
+4. add replay, idempotency, and immutability tests.
 
-- [ ] idempotent enqueue and completion;
-- [ ] bounded payloads rather than full transcripts;
-- [ ] incremental indexing from the prior checkpoint;
-- [ ] retry/error visibility;
-- [ ] concurrency and budget limits;
-- [ ] no coordination-path dependency on model availability; and
-- [ ] a model-runner boundary so Codex Spark is the first worker, not daemon infrastructure.
+WorkUnit composition, `/work <objective>`, lifecycle transitions, and top-level ordering follow after the checkpoint substrate. Atomic mutation admission, path leases, and observed-baseline protection remain later safety work.
 
-Exit condition: a fixture session can be checkpointed, processed asynchronously by a fake or Spark worker, stored with evidence links, and deterministically queried.
-
-## Phase 2 — Contention-activated indexing
-
-Semantic indexing should consume no model tokens for ordinary serial work.
-
-### Admission policy
-
-```text
-fewer than 2 active actors in a repository
-  deterministic provenance only
-  no Spark jobs
-
-2 or more active actors in a repository
-  activate semantic indexing
-  perform bounded catch-up
-  index settled work incrementally
-
-repository returns below 2 active actors
-  flush a final checkpoint
-  stop after a grace period
-```
-
-Use canonical `repository_id`, not cwd-string equality. Heartbeat-expired sessions do not count toward activation.
-
-### Scope-sensitive behavior
-
-For actors in the same repository but separate workspaces, index lightweight semantic coordination facts:
-
-- objectives and current JJ changes;
-- decisions and constraints;
-- modules or behavior under change;
-- handoffs and peer messages; and
-- possible duplicated or incompatible work.
-
-For actors sharing one physical workspace, additionally prioritize:
-
-- exact file mutations;
-- stale baselines;
-- destructive operations;
-- active collisions; and
-- yield/resolution state.
-
-### Smart triggers
-
-Do not invoke Spark after every tool event. Debounce and batch work around:
-
-- `agent_settled`;
-- collision open or resolution;
-- peer message or handoff;
-- context compaction;
-- meaningful test-batch completion;
-- significant JJ mutation boundaries;
-- accumulated unindexed-event thresholds; and
-- session shutdown.
-
-When a second actor activates indexing, backfill only:
-
-1. the latest checkpoint or compaction for each active actor;
-2. subsequent mutations and test results;
-3. current Git/JJ identity and declared intent; and
-4. unresolved messages and collisions.
-
-Exit condition: one actor working alone causes zero Spark jobs; adding a second actor in the same repository produces bounded catch-up and incremental checkpoints; returning to solo mode stops jobs after a final flush.
-
-## Phase 3 — Lazy semantic retrieval
-
-Once checkpoints exist, local Pi agents already provide the interactive reasoning layer. Avoid building a second conversational product.
-
-Expose compact deterministic queries such as:
-
-```text
-explain this session
-explain since compaction
-explain this JJ change
-what decisions led here
-what does another active actor need me to know
-```
-
-The Agent Bridge skill should lazily load semantic checkpoint tools only for attribution, recovery, handoff, or coordination questions. Answers should combine:
-
-1. observed provenance;
-2. evidence-linked extracted claims; and
-3. local Pi reasoning over the retrieved packet.
-
-Do not inject the full semantic index into every prompt. Deliver a compact packet only when a collision, handoff, relevant shared-module change, explicit query, or materially changed shared context requires it.
-
-Exit condition: any local Pi agent can explain a session or JJ change from a small retrieved packet without another Spark call and without loading the semantic schema into unrelated turns.
-
-## Phase 4 — Safety work carried forward
+## Phase 2 — Safety work carried forward
 
 Develop these alongside or after the checkpoint substrate, without reviving watcher-based attribution as authority:
 
@@ -189,6 +89,16 @@ Develop these alongside or after the checkpoint substrate, without reviving watc
 - explicit human overrides with audit events;
 - richer directory/generated-output/symbol collision evidence; and
 - capability and authorization policy for future adapters.
+
+## Deferred — Contention-activated semantic enrichment
+
+Do not implement active-actor smart triggers, Spark budgeting, catch-up indexing, or automatic semantic extraction as part of the checkpoint substrate. Revisit these only after agent-authored checkpoints and top-level workflow ordering are useful on their own.
+
+If semantic enrichment is later activated by contention, it must remain a derived, bounded, evidence-citing read model and must never replace agent-authored task state or coordination truth.
+
+## Deferred — Lazy semantic retrieval
+
+Do not add semantic retrieval or prompt injection yet. Existing provenance queries, explicit checkpoint reads, and local Pi reasoning are sufficient for the first checkpoint/work-unit workflow. Add compact retrieval packets only after there is demonstrated demand for attribution, handoff, recovery, or coordination explanations.
 
 ## Deferred — Continuous semantic supervisor
 

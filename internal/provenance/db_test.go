@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,10 +47,14 @@ func TestUUIDProjectionUsesBinaryColumnsAndNormalizedCollisionActors(t *testing.
 		t.Fatal(err)
 	}
 	defer database.Close()
-	checks := map[string]string{"repositories": "id", "workspaces": "id", "actors": "session_uuid", "mutations": "actor", "session_events": "actor", "collisions": "id", "collision_actors": "collision_id", "messages": "from_actor", "test_results": "actor"}
+	checks := map[string]string{"repositories": "id", "workspaces": "id", "actors": "session_uuid", "mutations": "actor", "session_events": "actor", "collisions": "id", "collision_actors": "collision_id", "messages": "from_actor", "test_results": "actor", "checkpoint_requests": "actor", "checkpoint_repository": "repository_uuid", "checkpoint_workspace": "workspace_uuid", "checkpoint_work_unit": "work_unit_uuid"}
 	for table, column := range checks {
+		lookupTable := table
+		if strings.HasPrefix(table, "checkpoint_") {
+			lookupTable = "checkpoint_requests"
+		}
 		var kind string
-		if err := database.db.QueryRow(`SELECT type FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&kind); err != nil {
+		if err := database.db.QueryRow(`SELECT type FROM pragma_table_info(?) WHERE name = ?`, lookupTable, column).Scan(&kind); err != nil {
 			t.Fatalf("%s.%s: %v", table, column, err)
 		}
 		if kind != "BLOB" {
@@ -343,6 +348,10 @@ func TestTursoProjectionAndQueries(t *testing.T) {
 		event(t, 3, "intent.completed", completed),
 		event(t, 4, "session.event", sessionEvent),
 		event(t, 5, "collision.upserted", collision),
+		event(t, 6, "collision.transitioned", protocol.CollisionTransitionEvent{
+			CollisionID: collision.ID, Actor: actor.Address, From: protocol.CollisionResolved, To: protocol.CollisionResolved,
+			Resolution: "walkie owns schema", At: now.Add(4 * time.Second),
+		}),
 	}
 	if err := database.ProjectAll(events); err != nil {
 		t.Fatal(err)
@@ -355,7 +364,7 @@ func TestTursoProjectionAndQueries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.Events != 5 || status.Actors != 1 || status.Repositories != 1 || status.Workspaces != 1 || status.Mutations != 1 || status.SessionEvents != 1 || status.Collisions != 1 {
+	if status.Events != 6 || status.Actors != 1 || status.Repositories != 1 || status.Workspaces != 1 || status.Mutations != 1 || status.SessionEvents != 1 || status.Collisions != 1 {
 		t.Fatalf("status = %#v", status)
 	}
 	scopes, err := database.Scopes()
@@ -377,7 +386,7 @@ func TestTursoProjectionAndQueries(t *testing.T) {
 		t.Fatalf("explain = %#v, %v", explained, err)
 	}
 	timeline, err := database.Timeline("@walkie", "", 10)
-	if err != nil || len(timeline) != 4 {
+	if err != nil || len(timeline) != 5 {
 		t.Fatalf("timeline = %#v, %v", timeline, err)
 	}
 	sessionEvents, err := database.SessionEvents("@walkie", 10)
@@ -387,6 +396,9 @@ func TestTursoProjectionAndQueries(t *testing.T) {
 	who, err := database.WhoChanged("/repo/schema.ts", 10)
 	if err != nil || len(who.Mutations) != 1 || len(who.Collisions) != 1 {
 		t.Fatalf("who changed = %#v, %v", who, err)
+	}
+	if who.Collisions[0].State != string(protocol.CollisionResolved) || who.Collisions[0].Resolution != "walkie owns schema" || who.Collisions[0].ResolvedBy != actor.Address {
+		t.Fatalf("projected collision transition = %#v", who.Collisions[0])
 	}
 	why, err := database.Why("intent-1", 10)
 	if err != nil || why.Mutation.TurnID != "pi:session:7:turn:3" || len(why.Collisions) != 1 {

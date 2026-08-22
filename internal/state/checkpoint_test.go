@@ -24,4 +24,13 @@ func TestCheckpointRequestIsIdempotentAndCapturesRange(t *testing.T) {
 	if len(journal.events) != 2 {
 		t.Fatalf("journal events = %d, want registration plus one request", len(journal.events))
 	}
+	conflict := request
+	conflict.CheckpointKind = "handoff"
+	if _, err := engine.RequestCheckpoint(conflict); err == nil {
+		t.Fatal("conflicting duplicate checkpoint ID was accepted")
+	}
+	future := protocol.CheckpointRequest{ID: "checkpoint-future", Actor: actor.Address, CheckpointKind: "settled", JournalEnd: 99}
+	if _, err := engine.RequestCheckpoint(future); err == nil {
+		t.Fatal("future checkpoint journal range was accepted")
+	}
 }

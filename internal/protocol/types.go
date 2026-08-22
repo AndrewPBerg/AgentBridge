@@ -1,11 +1,36 @@
 package protocol
 
 import (
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 )
 
 const Version = 1
+
+// ValidateUUID enforces the canonical UUID storage contract at protocol
+// boundaries. Persisted UUIDs must be 16-byte values with a recognized
+// version and RFC 4122 variant.
+func ValidateUUID(value string) error {
+	candidate := strings.TrimSpace(value)
+	for _, prefix := range []string{"pi:", "col:", "repo:", "workspace:"} {
+		if strings.HasPrefix(candidate, prefix) {
+			candidate = candidate[len(prefix):]
+			break
+		}
+	}
+	compact := strings.ReplaceAll(candidate, "-", "")
+	decoded, err := hex.DecodeString(compact)
+	if err != nil || len(decoded) != 16 {
+		return fmt.Errorf("invalid UUID %q", value)
+	}
+	if decoded[8]&0xc0 != 0x80 || decoded[6]>>4 == 0 || decoded[6]>>4 > 5 {
+		return fmt.Errorf("invalid UUID %q", value)
+	}
+	return nil
+}
 
 type Request struct {
 	ID     string          `json:"id"`
@@ -159,6 +184,26 @@ func (intent Intent) MarshalJSON() ([]byte, error) {
 
 type CollisionState string
 
+// CollisionTransitionEvent is the durable state-machine event for a lifecycle
+// transition. Collision snapshots remain read-model data; lifecycle changes
+// are replayed from these events.
+type CollisionTransitionEvent struct {
+	CollisionID string         `json:"collision_id"`
+	Actor       string         `json:"actor"`
+	From        CollisionState `json:"from"`
+	To          CollisionState `json:"to"`
+	Owner       string         `json:"owner,omitempty"`
+	YieldedBy   string         `json:"yielded_by,omitempty"`
+	Resolution  string         `json:"resolution,omitempty"`
+	At          time.Time      `json:"at"`
+}
+
+type CollisionActorDeadEvent struct {
+	CollisionID string    `json:"collision_id"`
+	Actor       string    `json:"actor"`
+	At          time.Time `json:"at"`
+}
+
 const (
 	CollisionOpen        CollisionState = "open"
 	CollisionNegotiating CollisionState = "negotiating"
@@ -300,9 +345,11 @@ type TestResult struct {
 type CheckpointRequest struct {
 	ID                string      `json:"id"`
 	Actor             string      `json:"actor"`
+	DeclaredBy        string      `json:"declared_by,omitempty"`
 	SessionGeneration uint64      `json:"session_generation"`
 	RepositoryUUID    string      `json:"repository_uuid"`
 	WorkspaceUUID     string      `json:"workspace_uuid"`
+	WorkUnitUUID      string      `json:"work_unit_uuid,omitempty"`
 	CheckpointKind    string      `json:"checkpoint_kind"`
 	JournalStart      uint64      `json:"journal_start_sequence"`
 	JournalEnd        uint64      `json:"journal_end_sequence"`

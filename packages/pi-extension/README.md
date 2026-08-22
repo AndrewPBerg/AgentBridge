@@ -14,7 +14,8 @@ The adapter owns only Pi-specific behavior:
 - mailbox polling and `steer` injection
 - acknowledgement after `agent_settled`
 - `/bridge` commands
-- `bridge_message` and `bridge_collision` tools
+- `/checkpoint [kind]` human checkpoint declaration
+- `bridge_message`, `bridge_collision`, and `bridge_checkpoint` tools
 
 The Go daemon owns actors, aliases, ordered durable queues, collision state, selector resolution, and event persistence.
 
@@ -37,6 +38,7 @@ The extension starts `agent-bridge serve` automatically when the socket is unava
 /bus list
 /bus name walkie
 /bus status
+/checkpoint [manual|settled|handoff|test]
 ```
 
 The talk overlay supports multi-select and an `All in this repo` recipient. It shows harness, state, cwd, and Git/JJ identity before sending.
