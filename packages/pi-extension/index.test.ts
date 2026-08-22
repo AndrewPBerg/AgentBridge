@@ -57,6 +57,19 @@ async function start(pi: ReturnType<typeof createMockPi>, client: BridgeClient, 
 }
 
 describe("Go Agent Bridge adapter", () => {
+  const repositoryUUID = "11111111-1111-5111-8111-111111111111";
+  const workspaceUUID = "22222222-2222-5222-8222-222222222222";
+  const defaultWorkUnitUUID = "33333333-3333-5333-8333-333333333333";
+  const workUnit = (uuid = defaultWorkUnitUUID): any => ({
+    work_unit_uuid: uuid,
+    repository_uuid: repositoryUUID,
+    workspace_uuid: workspaceUUID,
+    objective: "ship orchestration",
+    state: "active",
+    participants: [],
+    checkpoints: [],
+  });
+
   it("automatically reports ordinary edit intent to the daemon", async () => {
     const pi = createMockPi();
     const client = mockClient();
@@ -197,14 +210,253 @@ describe("Go Agent Bridge adapter", () => {
     expect(client.call).toHaveBeenCalledWith(
       "checkpoint.request",
       expect.objectContaining({
-        request: expect.objectContaining({ actor: "sender", declared_by: "agent", checkpoint_kind: "settled", turn_index: 4 }),
+        request: expect.objectContaining({
+          actor: "sender",
+          declared_by: "agent",
+          checkpoint_kind: "settled",
+          turn_index: 4,
+          claims: [expect.objectContaining({ kind: "summary", status: "asserted" })],
+        }),
       }),
     );
     await pi.commands.get("checkpoint").handler("handoff", ctx);
     expect(client.call).toHaveBeenCalledWith(
       "checkpoint.request",
-      expect.objectContaining({ request: expect.objectContaining({ declared_by: "human", checkpoint_kind: "handoff" }) }),
+      expect.objectContaining({
+        request: expect.objectContaining({
+          declared_by: "human",
+          checkpoint_kind: "handoff",
+          claims: [expect.objectContaining({ kind: "summary", status: "asserted" })],
+        }),
+      }),
     );
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("links successful captured test evidence to a verified claim and resets after checkpoint", async () => {
+    const pi = createMockPi();
+    const client = mockClient((method) => {
+      if (method === "checkpoint.request") return { id: "checkpoint", checkpoint_kind: "test" };
+      if (method === "test.result") return { id: "result-1" };
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.events.get("tool_call")?.[0]?.({ toolName: "bash", toolCallId: "test-1", input: { command: "pnpm test" } }, ctx);
+    await pi.events.get("tool_result")?.[0]?.(
+      {
+        toolName: "bash",
+        toolCallId: "test-1",
+        input: { command: "pnpm test" },
+        isError: false,
+        content: [{ type: "text", text: "passed" }],
+        details: { output: "passed", exitCode: 0, truncated: false },
+      },
+      ctx,
+    );
+    await pi.tools.get("bridge_checkpoint").execute("verified", { kind: "test", statement: "Pi tests pass" });
+    const first = vi.mocked(client.call).mock.calls.find(([method]) => method === "checkpoint.request");
+    const calls = vi.mocked(client.call).mock.calls.map(([method]) => method);
+    expect(calls.indexOf("test.result")).toBeLessThan(calls.indexOf("checkpoint.request"));
+    expect(first?.[1]).toEqual(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          test_result_ids: ["result-1"],
+          claims: [{ kind: "test", statement: "Pi tests pass", status: "verified", evidence: [{ kind: "test_result", ordinal: 0 }] }],
+        }),
+      }),
+    );
+    await pi.tools.get("bridge_checkpoint").execute("empty", { kind: "test" });
+    const checkpoints = vi.mocked(client.call).mock.calls.filter(([method]) => method === "checkpoint.request");
+    expect(checkpoints[1]?.[1]).toEqual(
+      expect.objectContaining({
+        request: expect.objectContaining({ test_result_ids: [], claims: [expect.objectContaining({ status: "asserted", evidence: [] })] }),
+      }),
+    );
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("matches failed and blocked claim evidence to test_result_ids", async () => {
+    const pi = createMockPi();
+    let resultNumber = 0;
+    const client = mockClient((method, params) => {
+      if (method === "test.result") return { id: `durable-${++resultNumber}` };
+      if (method === "checkpoint.request") return { id: "checkpoint", checkpoint_kind: String((params as any).request.checkpoint_kind) };
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    const record = async (toolCallId: string, exitCode: number | undefined, isError: boolean) => {
+      const event = {
+        toolName: "bash",
+        toolCallId,
+        input: { command: "pnpm test" },
+        content: [{ type: "text", text: exitCode === undefined ? "cancelled" : `output\nexit code: ${exitCode}` }],
+        details: { output: "output", exitCode, cancelled: exitCode === undefined, truncated: false },
+        isError,
+      };
+      await pi.events.get("tool_call")?.[0]?.(event, ctx);
+      await pi.events.get("tool_result")?.[0]?.(event, ctx);
+    };
+    await record("failed-1", 1, true);
+    await pi.tools.get("bridge_checkpoint").execute("failed", { kind: "failed" });
+    await record("blocked-1", undefined, true);
+    await pi.tools.get("bridge_checkpoint").execute("blocked", { kind: "blocked" });
+    const requests = vi
+      .mocked(client.call)
+      .mock.calls.filter(([method]) => method === "checkpoint.request")
+      .map(([, params]) => (params as any).request);
+    expect(requests).toEqual([
+      expect.objectContaining({
+        checkpoint_kind: "failed",
+        test_result_ids: ["durable-1"],
+        claims: [expect.objectContaining({ status: "failed", evidence: [{ kind: "test_result", ordinal: 0 }] })],
+      }),
+      expect.objectContaining({
+        checkpoint_kind: "blocked",
+        test_result_ids: ["durable-2"],
+        claims: [expect.objectContaining({ status: "blocked", evidence: [{ kind: "test_result", ordinal: 0 }] })],
+      }),
+    ]);
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("downgrades test claims without evidence and keeps old checkpoint calls compatible", async () => {
+    const pi = createMockPi();
+    const client = mockClient((method) => {
+      if (method === "checkpoint.request") return { id: "checkpoint", checkpoint_kind: "test" };
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    const result = await pi.tools.get("bridge_checkpoint").execute("asserted", { kind: "test" });
+    expect(result.content[0].text).toContain("lacks successful captured evidence");
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+    await pi.commands.get("checkpoint").handler("manual", ctx);
+    expect(client.call).toHaveBeenCalledWith(
+      "checkpoint.request",
+      expect.objectContaining({
+        request: expect.objectContaining({ claims: expect.any(Array), test_result_ids: [] }),
+      }),
+    );
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("does not verify failed or arbitrary bash commands", async () => {
+    const pi = createMockPi();
+    const client = mockClient((method) => {
+      if (method === "checkpoint.request") return { id: "checkpoint", checkpoint_kind: "test" };
+      if (method === "test.result") throw new Error("forced persistence failure");
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.events.get("tool_call")?.[0]?.({ toolName: "bash", toolCallId: "nope", input: { command: "echo hello" } }, ctx);
+    await pi.events.get("tool_result")?.[0]?.(
+      {
+        toolName: "bash",
+        toolCallId: "nope",
+        isError: false,
+        content: [{ type: "text", text: "hello\nexit code: 0" }],
+        details: { output: "hello", exitCode: 0, cancelled: false, truncated: false },
+      },
+      ctx,
+    );
+    await pi.events.get("tool_call")?.[0]?.({ toolName: "bash", toolCallId: "bad", input: { command: "go test ./..." } }, ctx);
+    await pi.events.get("tool_result")?.[0]?.(
+      {
+        toolName: "bash",
+        toolCallId: "bad",
+        isError: true,
+        content: [{ type: "text", text: "FAIL" }],
+        details: { output: "FAIL", exitCode: 1, cancelled: false, truncated: false },
+      },
+      ctx,
+    );
+    await pi.tools.get("bridge_checkpoint").execute("asserted", { kind: "test" });
+    expect(client.call).toHaveBeenCalledWith(
+      "test.result",
+      expect.objectContaining({ result: expect.objectContaining({ outcome: "failed" }) }),
+    );
+    const lastCall = vi.mocked(client.call).mock.calls.at(-1);
+    expect(lastCall?.[1]).toEqual(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          claims: [{ status: "asserted", kind: "test", statement: "test checkpoint", evidence: [] }],
+        }),
+      }),
+    );
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("retains evidence when checkpoint persistence fails", async () => {
+    const pi = createMockPi();
+    let fail = true;
+    const client = mockClient((method) => {
+      if (method === "test.result") return { id: "durable-result" };
+      if (method === "checkpoint.request" && fail) {
+        fail = false;
+        throw new Error("checkpoint unavailable");
+      }
+      if (method === "checkpoint.request") return { id: "checkpoint", checkpoint_kind: "test" };
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.events.get("tool_call")?.[0]?.({ toolName: "bash", toolCallId: "keep", input: { command: "vitest run" } }, ctx);
+    await pi.events.get("tool_result")?.[0]?.(
+      { toolName: "bash", toolCallId: "keep", isError: false, details: { output: "ok", exitCode: 0, truncated: false } },
+      ctx,
+    );
+    await expect(pi.tools.get("bridge_checkpoint").execute("first", { kind: "test" })).rejects.toThrow("checkpoint unavailable");
+    await pi.tools.get("bridge_checkpoint").execute("second", { kind: "test" });
+    const checkpoints = vi.mocked(client.call).mock.calls.filter(([method]) => method === "checkpoint.request");
+    expect(checkpoints[1]?.[1]).toEqual(
+      expect.objectContaining({ request: expect.objectContaining({ test_result_ids: ["durable-result"] }) }),
+    );
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("closes mutation intent when failed test evidence persistence is unavailable", async () => {
+    const pi = createMockPi();
+    const client = mockClient((method) => {
+      if (method === "test.result") throw new Error("test result unavailable");
+      if (method === "checkpoint.request") return { id: "checkpoint", checkpoint_kind: "test" };
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    const event = { toolName: "bash", toolCallId: "verify-mutate", input: { command: "pnpm test && rm -f generated.txt" } };
+    await pi.events.get("tool_call")?.[0]?.(event, ctx);
+    await pi.events.get("tool_result")?.[0]?.({ ...event, isError: true, details: { output: "FAIL", exitCode: 1, truncated: false } }, ctx);
+    expect(client.call).toHaveBeenCalledWith(
+      "intent.end",
+      expect.objectContaining({ intent_id: expect.stringContaining("verify-mutate") }),
+    );
+    await pi.tools.get("bridge_checkpoint").execute("no-fabrication", { kind: "test" });
+    expect(client.call).toHaveBeenCalledWith(
+      "checkpoint.request",
+      expect.objectContaining({
+        request: expect.objectContaining({ test_result_ids: [], claims: [expect.objectContaining({ evidence: [] })] }),
+      }),
+    );
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("uses stable declaration boundaries without conflicting separate checkpoints", async () => {
+    const pi = createMockPi();
+    const client = mockClient((method) => (method === "checkpoint.request" ? { id: "checkpoint", checkpoint_kind: "manual" } : undefined));
+    const ctx = await start(pi, client);
+    const tool = pi.tools.get("bridge_checkpoint");
+    await tool.execute("same-call", { kind: "manual" });
+    await tool.execute("same-call", { kind: "manual" });
+    await tool.execute("next-call", { kind: "manual" });
+    await pi.commands.get("checkpoint").handler("manual", ctx);
+    await pi.commands.get("checkpoint").handler("manual", ctx);
+    const requests = vi
+      .mocked(client.call)
+      .mock.calls.filter(([method]) => method === "checkpoint.request")
+      .map(([, params]) => (params as any).request);
+    expect(requests[0].id).toBe(requests[1].id);
+    expect(new Set(requests.map((request) => request.id)).size).toBe(4);
+    expect(requests.slice(3).map((request) => request.boundary_event_id)).toEqual([
+      expect.stringContaining(":human:1"),
+      expect.stringContaining(":human:2"),
+    ]);
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });
 
@@ -283,6 +535,117 @@ describe("Go Agent Bridge adapter", () => {
     const tool = pi.tools.get("bridge_message");
     await Promise.all([tool.execute("one", { to: "receiver", body: "one" }), tool.execute("two", { to: "receiver", body: "two" })]);
     expect(sent).toEqual([1, 2]);
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("creates, joins, and selects a WorkUnit, then reports and clears it", async () => {
+    const pi = createMockPi();
+    const client = mockClient((method, params) => {
+      if (method === "actor.register") return { ...actor(), repository_uuid: repositoryUUID, workspace_uuid: workspaceUUID };
+      if (method === "work_unit.create") return workUnit(params.work_unit.work_unit_uuid);
+      if (method === "provenance.work_unit") return workUnit(params.work_unit_uuid);
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.commands.get("work").handler("ship orchestration", ctx);
+    expect(client.call).toHaveBeenCalledWith(
+      "work_unit.create",
+      expect.objectContaining({ work_unit: expect.objectContaining({ created_by: "sender" }) }),
+    );
+    expect(client.call).toHaveBeenCalledWith("work_unit.join", expect.objectContaining({ actor: "sender" }));
+    await pi.commands.get("work").handler("status", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("ship orchestration"), "info");
+    await pi.commands.get("work").handler("clear", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith("WorkUnit selection cleared.", "info");
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("validates /work use before joining and rejects cross-scope units", async () => {
+    const pi = createMockPi();
+    const otherUUID = "44444444-4444-5444-8444-444444444444";
+    const client = mockClient((method) => {
+      if (method === "actor.register") return { ...actor(), repository_uuid: repositoryUUID, workspace_uuid: workspaceUUID };
+      if (method === "provenance.work_unit") return { ...workUnit(otherUUID), repository_uuid: "55555555-5555-5555-8555-555555555555" };
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.commands.get("work").handler(`use ${otherUUID}`, ctx);
+    expect(client.call).not.toHaveBeenCalledWith("work_unit.join", expect.anything());
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("different repository"), "warning");
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("rejects malformed WorkUnit UUIDs before querying the daemon", async () => {
+    const pi = createMockPi();
+    const client = mockClient((method) => {
+      if (method === "actor.register") return { ...actor(), repository_uuid: repositoryUUID, workspace_uuid: workspaceUUID };
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.commands.get("work").handler("use not-a-uuid", ctx);
+    expect(client.call).not.toHaveBeenCalledWith("provenance.work_unit", expect.anything());
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("canonical UUID"), "warning");
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("uses the selected WorkUnit for implicit checkpoints but validates explicit overrides", async () => {
+    const pi = createMockPi();
+    const client = mockClient((method, params) => {
+      if (method === "actor.register") return { ...actor(), repository_uuid: repositoryUUID, workspace_uuid: workspaceUUID };
+      if (method === "provenance.work_unit") return workUnit(params.work_unit_uuid);
+      if (method === "work_unit.create") return workUnit(params.work_unit.work_unit_uuid);
+      if (method === "checkpoint.request") return { id: "checkpoint", checkpoint_kind: "test" };
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.commands.get("work").handler("objective", ctx);
+    await pi.tools.get("bridge_checkpoint").execute("implicit", { kind: "test" });
+    expect(client.call).toHaveBeenCalledWith(
+      "checkpoint.request",
+      expect.objectContaining({ request: expect.objectContaining({ work_unit_uuid: expect.any(String) }) }),
+    );
+    const explicitWorkUnitUUID = "44444444-4444-5444-8444-444444444444";
+    await pi.tools.get("bridge_checkpoint").execute("explicit", { kind: "test", workUnitUUID: explicitWorkUnitUUID });
+    expect(client.call).toHaveBeenCalledWith("provenance.work_unit", { work_unit_uuid: explicitWorkUnitUUID });
+    expect(client.call).toHaveBeenCalledWith(
+      "checkpoint.request",
+      expect.objectContaining({ request: expect.objectContaining({ work_unit_uuid: explicitWorkUnitUUID }) }),
+    );
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("clears WorkUnit selection on session shutdown and preserves unselected checkpoints", async () => {
+    const pi = createMockPi();
+    const client = mockClient((method) => {
+      if (method === "actor.register") return { ...actor(), repository_uuid: repositoryUUID, workspace_uuid: workspaceUUID };
+      if (method === "work_unit.create") return workUnit();
+      if (method === "checkpoint.request") return { id: "checkpoint", checkpoint_kind: "test" };
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.commands.get("work").handler("objective", ctx);
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    const secondPi = createMockPi();
+    const second = await start(secondPi, client, context("second"));
+    await secondPi.tools.get("bridge_checkpoint").execute("plain", { kind: "test" });
+    expect(vi.mocked(client.call).mock.calls.at(-1)?.[1]).toEqual(
+      expect.objectContaining({ request: expect.objectContaining({ work_unit_uuid: undefined }) }),
+    );
+    await secondPi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, second);
+  });
+
+  it("rejects stale selected WorkUnits without recording a checkpoint", async () => {
+    const pi = createMockPi();
+    const client = mockClient((method) => {
+      if (method === "actor.register") return { ...actor(), repository_uuid: repositoryUUID, workspace_uuid: workspaceUUID };
+      if (method === "work_unit.create") return workUnit();
+      if (method === "provenance.work_unit") throw new Error("not found");
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.commands.get("work").handler("objective", ctx);
+    await expect(pi.tools.get("bridge_checkpoint").execute("stale", { kind: "test" })).rejects.toThrow("not found");
+    expect(client.call).not.toHaveBeenCalledWith("checkpoint.request", expect.anything());
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });
 

@@ -15,8 +15,6 @@ export function defaultSocketPath(): string {
 }
 
 export class BridgeClient {
-  private requestSequence = 0;
-
   constructor(
     readonly socketPath = defaultSocketPath(),
     private readonly timeoutMs = 2_000,

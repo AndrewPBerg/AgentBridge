@@ -301,6 +301,92 @@ func (s *Server) dispatch(request protocol.Request) protocol.Response {
 			return failure(request.ID, "test_result_failed", err)
 		}
 		return success(request.ID, result)
+	case "work_unit.get":
+		value, err := params[struct {
+			UUID string `json:"work_unit_uuid"`
+		}](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		unit, actors, err := s.engine.WorkUnit(value.UUID)
+		if err != nil {
+			return failure(request.ID, "work_unit_get_failed", err)
+		}
+		return success(request.ID, struct {
+			Unit   protocol.WorkUnit        `json:"work_unit"`
+			Actors []protocol.WorkUnitActor `json:"actors"`
+		}{unit, actors})
+	case "work_unit.create":
+		value, err := params[protocol.WorkUnitCreateParams](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		unit, err := s.engine.CreateWorkUnit(value.WorkUnit)
+		if err != nil {
+			return failure(request.ID, "work_unit_create_failed", err)
+		}
+		return success(request.ID, unit)
+	case "work_unit.update":
+		value, err := params[protocol.WorkUnitUpdateParams](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		unit, err := s.engine.UpdateWorkUnit(value)
+		if err != nil {
+			return failure(request.ID, "work_unit_update_failed", err)
+		}
+		return success(request.ID, unit)
+	case "work_unit.join":
+		value, err := params[protocol.WorkUnitActorParams](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		member, err := s.engine.JoinWorkUnit(value)
+		if err != nil {
+			return failure(request.ID, "work_unit_join_failed", err)
+		}
+		return success(request.ID, member)
+	case "work_unit.leave":
+		value, err := params[protocol.WorkUnitActorParams](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		member, err := s.engine.LeaveWorkUnit(value)
+		if err != nil {
+			return failure(request.ID, "work_unit_leave_failed", err)
+		}
+		return success(request.ID, member)
+	case "work_unit.transition":
+		value, err := params[protocol.WorkUnitTransitionParams](request)
+		if err != nil {
+			return failure(request.ID, "invalid_params", err)
+		}
+		unit, err := s.engine.TransitionWorkUnit(value)
+		if err != nil {
+			return failure(request.ID, "work_unit_transition_failed", err)
+		}
+		return success(request.ID, unit)
+	case "provenance.work_unit":
+		if s.provenance == nil {
+			return failure(request.ID, "provenance_unavailable", errors.New("provenance database is unavailable"))
+		}
+		if err := s.waitForProvenance(); err != nil {
+			return failure(request.ID, "provenance_lagging", err)
+		}
+		value, err := params[struct {
+			UUID string `json:"work_unit_uuid"`
+		}](request)
+		if err != nil || value.UUID == "" {
+			if err == nil {
+				err = errors.New("work unit UUID is required")
+			}
+			return failure(request.ID, "invalid_params", err)
+		}
+		unit, err := s.provenance.WorkUnit(value.UUID)
+		if err != nil {
+			return failure(request.ID, "provenance_query_failed", err)
+		}
+		return success(request.ID, unit)
 	case "checkpoint.request":
 		value, err := params[protocol.CheckpointRequestParams](request)
 		if err != nil {

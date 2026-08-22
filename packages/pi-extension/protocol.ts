@@ -107,6 +107,7 @@ export type TestResult = {
   command: string;
   cwd: string;
   exit_code?: number;
+  outcome?: "passed" | "failed" | "blocked";
   started_at: string;
   completed_at: string;
   duration_ms?: number;
@@ -120,6 +121,23 @@ export type TestResult = {
   jj?: JjContext;
 };
 
+export type WorkUnit = {
+  work_unit_uuid: string;
+  repository_uuid: string;
+  workspace_uuid: string;
+  objective: string;
+  state: string;
+  participants?: unknown[];
+  checkpoints?: unknown[];
+};
+
+export type CheckpointClaim = {
+  kind: string;
+  statement: string;
+  status: "asserted" | "verified" | "failed" | "blocked";
+  evidence: Array<{ kind: string; ordinal: number }>;
+};
+
 export type CheckpointRequest = {
   id: string;
   actor: ActorRecord["address"];
@@ -129,6 +147,7 @@ export type CheckpointRequest = {
   workspace_uuid: string;
   work_unit_uuid?: string;
   checkpoint_kind: string;
+  claims?: CheckpointClaim[];
   journal_start_sequence: number;
   journal_end_sequence: number;
   boundary_event_id?: string;
@@ -136,6 +155,11 @@ export type CheckpointRequest = {
   turn_id?: string;
   turn_index?: number;
   compaction_event_id?: string;
+  mutation_ids?: string[];
+  message_ids?: string[];
+  collision_ids?: string[];
+  test_result_ids?: string[];
+  metadata?: Record<string, string>;
   git?: GitContext;
   jj?: JjContext;
 };

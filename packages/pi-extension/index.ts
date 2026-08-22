@@ -1,13 +1,24 @@
 import { createHash, randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { isBashToolResult } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { BridgeClient, ensureDaemon } from "./client";
 import { inspectGit } from "./git";
 import { listHerdrAgents } from "./herdr";
 import { inferIntentContext, inferMutation } from "./intent";
 import { inspectJj } from "./jj";
-import type { ActorRecord, BridgeMessage, CheckpointRequest, Collision, CollisionState, MutationIntent, SessionEvent } from "./protocol";
+import type {
+  ActorRecord,
+  BridgeMessage,
+  CheckpointRequest,
+  Collision,
+  CollisionState,
+  MutationIntent,
+  SessionEvent,
+  TestResult,
+  WorkUnit,
+} from "./protocol";
 import { BRIDGE_MESSAGE_TYPE } from "./protocol";
 import { snapshotFiles } from "./provenance";
 import { initialTalkTargets, sameRepository, showTalkModal } from "./talk-modal";
@@ -36,9 +47,15 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
   let generation = 0;
   let clientSequence = 0;
   let sessionEventSequence = 0;
+  let declarationSequence = 0;
   let currentTurnIndex: number | undefined;
   let recoveryPromise: Promise<void> | undefined;
   let lastError = "";
+  let selectedWorkUnit: WorkUnit | undefined;
+  // Test results are emitted by the Pi tool/runtime boundary. Keep only results
+  // captured after the last checkpoint; the daemon assigns evidence ordinals.
+  let capturedTestResults: Array<{ id: string; outcome: "passed" | "failed" | "blocked" }> = [];
+  const verificationRuns = new Map<string, { command: string; cwd: string; startedAt: Date }>();
 
   function reportError(ctx: ExtensionContext | undefined, error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
@@ -169,11 +186,174 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     await call("session.event", { event });
   }
 
-  async function requestCheckpoint(declaredBy: "agent" | "human", kind: string, workUnitUUID?: string): Promise<CheckpointRequest> {
+  function canonicalUUID(value: unknown, label: string): string {
+    if (
+      typeof value !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ||
+      value === "00000000-0000-0000-0000-000000000000"
+    ) {
+      throw new Error(`${label} must be a canonical UUID`);
+    }
+    return value;
+  }
+
+  function requireWorkUnitScope(): { repository_uuid: string; workspace_uuid: string } {
     if (!actor) throw new Error("Agent Bridge is not attached to an active session");
-    const boundary = `${actor.address}:${generation}:${kind}:${currentTurnIndex ?? "session"}`;
+    return {
+      repository_uuid: canonicalUUID(actor.repository_uuid, "Repository UUID"),
+      workspace_uuid: canonicalUUID(actor.workspace_uuid, "Workspace UUID"),
+    };
+  }
+
+  function normalizeWorkUnit(result: unknown): WorkUnit {
+    const candidate = (result as { work_unit?: unknown } | undefined)?.work_unit ?? result;
+    if (!candidate || typeof candidate !== "object") throw new Error("Daemon returned no WorkUnit");
+    const unit = candidate as Partial<WorkUnit>;
+    if (typeof unit.objective !== "string" || typeof unit.state !== "string") throw new Error("Daemon returned an invalid WorkUnit");
+    canonicalUUID(unit.work_unit_uuid, "WorkUnit UUID");
+    canonicalUUID(unit.repository_uuid, "Repository UUID");
+    canonicalUUID(unit.workspace_uuid, "Workspace UUID");
+    return unit as WorkUnit;
+  }
+
+  function validateWorkUnit(unit: WorkUnit): WorkUnit {
+    const scope = requireWorkUnitScope();
+    if (unit.repository_uuid !== scope.repository_uuid || unit.workspace_uuid !== scope.workspace_uuid) {
+      throw new Error("WorkUnit belongs to a different repository or workspace");
+    }
+    return unit;
+  }
+
+  async function fetchWorkUnit(workUnitUUID: string): Promise<WorkUnit> {
+    const uuid = canonicalUUID(workUnitUUID, "WorkUnit UUID");
+    return validateWorkUnit(normalizeWorkUnit(await call("provenance.work_unit", { work_unit_uuid: uuid })));
+  }
+
+  async function selectWorkUnit(unit: WorkUnit): Promise<WorkUnit> {
+    selectedWorkUnit = validateWorkUnit(unit);
+    return selectedWorkUnit;
+  }
+
+  function isVerificationKind(kind: string): boolean {
+    return /^(test|build|runtime)$/i.test(kind.trim());
+  }
+
+  function claimFor(
+    kind: string,
+    statement: string | undefined,
+    evidence: Array<{ id: string; outcome: "passed" | "failed" | "blocked" }>,
+  ) {
+    const normalizedKind = kind.trim().toLowerCase();
+    const claimKind = isVerificationKind(normalizedKind) ? normalizedKind : "summary";
+    const explicitStatus = /^failed$/i.test(normalizedKind) ? "failed" : /^blocked$/i.test(normalizedKind) ? "blocked" : undefined;
+    const matching = explicitStatus
+      ? evidence.filter((result) => result.outcome === explicitStatus)
+      : isVerificationKind(normalizedKind)
+        ? evidence.filter(
+            (result) =>
+              result.outcome ===
+              (evidence.some((item) => item.outcome === "passed")
+                ? "passed"
+                : evidence.some((item) => item.outcome === "failed")
+                  ? "failed"
+                  : "blocked"),
+          )
+        : [];
+    const status =
+      explicitStatus ?? (matching.length > 0 ? (matching[0]?.outcome === "passed" ? "verified" : matching[0]?.outcome) : "asserted");
+    return [
+      {
+        kind: claimKind,
+        statement: statement?.trim() || `${normalizedKind} checkpoint`,
+        status,
+        evidence: matching.map((_, ordinal) => ({ kind: "test_result", ordinal })),
+      },
+    ];
+  }
+
+  function verificationCommand(command: string): boolean {
+    const words = command.trim().split(/\s+/);
+    const first = words[0]?.toLowerCase();
+    const second = words[1]?.toLowerCase();
+    if (first === "go" && ["test", "build", "run"].includes(second ?? "")) return true;
+    if (
+      ["bun", "npm", "pnpm"].includes(first ?? "") &&
+      (second === "test" || (second === "run" && ["test", "typecheck", "build"].includes(words[2]?.toLowerCase() ?? "")))
+    )
+      return true;
+    if (
+      ["vitest", "jest", "pytest"].includes(first ?? "") ||
+      (first === "cargo" && ["test", "build", "run"].includes(second ?? "")) ||
+      ((first === "npm" || first === "pnpm") && second === "start")
+    )
+      return true;
+    if (first === "tsc" || first === "typecheck") return true;
+    return false;
+  }
+
+  function bashResultMetadata(
+    details: { truncation?: { truncated?: boolean } | null },
+    content: unknown,
+    isError: boolean,
+  ): { exitCode?: number; output: string; truncated: boolean } {
+    const output = Array.isArray(content)
+      ? content
+          .filter((part) => part && typeof part === "object" && (part as { type?: string }).type === "text")
+          .map((part) => String((part as { text?: unknown }).text ?? ""))
+          .join("\n")
+      : "";
+    const exitMatch = output.match(/exit code: (-?\d+)/i);
+    const blocked = /\b(cancelled|canceled|aborted|timed out)\b/i.test(output);
+    return {
+      exitCode: exitMatch?.[1] === undefined ? (blocked ? undefined : isError ? 1 : 0) : Number(exitMatch[1]),
+      output,
+      truncated: details.truncation?.truncated === true,
+    };
+  }
+
+  async function requestCheckpoint(
+    declaredBy: "agent" | "human",
+    kind: string,
+    workUnitUUID?: string,
+    metadata?: Record<string, string>,
+    statement?: string,
+    declarationId?: string,
+  ): Promise<CheckpointRequest> {
+    if (!actor) throw new Error("Agent Bridge is not attached to an active session");
+    // An explicit UUID is authoritative. An implicit selection is re-read so stale
+    // or cross-scope state can never receive a checkpoint.
+    let linkedWorkUnit: string | undefined;
+    if (workUnitUUID) {
+      linkedWorkUnit = (await fetchWorkUnit(canonicalUUID(workUnitUUID, "WorkUnit UUID"))).work_unit_uuid;
+    } else if (selectedWorkUnit) {
+      try {
+        linkedWorkUnit = (await fetchWorkUnit(selectedWorkUnit.work_unit_uuid)).work_unit_uuid;
+      } catch (error) {
+        selectedWorkUnit = undefined;
+        throw error;
+      }
+    }
+    const boundary = declarationId ?? `${actor.address}:${generation}:human:${++declarationSequence}`;
     const id = createHash("sha256").update(boundary).digest("hex");
-    return call<CheckpointRequest>("checkpoint.request", {
+    const evidence = [...capturedTestResults];
+    const normalizedKind = kind.trim();
+    const checkpointEvidence = /^failed$/i.test(normalizedKind)
+      ? evidence.filter((result) => result.outcome === "failed")
+      : /^blocked$/i.test(normalizedKind)
+        ? evidence.filter((result) => result.outcome === "blocked")
+        : isVerificationKind(normalizedKind)
+          ? evidence.filter(
+              (result) =>
+                result.outcome ===
+                (evidence.some((item) => item.outcome === "passed")
+                  ? "passed"
+                  : evidence.some((item) => item.outcome === "failed")
+                    ? "failed"
+                    : "blocked"),
+            )
+          : [];
+    const evidenceIds = checkpointEvidence.map((result) => result.id);
+    const result = await call<CheckpointRequest>("checkpoint.request", {
       request: {
         id,
         actor: actor.address,
@@ -181,16 +361,22 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
         session_generation: generation,
         repository_uuid: actor.repository_uuid,
         workspace_uuid: actor.workspace_uuid,
-        work_unit_uuid: workUnitUUID,
+        work_unit_uuid: linkedWorkUnit,
         checkpoint_kind: kind,
+        claims: claimFor(kind, statement, checkpointEvidence),
+        test_result_ids: evidenceIds,
         boundary_event_id: boundary,
         boundary_type: "explicit",
         turn_id: currentTurnIndex === undefined ? undefined : `${actor.address}:${generation}:turn:${currentTurnIndex}`,
         turn_index: currentTurnIndex,
         git: actor.git,
         jj: actor.jj,
+        metadata,
       },
     });
+    if (!result.test_result_ids?.length && evidenceIds.length > 0) result.test_result_ids = evidenceIds;
+    capturedTestResults = [];
+    return result;
   }
 
   async function send(to: string, body: string): Promise<BridgeMessage> {
@@ -365,18 +551,39 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
   pi.registerTool({
     name: "bridge_checkpoint",
     label: "Agent Bridge Checkpoint",
-    description: "Declare an immutable, evidence-linked checkpoint at a meaningful stopping point.",
-    promptSnippet: "Use bridge_checkpoint when you reach a meaningful stopping point or need a durable handoff boundary.",
+    description:
+      "Declare an immutable checkpoint with an optional claim statement. Test/build/runtime claims are verified only with successful captured evidence; otherwise they remain asserted.",
+    promptSnippet:
+      "Use bridge_checkpoint at a durable boundary; distinguish asserted, verified, failed, and blocked, and never claim tests/build/runtime passed without attached evidence.",
+    promptGuidelines: [
+      "Use a concise statement to say what changed or was checked.",
+      "Verification requires a successful persisted test result; otherwise report the claim as asserted and lacking verification.",
+    ],
     parameters: Type.Object({
       kind: Type.String({ description: "Checkpoint kind, for example settled, handoff, test, or manual." }),
       workUnitUUID: Type.Optional(Type.String({ description: "Optional WorkUnit UUID to link this checkpoint to." })),
+      metadata: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Optional authored metadata for this boundary." })),
+      statement: Type.Optional(Type.String({ description: "Optional concise claim statement." })),
     }),
     async execute(_toolCallId, params) {
       const kind = String(params.kind ?? "").trim();
       if (!kind) throw new Error("Checkpoint kind is required");
-      const checkpoint = await requestCheckpoint("agent", kind, params.workUnitUUID ? String(params.workUnitUUID) : undefined);
+      const checkpoint = await requestCheckpoint(
+        "agent",
+        kind,
+        params.workUnitUUID ? String(params.workUnitUUID) : undefined,
+        params.metadata,
+        params.statement ? String(params.statement) : undefined,
+        `bridge:${actor?.address ?? "unknown"}:${generation}:${String(_toolCallId)}`,
+      );
+      const unverified = isVerificationKind(kind) && !checkpoint.test_result_ids?.length;
       return {
-        content: [{ type: "text", text: `Checkpoint ${checkpoint.id} recorded.` }],
+        content: [
+          {
+            type: "text",
+            text: `Checkpoint ${checkpoint.id} recorded${unverified ? "; claim asserted and lacks successful captured evidence" : "."}`,
+          },
+        ],
         details: { checkpoint },
       };
     },
@@ -524,6 +731,73 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     handler: handleBus,
   });
 
+  const workUsage = "Usage: /work <objective> | /work use <uuid> | /work status | /work clear";
+
+  pi.registerCommand("work", {
+    description: "Create, select, inspect, or clear the session WorkUnit",
+    getArgumentCompletions: (prefix: string) => {
+      if (prefix.trim().includes(" ")) return null;
+      const normalized = prefix.trim();
+      return ["use", "status", "clear"].filter((value) => value.startsWith(normalized)).map((value) => ({ value, label: value }));
+    },
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const input = String(args ?? "").trim();
+      const [action, ...rest] = input.split(/\s+/);
+      try {
+        if (!actor) throw new Error("Agent Bridge is not attached to an active session");
+        if (action === "status") {
+          if (!selectedWorkUnit) {
+            ctx.ui.notify("No WorkUnit selected.", "info");
+            return;
+          }
+          try {
+            const unit = await fetchWorkUnit(selectedWorkUnit.work_unit_uuid);
+            selectedWorkUnit = unit;
+            ctx.ui.notify(`WorkUnit ${unit.work_unit_uuid}: ${unit.state} · ${unit.objective}`, "info");
+          } catch (error) {
+            selectedWorkUnit = undefined;
+            throw new Error(`Selected WorkUnit cleared: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          return;
+        }
+        if (action === "clear") {
+          selectedWorkUnit = undefined;
+          ctx.ui.notify("WorkUnit selection cleared.", "info");
+          return;
+        }
+        if (action === "use") {
+          const uuid = rest[0];
+          if (!uuid) throw new Error("/work use requires a WorkUnit UUID");
+          const unit = await fetchWorkUnit(uuid);
+          await call("work_unit.join", { work_unit_uuid: unit.work_unit_uuid, actor: actor.address });
+          await selectWorkUnit(unit);
+          ctx.ui.notify(`Selected WorkUnit ${unit.work_unit_uuid}.`, "info");
+          return;
+        }
+        const objective = input.startsWith("<") ? "" : input;
+        if (!objective || objective === "use" || objective === "status" || objective === "clear") throw new Error(workUsage);
+        const scope = requireWorkUnitScope();
+        const unit = normalizeWorkUnit(
+          await call("work_unit.create", {
+            work_unit: {
+              work_unit_uuid: randomUUID(),
+              repository_uuid: scope.repository_uuid,
+              workspace_uuid: scope.workspace_uuid,
+              objective,
+              created_by: actor.address,
+            },
+          }),
+        );
+        validateWorkUnit(unit);
+        await call("work_unit.join", { work_unit_uuid: unit.work_unit_uuid, actor: actor.address });
+        await selectWorkUnit(unit);
+        ctx.ui.notify(`Created and selected WorkUnit ${unit.work_unit_uuid}.`, "info");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+      }
+    },
+  });
+
   pi.registerCommand("checkpoint", {
     description: "Declare a human checkpoint: /checkpoint [kind]",
     getArgumentCompletions: (prefix: string) => {
@@ -534,10 +808,16 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
         .map((value) => ({ value, label: value }));
     },
     handler: async (args: string, ctx: ExtensionContext) => {
-      const kind = String(args ?? "").trim() || "manual";
+      const input = String(args ?? "").trim();
+      const [kind = "manual", ...statementParts] = input ? input.split(/\s+/) : [];
+      const statement = statementParts.join(" ") || undefined;
       try {
-        const checkpoint = await requestCheckpoint("human", kind);
-        ctx.ui.notify(`Checkpoint ${checkpoint.id} recorded.`, "info");
+        const checkpoint = await requestCheckpoint("human", kind, undefined, undefined, statement);
+        const unverified = isVerificationKind(kind) && !checkpoint.test_result_ids?.length;
+        ctx.ui.notify(
+          `Checkpoint ${checkpoint.id} recorded${unverified ? "; claim asserted and lacks successful captured evidence." : "."}`,
+          unverified ? "warning" : "info",
+        );
       } catch (error) {
         reportError(ctx, error);
       }
@@ -545,7 +825,7 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
   });
 
   pi.on("before_agent_start", (event) => ({
-    systemPrompt: `${event.systemPrompt}\n\nAgent Bridge automatically detects shared-workspace file collisions. When it reports one, do not revert unfamiliar edits; coordinate using bridge_message, then record yield or resolution using bridge_collision. You never declare edit intent manually.`,
+    systemPrompt: `${event.systemPrompt}\n\nAgent Bridge automatically detects shared-workspace file collisions. When it reports one, do not revert unfamiliar edits; coordinate using bridge_message, then record yield or resolution using bridge_collision. You never declare edit intent manually. Checkpoint claims are asserted, verified, failed, or blocked: test/build/runtime claims are verified only with successful persisted evidence attached. Without evidence, say asserted and lacking verification; never claim tests, builds, or runtime checks passed.`,
   }));
 
   pi.on("session_start", async (event, ctx) => {
@@ -555,6 +835,10 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     clientSequence = 0;
     sessionEventSequence = 0;
     currentTurnIndex = undefined;
+    selectedWorkUnit = undefined;
+    capturedTestResults = [];
+    declarationSequence = 0;
+    verificationRuns.clear();
     await ensureDaemon(client);
     const sessionId = randomUUID();
     const now = new Date().toISOString();
@@ -621,9 +905,18 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
 
   pi.on("tool_call", async (event, ctx) => {
     if (!actor) return;
+    const toolName =
+      String(event.toolName ?? "")
+        .split(".")
+        .at(-1) ?? "";
+    const input = event.input as Record<string, unknown> | undefined;
+    const toolCallId = String(event.toolCallId ?? "");
+    if (toolName === "bash" && typeof input?.command === "string" && verificationCommand(input.command) && toolCallId) {
+      verificationRuns.set(toolCallId, { command: input.command, cwd: ctx.cwd, startedAt: new Date() });
+    }
     const mutation = inferMutation(event, ctx.cwd);
     if (!mutation) return;
-    const toolCallId = String(event.toolCallId ?? randomUUID());
+    const mutationToolCallId = String(event.toolCallId ?? randomUUID());
     const started = new Date();
     const vcsCwd = mutation.paths[0] ? dirname(mutation.paths[0]) : ctx.cwd;
     const [before, mutationGit, mutationJj] = await Promise.all([
@@ -632,12 +925,12 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
       inspectJj(pi, vcsCwd),
     ]);
     const intent: MutationIntent = {
-      id: `${actor.address}:${generation}:${toolCallId}`,
+      id: `${actor.address}:${generation}:${mutationToolCallId}`,
       actor: actor.address,
       session_generation: generation,
       turn_id: currentTurnIndex === undefined ? undefined : `${actor.address}:${generation}:turn:${currentTurnIndex}`,
       turn_index: currentTurnIndex,
-      tool_call_id: toolCallId,
+      tool_call_id: mutationToolCallId,
       ...mutation,
       cwd: ctx.cwd,
       workspace_key:
@@ -649,12 +942,54 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
       started_at: started.toISOString(),
       expires_at: new Date(started.getTime() + INTENT_TTL_MS).toISOString(),
     };
-    openIntents.set(toolCallId, intent);
+    openIntents.set(mutationToolCallId, intent);
     await call<IntentResult>("intent.begin", { intent });
   });
 
   pi.on("tool_result", async (event) => {
     const toolCallId = String(event.toolCallId ?? "");
+    const verification = verificationRuns.get(toolCallId);
+    verificationRuns.delete(toolCallId);
+    if (verification && actor && isBashToolResult(event)) {
+      const metadata = bashResultMetadata(event.details, event.content, event.isError);
+      const outcome = metadata.exitCode === undefined ? "blocked" : metadata.exitCode === 0 && !event.isError ? "passed" : "failed";
+      const completedAt = new Date();
+      const outputBytes = Buffer.byteLength(metadata.output, "utf8");
+      try {
+        const persisted = await call<TestResult>("test.result", {
+          result: {
+            id: createHash("sha256").update(`${actor.address}:${generation}:test-result:${toolCallId}`).digest("hex"),
+            actor: actor.address,
+            session_generation: generation,
+            turn_id: currentTurnIndex === undefined ? undefined : `${actor.address}:${generation}:turn:${currentTurnIndex}`,
+            turn_index: currentTurnIndex,
+            tool_call_id: toolCallId,
+            command: verification.command,
+            cwd: verification.cwd,
+            exit_code: metadata.exitCode,
+            outcome,
+            started_at: verification.startedAt.toISOString(),
+            completed_at: completedAt.toISOString(),
+            duration_ms: completedAt.getTime() - verification.startedAt.getTime(),
+            output_excerpt: metadata.output.slice(0, 600),
+            output_sha256: createHash("sha256").update(metadata.output).digest("hex"),
+            output_bytes: outputBytes,
+            output_truncated: metadata.truncated,
+            repository_uuid: actor.repository_uuid,
+            workspace_uuid: actor.workspace_uuid,
+            git: actor.git,
+            jj: actor.jj,
+          },
+        });
+        if (typeof persisted?.id === "string" && persisted.id.trim()) {
+          const daemonOutcome = persisted.outcome;
+          const confirmedOutcome = outcome === "failed" || outcome === "blocked" ? outcome : (daemonOutcome ?? outcome);
+          capturedTestResults.push({ id: persisted.id.trim(), outcome: confirmedOutcome });
+        }
+      } catch (error) {
+        reportError(sessionCtx, error);
+      }
+    }
     const intent = openIntents.get(toolCallId);
     if (!intent) return;
     openIntents.delete(toolCallId);
@@ -708,6 +1043,9 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     if (actor) await call("actor.heartbeat", { address: actor.address, state: "dead", generation }).catch(() => undefined);
     actor = undefined;
     sessionCtx = undefined;
+    selectedWorkUnit = undefined;
+    capturedTestResults = [];
+    verificationRuns.clear();
     deliveredInRuntime.clear();
     pendingAcknowledgements.clear();
     ctx.ui.setStatus(BRIDGE_MESSAGE_TYPE, undefined);

@@ -27,13 +27,28 @@ function shellWords(command: string): string[] {
 }
 
 function bashMutation(command: string, cwd: string): InferredMutation | undefined {
-  if (!MUTATING_BASH.test(command)) return undefined;
   const words = shellWords(command);
-  const match = BASH_OPERATIONS.find(({ prefix }) => prefix.every((word, index) => words[index] === word));
+  if (
+    !MUTATING_BASH.test(command) &&
+    !words.some((_word, index) => BASH_OPERATIONS.some(({ prefix }) => prefix.every((part, offset) => words[index + offset] === part)))
+  ) {
+    return undefined;
+  }
+  let match: (typeof BASH_OPERATIONS)[number] | undefined;
+  let matchIndex = -1;
+  for (let index = 0; index < words.length; index += 1) {
+    const candidate = BASH_OPERATIONS.find(({ prefix }) => prefix.every((word, offset) => words[index + offset] === word));
+    if (candidate) {
+      match = candidate;
+      matchIndex = index;
+      break;
+    }
+  }
   if (!match) return undefined;
 
-  const operands = words
-    .slice(match.prefix.length)
+  const operandWords = words.slice(matchIndex + match.prefix.length);
+  const stop = operandWords.findIndex((word) => ["&&", "||", ";", "|"].includes(word));
+  const operands = (stop < 0 ? operandWords : operandWords.slice(0, stop))
     .filter((word) => word && word !== "--" && !word.startsWith("-"))
     .map((path) => canonicalPath(cwd, path));
   if (!operands.length) return undefined;

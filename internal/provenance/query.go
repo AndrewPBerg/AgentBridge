@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
 )
 
 type MutationRecord struct {
@@ -81,19 +84,98 @@ type Status struct {
 	Collisions        int64  `json:"collisions"`
 }
 
+type WorkUnitRecord struct {
+	UUID               string                   `json:"work_unit_uuid"`
+	RepositoryUUID     string                   `json:"repository_uuid"`
+	WorkspaceUUID      string                   `json:"workspace_uuid"`
+	Objective          string                   `json:"objective"`
+	AcceptanceCriteria string                   `json:"acceptance_criteria,omitempty"`
+	Context            string                   `json:"context,omitempty"`
+	State              protocol.WorkUnitState   `json:"state"`
+	CreatedBy          string                   `json:"created_by"`
+	CreatedAt          string                   `json:"created_at"`
+	UpdatedAt          string                   `json:"updated_at"`
+	CompletedAt        string                   `json:"completed_at,omitempty"`
+	Participants       []protocol.WorkUnitActor `json:"participants"`
+	Checkpoints        []CheckpointRecord       `json:"checkpoints"`
+}
+
+func (d *DB) WorkUnit(uuid string) (WorkUnitRecord, error) {
+	var record WorkUnitRecord
+	var id, repo, workspace, creator []byte
+	err := d.db.QueryRow(`SELECT work_unit_uuid, repository_uuid, workspace_uuid, objective, COALESCE(acceptance_criteria,''), COALESCE(context,''), state, created_by, created_at, updated_at, COALESCE(completed_at,'') FROM work_units WHERE work_unit_uuid=?`, uuidBlob(uuid)).Scan(&id, &repo, &workspace, &record.Objective, &record.AcceptanceCriteria, &record.Context, &record.State, &creator, &record.CreatedAt, &record.UpdatedAt, &record.CompletedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return record, fmt.Errorf("unknown work unit %q", uuid)
+	}
+	if err != nil {
+		return record, err
+	}
+	record.UUID, record.RepositoryUUID, record.WorkspaceUUID, record.CreatedBy = uuidString(id), uuidString(repo), uuidString(workspace), uuidString(creator)
+	rows, err := d.db.Query(`SELECT actor_uuid, joined_at, left_at, participation_state FROM work_unit_actors WHERE work_unit_uuid=? ORDER BY actor_uuid`, uuidBlob(uuid))
+	if err != nil {
+		return record, err
+	}
+	defer rows.Close()
+	record.Participants = []protocol.WorkUnitActor{}
+	for rows.Next() {
+		var actor []byte
+		var joined, state string
+		var left sql.NullString
+		if err := rows.Scan(&actor, &joined, &left, &state); err != nil {
+			return record, err
+		}
+		value := protocol.WorkUnitActor{WorkUnitUUID: record.UUID, Actor: uuidString(actor), JoinedAt: parseTime(joined), ParticipationState: state}
+		if left.Valid {
+			at := parseTime(left.String)
+			value.LeftAt = &at
+		}
+		record.Participants = append(record.Participants, value)
+	}
+	if err := rows.Err(); err != nil {
+		return record, err
+	}
+	record.Checkpoints, err = d.ListCheckpoints(uuid, 1000)
+	return record, err
+}
+
+func parseTime(value string) time.Time {
+	parsed, _ := time.Parse(time.RFC3339Nano, value)
+	return parsed
+}
+
+type CheckpointClaimRecord struct {
+	Kind      string                           `json:"kind"`
+	Statement string                           `json:"statement"`
+	Status    protocol.CheckpointClaimStatus   `json:"status"`
+	Evidence  []protocol.CheckpointEvidenceRef `json:"evidence,omitempty"`
+}
+
 type CheckpointRecord struct {
-	ID                string          `json:"id"`
-	Actor             string          `json:"actor"`
-	DeclaredBy        string          `json:"declared_by"`
-	SessionGeneration uint64          `json:"session_generation"`
-	RepositoryUUID    string          `json:"repository_uuid"`
-	WorkspaceUUID     string          `json:"workspace_uuid"`
-	WorkUnitUUID      string          `json:"work_unit_uuid,omitempty"`
-	CheckpointKind    string          `json:"checkpoint_kind"`
-	JournalStart      uint64          `json:"journal_start_sequence"`
-	JournalEnd        uint64          `json:"journal_end_sequence"`
-	Data              json.RawMessage `json:"data"`
-	EventSequence     uint64          `json:"event_sequence"`
+	ID                string                  `json:"id"`
+	Actor             string                  `json:"actor"`
+	DeclaredBy        string                  `json:"declared_by"`
+	SessionGeneration uint64                  `json:"session_generation"`
+	RepositoryUUID    string                  `json:"repository_uuid"`
+	WorkspaceUUID     string                  `json:"workspace_uuid"`
+	WorkUnitUUID      string                  `json:"work_unit_uuid,omitempty"`
+	CheckpointKind    string                  `json:"checkpoint_kind"`
+	JournalStart      uint64                  `json:"journal_start_sequence"`
+	JournalEnd        uint64                  `json:"journal_end_sequence"`
+	BoundaryEventID   string                  `json:"boundary_event_id,omitempty"`
+	BoundaryType      string                  `json:"boundary_type,omitempty"`
+	TurnID            string                  `json:"turn_id,omitempty"`
+	TurnIndex         *int                    `json:"turn_index,omitempty"`
+	CompactionEventID string                  `json:"compaction_event_id,omitempty"`
+	MutationIDs       []string                `json:"mutation_ids,omitempty"`
+	MessageIDs        []string                `json:"message_ids,omitempty"`
+	CollisionIDs      []string                `json:"collision_ids,omitempty"`
+	TestResultIDs     []string                `json:"test_result_ids,omitempty"`
+	Claims            []CheckpointClaimRecord `json:"claims,omitempty"`
+	Metadata          map[string]string       `json:"metadata,omitempty"`
+	Git               *protocol.GitContext    `json:"git,omitempty"`
+	JJ                *protocol.JJContext     `json:"jj,omitempty"`
+	Data              json.RawMessage         `json:"data"`
+	EventSequence     uint64                  `json:"event_sequence"`
 }
 
 type RepositoryRecord struct {
@@ -201,7 +283,11 @@ func (d *DB) ListCheckpoints(workUnitUUID string, limit int) ([]CheckpointRecord
 		query += ` WHERE work_unit_uuid = ?`
 		arguments = append(arguments, uuidBlob(workUnitUUID))
 	}
-	query += ` ORDER BY journal_end_sequence DESC, event_sequence DESC, id DESC LIMIT ?`
+	if workUnitUUID != "" {
+		query += ` ORDER BY event_sequence ASC, id ASC LIMIT ?`
+	} else {
+		query += ` ORDER BY journal_end_sequence DESC, event_sequence DESC, id DESC LIMIT ?`
+	}
 	arguments = append(arguments, limit)
 	rows, err := d.db.Query(query, arguments...)
 	if err != nil {
@@ -212,6 +298,9 @@ func (d *DB) ListCheckpoints(workUnitUUID string, limit int) ([]CheckpointRecord
 	for rows.Next() {
 		record, err := scanCheckpoint(rows)
 		if err != nil {
+			return nil, err
+		}
+		if err := d.hydrateCheckpoint(&record); err != nil {
 			return nil, err
 		}
 		result = append(result, record)
@@ -227,7 +316,94 @@ func (d *DB) Checkpoint(id string) (CheckpointRecord, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return CheckpointRecord{}, fmt.Errorf("unknown checkpoint %q", id)
 	}
-	return record, err
+	if err != nil {
+		return CheckpointRecord{}, err
+	}
+	if err := d.hydrateCheckpoint(&record); err != nil {
+		return CheckpointRecord{}, err
+	}
+	return record, nil
+}
+
+func (d *DB) hydrateCheckpoint(record *CheckpointRecord) error {
+	record.MutationIDs = nil
+	record.MessageIDs = nil
+	record.CollisionIDs = nil
+	record.TestResultIDs = nil
+	record.Claims = nil
+	rows, err := d.db.Query(`SELECT kind, ref_text, ref_uuid FROM checkpoint_evidence WHERE checkpoint_id = ? ORDER BY kind, ordinal`, record.ID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind string
+		var text sql.NullString
+		var binary []byte
+		if err := rows.Scan(&kind, &text, &binary); err != nil {
+			return err
+		}
+		ref := text.String
+		if len(binary) > 0 {
+			ref = uuidString(binary)
+		}
+		switch kind {
+		case "mutation":
+			record.MutationIDs = append(record.MutationIDs, ref)
+		case "message":
+			record.MessageIDs = append(record.MessageIDs, ref)
+		case "collision":
+			record.CollisionIDs = append(record.CollisionIDs, ref)
+		case "test_result":
+			record.TestResultIDs = append(record.TestResultIDs, ref)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	claimRows, err := d.db.Query(`SELECT ordinal, kind, statement, status FROM checkpoint_claims WHERE checkpoint_id=? ORDER BY ordinal`, record.ID)
+	if err != nil {
+		return err
+	}
+	defer claimRows.Close()
+	for claimRows.Next() {
+		var ordinal int
+		var claim CheckpointClaimRecord
+		if err := claimRows.Scan(&ordinal, &claim.Kind, &claim.Statement, &claim.Status); err != nil {
+			return err
+		}
+		evidenceRows, err := d.db.Query(`SELECT evidence_kind, evidence_ordinal FROM checkpoint_claim_evidence WHERE checkpoint_id=? AND claim_ordinal=? ORDER BY evidence_kind, evidence_ordinal`, record.ID, ordinal)
+		if err != nil {
+			return err
+		}
+		for evidenceRows.Next() {
+			var ref protocol.CheckpointEvidenceRef
+			if err := evidenceRows.Scan(&ref.Kind, &ref.Ordinal); err != nil {
+				evidenceRows.Close()
+				return err
+			}
+			claim.Evidence = append(claim.Evidence, ref)
+		}
+		evidenceRows.Close()
+		record.Claims = append(record.Claims, claim)
+	}
+	if err := claimRows.Err(); err != nil {
+		return err
+	}
+	record.Metadata = map[string]string{}
+	metadata, err := d.db.Query(`SELECT key, value FROM checkpoint_metadata WHERE checkpoint_id = ? ORDER BY key`, record.ID)
+	if err != nil {
+		return err
+	}
+	defer metadata.Close()
+	for metadata.Next() {
+		var key, value string
+		if err := metadata.Scan(&key, &value); err != nil {
+			return err
+		}
+		record.Metadata[key] = value
+	}
+	return metadata.Err()
 }
 
 func scanCheckpoint(row scanner) (CheckpointRecord, error) {
@@ -244,6 +420,22 @@ func scanCheckpoint(row scanner) (CheckpointRecord, error) {
 	record.WorkspaceUUID = uuidString(workspace)
 	record.WorkUnitUUID = uuidString(workUnit)
 	record.Data = json.RawMessage(data)
+	var checkpoint protocol.CheckpointRequest
+	if err := json.Unmarshal(record.Data, &checkpoint); err != nil {
+		return CheckpointRecord{}, fmt.Errorf("decode checkpoint data: %w", err)
+	}
+	record.BoundaryEventID = checkpoint.BoundaryEventID
+	record.BoundaryType = checkpoint.BoundaryType
+	record.TurnID = checkpoint.TurnID
+	record.TurnIndex = checkpoint.TurnIndex
+	record.CompactionEventID = checkpoint.CompactionEventID
+	record.MutationIDs = checkpoint.MutationIDs
+	record.MessageIDs = checkpoint.MessageIDs
+	record.CollisionIDs = checkpoint.CollisionIDs
+	record.TestResultIDs = checkpoint.TestResultIDs
+	record.Metadata = checkpoint.Metadata
+	record.Git = checkpoint.Git
+	record.JJ = checkpoint.JJ
 	return record, nil
 }
 

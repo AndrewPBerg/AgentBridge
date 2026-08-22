@@ -23,11 +23,25 @@ export type ToolDefinition = {
   [key: string]: any;
 };
 
+export type BashToolDetails = {
+  truncation: { truncated: boolean; outputLines?: number; totalLines?: number } | null;
+  fullOutputPath: string | null;
+};
+
+export type BashToolResult = {
+  toolName: "bash";
+  toolCallId: string;
+  input: Record<string, unknown>;
+  content: Array<{ type: "text"; text: string }>;
+  details: BashToolDetails;
+  isError: boolean;
+};
+
 export function isToolCallEventType(toolName: string, event: { toolName?: string }) {
   return event.toolName === toolName;
 }
 
-export function isBashToolResult(event: { toolName?: string }) {
+export function isBashToolResult(event: { toolName?: string }): event is BashToolResult {
   return event.toolName === "bash";
 }
 

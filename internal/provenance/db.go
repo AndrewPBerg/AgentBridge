@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +20,7 @@ import (
 	_ "turso.tech/database/tursogo"
 )
 
-const projectionSchemaVersion = 8
+const projectionSchemaVersion = 13
 
 type DB struct {
 	db   *sql.DB
@@ -134,6 +135,7 @@ func (d *DB) initialize() error {
 		) STRICT`,
 		`CREATE INDEX IF NOT EXISTS mutations_actor_started ON mutations(actor, started_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS mutations_started ON mutations(started_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS mutations_sequence_id ON mutations(updated_sequence, id)`,
 		`CREATE TABLE IF NOT EXISTS mutation_paths (
 			mutation_id TEXT NOT NULL REFERENCES mutations(id) ON DELETE CASCADE,
 			path TEXT NOT NULL,
@@ -169,6 +171,7 @@ func (d *DB) initialize() error {
 			data TEXT NOT NULL,
 			updated_sequence INTEGER NOT NULL
 		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS collisions_sequence_id ON collisions(updated_sequence, id)`,
 		`CREATE TABLE IF NOT EXISTS collision_actors (
 			collision_id BLOB NOT NULL REFERENCES collisions(id) ON DELETE CASCADE,
 			ordinal INTEGER NOT NULL,
@@ -193,6 +196,8 @@ func (d *DB) initialize() error {
 			event_sequence INTEGER NOT NULL
 		) STRICT`,
 		`CREATE INDEX IF NOT EXISTS messages_actor_created ON messages(to_actor, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS messages_sequence_id ON messages(event_sequence, id)`,
+		`CREATE INDEX IF NOT EXISTS collision_actors_actor ON collision_actors(session_uuid, collision_id)`,
 		`CREATE TABLE IF NOT EXISTS test_results (
 			id TEXT PRIMARY KEY,
 			actor BLOB NOT NULL,
@@ -203,6 +208,7 @@ func (d *DB) initialize() error {
 			command TEXT NOT NULL,
 			cwd TEXT NOT NULL,
 			exit_code INTEGER,
+			outcome TEXT NOT NULL DEFAULT 'blocked' CHECK(outcome IN ('passed','failed','blocked')),
 			started_at TEXT NOT NULL,
 			completed_at TEXT NOT NULL,
 			duration_ms INTEGER,
@@ -215,6 +221,7 @@ func (d *DB) initialize() error {
 			data TEXT NOT NULL,
 			event_sequence INTEGER NOT NULL
 		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS test_results_sequence_id ON test_results(event_sequence, id)`,
 		`CREATE TABLE IF NOT EXISTS checkpoint_requests (
 			id TEXT PRIMARY KEY,
 			actor BLOB NOT NULL,
@@ -228,6 +235,49 @@ func (d *DB) initialize() error {
 			journal_end_sequence INTEGER NOT NULL,
 			data TEXT NOT NULL,
 			event_sequence INTEGER NOT NULL
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS checkpoint_evidence (
+			checkpoint_id TEXT NOT NULL REFERENCES checkpoint_requests(id) ON DELETE CASCADE,
+			kind TEXT NOT NULL,
+			ordinal INTEGER NOT NULL,
+			ref_text TEXT,
+			ref_uuid BLOB,
+			PRIMARY KEY(checkpoint_id, kind, ordinal),
+			CHECK ((ref_text IS NOT NULL) != (ref_uuid IS NOT NULL))
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS checkpoint_metadata (
+			checkpoint_id TEXT NOT NULL REFERENCES checkpoint_requests(id) ON DELETE CASCADE,
+			key TEXT NOT NULL,
+			value TEXT NOT NULL,
+			PRIMARY KEY(checkpoint_id, key)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS checkpoint_claims (
+			checkpoint_id TEXT NOT NULL REFERENCES checkpoint_requests(id) ON DELETE CASCADE,
+			ordinal INTEGER NOT NULL,
+			kind TEXT NOT NULL,
+			statement TEXT NOT NULL,
+			status TEXT NOT NULL CHECK(status IN ('asserted','verified','failed','blocked')),
+			PRIMARY KEY(checkpoint_id, ordinal)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS checkpoint_claim_evidence (
+			checkpoint_id TEXT NOT NULL,
+			claim_ordinal INTEGER NOT NULL,
+			evidence_kind TEXT NOT NULL,
+			evidence_ordinal INTEGER NOT NULL,
+			PRIMARY KEY(checkpoint_id, claim_ordinal, evidence_kind, evidence_ordinal),
+			FOREIGN KEY(checkpoint_id, claim_ordinal) REFERENCES checkpoint_claims(checkpoint_id, ordinal) ON DELETE CASCADE,
+			FOREIGN KEY(checkpoint_id, evidence_kind, evidence_ordinal) REFERENCES checkpoint_evidence(checkpoint_id, kind, ordinal) ON DELETE CASCADE
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS work_units (
+			work_unit_uuid BLOB PRIMARY KEY, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL,
+			objective TEXT NOT NULL, acceptance_criteria TEXT, context TEXT, state TEXT NOT NULL,
+			created_by BLOB NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT,
+			updated_sequence INTEGER NOT NULL
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS work_unit_actors (
+			work_unit_uuid BLOB NOT NULL REFERENCES work_units(work_unit_uuid) ON DELETE CASCADE,
+			actor_uuid BLOB NOT NULL, joined_at TEXT NOT NULL, left_at TEXT, participation_state TEXT NOT NULL,
+			PRIMARY KEY(work_unit_uuid, actor_uuid)
 		) STRICT`,
 	}
 	for _, statement := range statements {
@@ -259,6 +309,7 @@ func (d *DB) initialize() error {
 		{"collisions", "dead_actor", "BLOB"},
 		{"checkpoint_requests", "declared_by", "TEXT NOT NULL DEFAULT 'agent'"},
 		{"checkpoint_requests", "work_unit_uuid", "BLOB"},
+		{"test_results", "outcome", "TEXT NOT NULL DEFAULT 'blocked'"},
 	} {
 		if err := d.ensureColumn(column.table, column.name, column.definition); err != nil {
 			return err
@@ -296,9 +347,9 @@ func (d *DB) ensureProjectionVersion() error {
 			return err
 		}
 	}
-	tables := []string{"mutation_paths", "mutations", "session_events", "messages", "test_results", "checkpoint_requests", "workspaces", "repositories", "events"}
+	tables := []string{"checkpoint_claim_evidence", "checkpoint_claims", "checkpoint_metadata", "checkpoint_evidence", "checkpoint_requests", "work_unit_actors", "work_units", "mutation_paths", "mutations", "session_events", "messages", "test_results", "workspaces", "repositories", "events"}
 	if version == 0 || version >= 7 {
-		tables = append(tables, "collisions", "collision_actors")
+		tables = append(tables, "collision_actors", "collisions")
 	}
 	for _, table := range tables {
 		if _, err := transaction.Exec(`DELETE FROM ` + table); err != nil {
@@ -318,7 +369,7 @@ func recreateBinaryProjectionTables(transaction *sql.Tx) error {
 	// Projection state is disposable: the journal is the migration source. Drop
 	// every UUID-bearing table together so old TEXT schemas cannot reject the
 	// binary projection during backfill.
-	for _, table := range []string{"checkpoint_requests", "test_results", "messages", "collision_actors", "collisions", "session_events", "mutation_paths", "mutations", "actors", "workspaces", "repositories"} {
+	for _, table := range []string{"checkpoint_claim_evidence", "checkpoint_claims", "checkpoint_metadata", "checkpoint_evidence", "checkpoint_requests", "work_unit_actors", "work_units", "test_results", "messages", "collision_actors", "collisions", "session_events", "mutation_paths", "mutations", "actors", "workspaces", "repositories"} {
 		if _, err := transaction.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
 			return fmt.Errorf("drop legacy projection table %s: %w", table, err)
 		}
@@ -331,16 +382,27 @@ func recreateBinaryProjectionTables(transaction *sql.Tx) error {
 		`CREATE TABLE mutations (id TEXT PRIMARY KEY, actor BLOB NOT NULL, session_generation INTEGER NOT NULL, turn_id TEXT, turn_index INTEGER, tool_call_id TEXT NOT NULL, tool TEXT NOT NULL, operation TEXT NOT NULL, cwd TEXT NOT NULL, repository_uuid BLOB, repository_root TEXT, workspace_uuid BLOB, workspace_root TEXT, workspace_kind TEXT, workspace_key TEXT NOT NULL, paths_json TEXT NOT NULL, relative_paths_json TEXT NOT NULL, assistant_excerpt TEXT, started_at TEXT NOT NULL, completed_at TEXT, success INTEGER, error TEXT, before_json TEXT NOT NULL, after_json TEXT NOT NULL, git_before_json TEXT, git_after_json TEXT, jj_before_json TEXT, jj_after_json TEXT, updated_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE INDEX mutations_actor_started ON mutations(actor, started_at DESC)`,
 		`CREATE INDEX mutations_started ON mutations(started_at DESC)`,
+		`CREATE INDEX mutations_sequence_id ON mutations(updated_sequence, id)`,
 		`CREATE TABLE mutation_paths (mutation_id TEXT NOT NULL REFERENCES mutations(id) ON DELETE CASCADE, path TEXT NOT NULL, ordinal INTEGER NOT NULL, before_json TEXT, after_json TEXT, PRIMARY KEY(mutation_id, path)) STRICT`,
 		`CREATE INDEX mutation_paths_path ON mutation_paths(path, mutation_id)`,
 		`CREATE TABLE session_events (id TEXT PRIMARY KEY, actor BLOB NOT NULL, session_generation INTEGER NOT NULL, type TEXT NOT NULL, at TEXT NOT NULL, turn_index INTEGER, summary TEXT, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE INDEX session_events_actor_at ON session_events(actor, at DESC)`,
 		`CREATE TABLE collisions (id BLOB PRIMARY KEY, path TEXT NOT NULL, state TEXT NOT NULL, owner BLOB, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, resolved_at TEXT, resolution TEXT, resolved_by BLOB, dead_actor BLOB, data TEXT NOT NULL, updated_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE collision_actors (collision_id BLOB NOT NULL REFERENCES collisions(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, session_uuid BLOB NOT NULL, PRIMARY KEY(collision_id, ordinal)) STRICT`,
+		`CREATE INDEX collisions_sequence_id ON collisions(updated_sequence, id)`,
 		`CREATE TABLE messages (id TEXT PRIMARY KEY, kind TEXT NOT NULL, from_actor BLOB NOT NULL, to_actor BLOB NOT NULL, body TEXT NOT NULL, global_sequence INTEGER NOT NULL, sender_sequence INTEGER NOT NULL, recipient_sequence INTEGER NOT NULL, client_sequence INTEGER, session_generation INTEGER, collision_id BLOB, created_at TEXT NOT NULL, acknowledged_at TEXT, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE INDEX messages_actor_created ON messages(to_actor, created_at DESC)`,
-		`CREATE TABLE test_results (id TEXT PRIMARY KEY, actor BLOB NOT NULL, session_generation INTEGER NOT NULL, turn_id TEXT, turn_index INTEGER, tool_call_id TEXT, command TEXT NOT NULL, cwd TEXT NOT NULL, exit_code INTEGER, started_at TEXT NOT NULL, completed_at TEXT NOT NULL, duration_ms INTEGER, output_excerpt TEXT, output_sha256 TEXT, output_bytes INTEGER, output_truncated INTEGER NOT NULL, repository_uuid BLOB, workspace_uuid BLOB, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
-		`CREATE TABLE checkpoint_requests (id TEXT PRIMARY KEY, actor BLOB NOT NULL, declared_by TEXT NOT NULL, session_generation INTEGER NOT NULL, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, work_unit_uuid BLOB, checkpoint_kind TEXT NOT NULL, journal_start_sequence INTEGER NOT NULL, journal_end_sequence INTEGER NOT NULL, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE INDEX messages_sequence_id ON messages(event_sequence, id)`,
+		`CREATE INDEX collision_actors_actor ON collision_actors(session_uuid, collision_id)`,
+		`CREATE TABLE test_results (id TEXT PRIMARY KEY, actor BLOB NOT NULL, session_generation INTEGER NOT NULL, turn_id TEXT, turn_index INTEGER, tool_call_id TEXT, command TEXT NOT NULL, cwd TEXT NOT NULL, exit_code INTEGER, outcome TEXT NOT NULL DEFAULT 'blocked' CHECK(outcome IN ('passed','failed','blocked')), started_at TEXT NOT NULL, completed_at TEXT NOT NULL, duration_ms INTEGER, output_excerpt TEXT, output_sha256 TEXT, output_bytes INTEGER, output_truncated INTEGER NOT NULL, repository_uuid BLOB, workspace_uuid BLOB, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE INDEX test_results_sequence_id ON test_results(event_sequence, id)`,
+		`CREATE TABLE checkpoint_requests (id TEXT PRIMARY KEY, actor BLOB NOT NULL, declared_by TEXT NOT NULL, session_generation INTEGER NOT NULL, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, work_unit_uuid BLOB REFERENCES work_units(work_unit_uuid), checkpoint_kind TEXT NOT NULL, journal_start_sequence INTEGER NOT NULL, journal_end_sequence INTEGER NOT NULL, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE checkpoint_evidence (checkpoint_id TEXT NOT NULL REFERENCES checkpoint_requests(id) ON DELETE CASCADE, kind TEXT NOT NULL, ordinal INTEGER NOT NULL, ref_text TEXT, ref_uuid BLOB, PRIMARY KEY(checkpoint_id, kind, ordinal), CHECK ((ref_text IS NOT NULL) != (ref_uuid IS NOT NULL))) STRICT`,
+		`CREATE TABLE checkpoint_metadata (checkpoint_id TEXT NOT NULL REFERENCES checkpoint_requests(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(checkpoint_id, key)) STRICT`,
+		`CREATE TABLE checkpoint_claims (checkpoint_id TEXT NOT NULL REFERENCES checkpoint_requests(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, kind TEXT NOT NULL, statement TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('asserted','verified','failed','blocked')), PRIMARY KEY(checkpoint_id, ordinal)) STRICT`,
+		`CREATE TABLE checkpoint_claim_evidence (checkpoint_id TEXT NOT NULL, claim_ordinal INTEGER NOT NULL, evidence_kind TEXT NOT NULL, evidence_ordinal INTEGER NOT NULL, PRIMARY KEY(checkpoint_id, claim_ordinal, evidence_kind, evidence_ordinal), FOREIGN KEY(checkpoint_id, claim_ordinal) REFERENCES checkpoint_claims(checkpoint_id, ordinal) ON DELETE CASCADE, FOREIGN KEY(checkpoint_id, evidence_kind, evidence_ordinal) REFERENCES checkpoint_evidence(checkpoint_id, kind, ordinal) ON DELETE CASCADE) STRICT`,
+		`CREATE TABLE work_units (work_unit_uuid BLOB PRIMARY KEY, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, objective TEXT NOT NULL, acceptance_criteria TEXT, context TEXT, state TEXT NOT NULL, created_by BLOB NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, updated_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE work_unit_actors (work_unit_uuid BLOB NOT NULL REFERENCES work_units(work_unit_uuid) ON DELETE CASCADE, actor_uuid BLOB NOT NULL, joined_at TEXT NOT NULL, left_at TEXT, participation_state TEXT NOT NULL, PRIMARY KEY(work_unit_uuid, actor_uuid)) STRICT`,
 	}
 	for _, statement := range statements {
 		if _, err := transaction.Exec(statement); err != nil {
@@ -650,32 +712,219 @@ func (d *DB) projectDomain(transaction *sql.Tx, event protocol.Event) error {
 		if err := json.Unmarshal(event.Data, &result); err != nil {
 			return err
 		}
+		if result.RepositoryUUID != "" {
+			if err := protocol.ValidateUUID(result.RepositoryUUID); err != nil {
+				return fmt.Errorf("repository_uuid: %w", err)
+			}
+		}
+		if result.WorkspaceUUID != "" {
+			if err := protocol.ValidateUUID(result.WorkspaceUUID); err != nil {
+				return fmt.Errorf("workspace_uuid: %w", err)
+			}
+		}
+		if err := protocol.NormalizeTestResult(&result); err != nil {
+			return err
+		}
 		_, err := transaction.Exec(`INSERT OR IGNORE INTO test_results(
-			id, actor, session_generation, turn_id, turn_index, tool_call_id, command, cwd, exit_code,
+			id, actor, session_generation, turn_id, turn_index, tool_call_id, command, cwd, exit_code, outcome,
 			started_at, completed_at, duration_ms, output_excerpt, output_sha256, output_bytes, output_truncated,
 			repository_uuid, workspace_uuid, data, event_sequence
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, result.ID, uuidBlob(result.Actor),
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, result.ID, uuidBlob(result.Actor),
 			result.SessionGeneration, nullable(result.TurnID), result.TurnIndex, nullable(result.ToolCallID), result.Command, result.CWD,
-			result.ExitCode, result.StartedAt.UTC().Format(time.RFC3339Nano), result.CompletedAt.UTC().Format(time.RFC3339Nano),
+			result.ExitCode, result.Outcome, result.StartedAt.UTC().Format(time.RFC3339Nano), result.CompletedAt.UTC().Format(time.RFC3339Nano),
 			result.DurationMillis, nullable(result.OutputExcerpt), nullable(result.OutputSHA256), result.OutputBytes, result.OutputTruncated,
 			nullableUUID(result.RepositoryUUID), nullableUUID(result.WorkspaceUUID), string(event.Data), event.Sequence)
+		return err
+	case "work_unit.created":
+		var created protocol.WorkUnitCreatedEvent
+		if err := json.Unmarshal(event.Data, &created); err != nil {
+			return err
+		}
+		unit := created.WorkUnit
+		for name, value := range map[string]string{"work_unit_uuid": unit.UUID, "repository_uuid": unit.RepositoryUUID, "workspace_uuid": unit.WorkspaceUUID, "created_by": unit.CreatedBy} {
+			if err := protocol.ValidateUUID(value); err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+		}
+		result, err := transaction.Exec(`INSERT INTO work_units(work_unit_uuid, repository_uuid, workspace_uuid, objective, acceptance_criteria, context, state, created_by, created_at, updated_at, updated_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, uuidBlob(unit.UUID), uuidBlob(unit.RepositoryUUID), uuidBlob(unit.WorkspaceUUID), unit.Objective, nullable(unit.AcceptanceCriteria), nullable(unit.Context), unit.State, uuidBlob(unit.CreatedBy), unit.CreatedAt.UTC().Format(time.RFC3339Nano), unit.UpdatedAt.UTC().Format(time.RFC3339Nano), event.Sequence)
+		if err != nil {
+			return err
+		}
+		count, err := result.RowsAffected()
+		if err != nil || count != 1 {
+			return fmt.Errorf("conflicting work unit creation")
+		}
+		return nil
+	case "work_unit.updated":
+		var updated protocol.WorkUnitUpdatedEvent
+		if err := json.Unmarshal(event.Data, &updated); err != nil {
+			return err
+		}
+		if err := validateProjectedWorkUnit(updated.Previous); err != nil {
+			return errors.New("invalid work unit update")
+		}
+		if err := validateProjectedWorkUnit(updated.Result); err != nil || protocol.ValidateUUID(updated.UUID) != nil || protocol.ValidateUUID(updated.Actor) != nil || updated.UUID != updated.Previous.UUID || updated.UUID != updated.Result.UUID {
+			return errors.New("invalid work unit update")
+		}
+		current, err := loadProjectedWorkUnit(transaction, updated.UUID)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(current, updated.Previous) || updated.Result.RepositoryUUID != current.RepositoryUUID || updated.Result.WorkspaceUUID != current.WorkspaceUUID || updated.Result.State != current.State || !projectedActiveParticipant(transaction, updated.UUID, updated.Actor, current.RepositoryUUID, current.WorkspaceUUID) {
+			return errors.New("invalid work unit update provenance")
+		}
+		unit := updated.Result
+		result, err := transaction.Exec(`UPDATE work_units SET objective=?, acceptance_criteria=?, context=?, state=?, updated_at=?, updated_sequence=? WHERE work_unit_uuid=?`, unit.Objective, nullable(unit.AcceptanceCriteria), nullable(unit.Context), unit.State, unit.UpdatedAt.UTC().Format(time.RFC3339Nano), event.Sequence, uuidBlob(unit.UUID))
+		if err != nil {
+			return err
+		}
+		count, err := result.RowsAffected()
+		if err != nil || count != 1 {
+			return fmt.Errorf("work unit update references unknown unit")
+		}
+		return nil
+	case "work_unit.transitioned":
+		var transition protocol.WorkUnitTransitionEvent
+		if err := json.Unmarshal(event.Data, &transition); err != nil {
+			return err
+		}
+		if protocol.ValidateUUID(transition.WorkUnitUUID) != nil || protocol.ValidateUUID(transition.Actor) != nil || !validProjectedWorkUnitTransition(transition.From, transition.To) {
+			return errors.New("invalid work unit transition")
+		}
+		current, err := loadProjectedWorkUnit(transaction, transition.WorkUnitUUID)
+		if err != nil {
+			return err
+		}
+		if current.State != transition.From || !projectedActiveParticipant(transaction, transition.WorkUnitUUID, transition.Actor, current.RepositoryUUID, current.WorkspaceUUID) {
+			return errors.New("invalid work unit transition provenance")
+		}
+		var completed any
+		if transition.To == protocol.WorkUnitCompleted {
+			completed = transition.At.UTC().Format(time.RFC3339Nano)
+		}
+		result, err := transaction.Exec(`UPDATE work_units SET state=?, updated_at=?, completed_at=?, updated_sequence=? WHERE work_unit_uuid=?`, transition.To, transition.At.UTC().Format(time.RFC3339Nano), completed, event.Sequence, uuidBlob(transition.WorkUnitUUID))
+		if err != nil {
+			return err
+		}
+		count, err := result.RowsAffected()
+		if err != nil || count != 1 {
+			return fmt.Errorf("work unit transition references unknown unit")
+		}
+		return nil
+	case "work_unit.actor_joined", "work_unit.actor_left":
+		var membership protocol.WorkUnitActorEvent
+		if err := json.Unmarshal(event.Data, &membership); err != nil {
+			return err
+		}
+		result := membership.Result
+		if protocol.ValidateUUID(membership.WorkUnitUUID) != nil || protocol.ValidateUUID(membership.Actor) != nil || result.WorkUnitUUID != membership.WorkUnitUUID || result.Actor != membership.Actor {
+			return errors.New("invalid work unit membership UUID")
+		}
+		var repository, workspace []byte
+		if err := transaction.QueryRow(`SELECT repository_uuid, workspace_uuid FROM work_units WHERE work_unit_uuid = ?`, uuidBlob(membership.WorkUnitUUID)).Scan(&repository, &workspace); err != nil {
+			return fmt.Errorf("membership references unknown work unit: %w", err)
+		}
+		var existing protocol.WorkUnitActor
+		var joined, state string
+		var left sql.NullString
+		err := transaction.QueryRow(`SELECT joined_at, left_at, participation_state FROM work_unit_actors WHERE work_unit_uuid = ? AND actor_uuid = ?`, uuidBlob(result.WorkUnitUUID), uuidBlob(result.Actor)).Scan(&joined, &left, &state)
+		if err == nil {
+			existing = protocol.WorkUnitActor{WorkUnitUUID: result.WorkUnitUUID, Actor: result.Actor, JoinedAt: parseProjectionTime(joined), ParticipationState: state}
+			if left.Valid {
+				at := parseProjectionTime(left.String)
+				existing.LeftAt = &at
+			}
+			if reflect.DeepEqual(existing, result) {
+				return nil
+			}
+			if event.Type != "work_unit.actor_left" || membership.Previous == nil || !reflect.DeepEqual(existing, *membership.Previous) || result.LeftAt == nil || result.ParticipationState != "left" || !result.JoinedAt.Equal(existing.JoinedAt) {
+				return errors.New("conflicting work unit membership projection")
+			}
+			update, err := transaction.Exec(`UPDATE work_unit_actors SET left_at = ?, participation_state = ? WHERE work_unit_uuid = ? AND actor_uuid = ?`, nullableTime(result.LeftAt), result.ParticipationState, uuidBlob(result.WorkUnitUUID), uuidBlob(result.Actor))
+			if err != nil {
+				return err
+			}
+			count, err := update.RowsAffected()
+			if err != nil || count != 1 {
+				return errors.New("work unit actor leave references unknown membership")
+			}
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if event.Type == "work_unit.actor_left" {
+			return errors.New("work unit actor leave references unknown membership")
+		}
+		if membership.Previous != nil || result.LeftAt != nil || result.ParticipationState != "active" {
+			return errors.New("invalid joined work unit membership")
+		}
+		_, err = transaction.Exec(`INSERT INTO work_unit_actors(work_unit_uuid, actor_uuid, joined_at, left_at, participation_state) VALUES (?, ?, ?, ?, ?)`, uuidBlob(result.WorkUnitUUID), uuidBlob(result.Actor), result.JoinedAt.UTC().Format(time.RFC3339Nano), nil, result.ParticipationState)
 		return err
 	case "checkpoint.requested":
 		var checkpoint protocol.CheckpointRequest
 		if err := json.Unmarshal(event.Data, &checkpoint); err != nil {
 			return err
 		}
+		for name, value := range map[string]string{
+			"actor":           checkpoint.Actor,
+			"repository_uuid": checkpoint.RepositoryUUID,
+			"workspace_uuid":  checkpoint.WorkspaceUUID,
+		} {
+			if err := protocol.ValidateUUID(value); err != nil {
+				return fmt.Errorf("checkpoint %s: %w", name, err)
+			}
+		}
 		workUnitUUID, err := checkpointWorkUnitUUID(checkpoint.WorkUnitUUID)
 		if err != nil {
 			return err
 		}
-		_, err = transaction.Exec(`INSERT OR IGNORE INTO checkpoint_requests(
+		if checkpoint.WorkUnitUUID != "" {
+			var repository, workspace []byte
+			if err := transaction.QueryRow(`SELECT repository_uuid, workspace_uuid FROM work_units WHERE work_unit_uuid = ?`, workUnitUUID).Scan(&repository, &workspace); err != nil {
+				return fmt.Errorf("checkpoint references unknown work unit: %w", err)
+			}
+			if string(repository) != string(uuidBlob(checkpoint.RepositoryUUID)) || string(workspace) != string(uuidBlob(checkpoint.WorkspaceUUID)) {
+				return errors.New("checkpoint work unit scope mismatch")
+			}
+			var active int
+			if err := transaction.QueryRow(`SELECT COUNT(*) FROM work_unit_actors WHERE work_unit_uuid = ? AND actor_uuid = ? AND left_at IS NULL AND participation_state = 'active'`, workUnitUUID, uuidBlob(checkpoint.Actor)).Scan(&active); err != nil {
+				return err
+			}
+			if active != 1 {
+				return errors.New("checkpoint declarer is not an active work unit participant")
+			}
+		}
+		var existingCheckpointData string
+		err = transaction.QueryRow(`SELECT data FROM checkpoint_requests WHERE id = ?`, checkpoint.ID).Scan(&existingCheckpointData)
+		if err == nil {
+			if existingCheckpointData != string(event.Data) {
+				return fmt.Errorf("conflicting checkpoint ID %q", checkpoint.ID)
+			}
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		_, err = transaction.Exec(`INSERT INTO checkpoint_requests(
 			id, actor, declared_by, session_generation, repository_uuid, workspace_uuid, work_unit_uuid, checkpoint_kind,
 			journal_start_sequence, journal_end_sequence, data, event_sequence
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, checkpoint.ID, uuidBlob(checkpoint.Actor), checkpoint.DeclaredBy, checkpoint.SessionGeneration,
 			uuidBlob(checkpoint.RepositoryUUID), uuidBlob(checkpoint.WorkspaceUUID), workUnitUUID, checkpoint.CheckpointKind, checkpoint.JournalStart,
 			checkpoint.JournalEnd, string(event.Data), event.Sequence)
-		return err
+		if err != nil {
+			return err
+		}
+		if err := normalizeProjectedCheckpointEvidence(transaction, &checkpoint); err != nil {
+			return err
+		}
+		if err := projectCheckpointEvidence(transaction, checkpoint); err != nil {
+			return err
+		}
+		if err := projectCheckpointClaims(transaction, checkpoint); err != nil {
+			return err
+		}
+		return projectCheckpointMetadata(transaction, checkpoint)
 	case "collision.actor_dead":
 		var dead protocol.CollisionActorDeadEvent
 		if err := json.Unmarshal(event.Data, &dead); err != nil {
@@ -744,6 +993,65 @@ func (d *DB) projectDomain(transaction *sql.Tx, event protocol.Event) error {
 		return nil
 	}
 	return nil
+}
+
+func parseProjectionTime(value string) time.Time {
+	parsed, _ := time.Parse(time.RFC3339Nano, value)
+	return parsed
+}
+
+func validateProjectedWorkUnit(unit protocol.WorkUnit) error {
+	for _, value := range []string{unit.UUID, unit.RepositoryUUID, unit.WorkspaceUUID, unit.CreatedBy} {
+		if err := protocol.ValidateUUID(value); err != nil {
+			return err
+		}
+	}
+	if unit.Objective == "" || unit.State == "" || unit.CreatedAt.IsZero() || unit.UpdatedAt.IsZero() {
+		return errors.New("invalid work unit")
+	}
+	return nil
+}
+
+func loadProjectedWorkUnit(transaction *sql.Tx, uuid string) (protocol.WorkUnit, error) {
+	var unit protocol.WorkUnit
+	var id, repo, workspace, creator []byte
+	var created, updated string
+	var completed sql.NullString
+	err := transaction.QueryRow(`SELECT work_unit_uuid, repository_uuid, workspace_uuid, objective, COALESCE(acceptance_criteria,''), COALESCE(context,''), state, created_by, created_at, updated_at, completed_at FROM work_units WHERE work_unit_uuid = ?`, uuidBlob(uuid)).Scan(&id, &repo, &workspace, &unit.Objective, &unit.AcceptanceCriteria, &unit.Context, &unit.State, &creator, &created, &updated, &completed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return unit, errors.New("work unit event references unknown unit")
+	}
+	if err != nil {
+		return unit, err
+	}
+	unit.UUID, unit.RepositoryUUID, unit.WorkspaceUUID, unit.CreatedBy = uuidString(id), uuidString(repo), uuidString(workspace), uuidString(creator)
+	unit.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	unit.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	if completed.Valid {
+		at, _ := time.Parse(time.RFC3339Nano, completed.String)
+		unit.CompletedAt = &at
+	}
+	return unit, nil
+}
+
+func projectedActiveParticipant(transaction *sql.Tx, workUnit, actor, repository, workspace string) bool {
+	var count int
+	err := transaction.QueryRow(`SELECT COUNT(*) FROM work_unit_actors a JOIN actors s ON s.session_uuid = a.actor_uuid WHERE a.work_unit_uuid = ? AND a.actor_uuid = ? AND a.left_at IS NULL AND a.participation_state = 'active' AND s.repository_uuid = ? AND s.workspace_uuid = ?`, uuidBlob(workUnit), uuidBlob(actor), uuidBlob(repository), uuidBlob(workspace)).Scan(&count)
+	return err == nil && count == 1
+}
+
+func validProjectedWorkUnitTransition(from, to protocol.WorkUnitState) bool {
+	switch from {
+	case protocol.WorkUnitProposed:
+		return to == protocol.WorkUnitActive || to == protocol.WorkUnitAbandoned
+	case protocol.WorkUnitActive:
+		return to == protocol.WorkUnitBlocked || to == protocol.WorkUnitVerified || to == protocol.WorkUnitAbandoned
+	case protocol.WorkUnitBlocked:
+		return to == protocol.WorkUnitActive || to == protocol.WorkUnitVerified || to == protocol.WorkUnitAbandoned
+	case protocol.WorkUnitVerified:
+		return to == protocol.WorkUnitCompleted || to == protocol.WorkUnitAbandoned
+	}
+	return false
 }
 
 func deriveScope(cwd string, git *protocol.GitContext, jj *protocol.JJContext) (string, string, string, string, string) {
@@ -1166,15 +1474,219 @@ func nullableUUID(value string) any {
 	return uuidBlob(value)
 }
 
+func normalizeProjectedCheckpointEvidence(transaction *sql.Tx, checkpoint *protocol.CheckpointRequest) error {
+	actor := uuidBlob(checkpoint.Actor)
+	validate := func(kind string, ids *[]string) error {
+		if len(*ids) == 0 {
+			var query string
+			switch kind {
+			case "mutation":
+				query = `SELECT id FROM mutations WHERE completed_at IS NOT NULL AND actor=? AND repository_uuid=? AND workspace_uuid=? AND updated_sequence BETWEEN ? AND ? ORDER BY updated_sequence, id`
+			case "message":
+				query = `SELECT id FROM messages WHERE (from_actor=? OR to_actor=?) AND event_sequence BETWEEN ? AND ? ORDER BY event_sequence, id`
+			case "collision":
+				query = `SELECT c.id FROM collisions c JOIN collision_actors a ON a.collision_id=c.id WHERE a.session_uuid=? AND c.updated_sequence BETWEEN ? AND ? ORDER BY c.updated_sequence, c.id`
+			case "test_result":
+				query = `SELECT id FROM test_results WHERE actor=? AND repository_uuid=? AND workspace_uuid=? AND event_sequence BETWEEN ? AND ? ORDER BY event_sequence, id`
+			}
+			var rows *sql.Rows
+			var err error
+			if kind == "message" {
+				rows, err = transaction.Query(query, actor, actor, checkpoint.JournalStart, checkpoint.JournalEnd)
+			} else if kind == "collision" {
+				rows, err = transaction.Query(query, actor, checkpoint.JournalStart, checkpoint.JournalEnd)
+			} else {
+				rows, err = transaction.Query(query, actor, uuidBlob(checkpoint.RepositoryUUID), uuidBlob(checkpoint.WorkspaceUUID), checkpoint.JournalStart, checkpoint.JournalEnd)
+			}
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var id any
+				if err := rows.Scan(&id); err != nil {
+					return err
+				}
+				switch value := id.(type) {
+				case string:
+					*ids = append(*ids, value)
+				case []byte:
+					*ids = append(*ids, uuidString(value))
+				}
+			}
+			return rows.Err()
+		}
+		for _, id := range *ids {
+			var count int
+			var err error
+			switch kind {
+			case "mutation":
+				err = transaction.QueryRow(`SELECT COUNT(*) FROM mutations WHERE id=? AND completed_at IS NOT NULL AND actor=? AND repository_uuid=? AND workspace_uuid=? AND updated_sequence BETWEEN ? AND ?`, id, actor, uuidBlob(checkpoint.RepositoryUUID), uuidBlob(checkpoint.WorkspaceUUID), checkpoint.JournalStart, checkpoint.JournalEnd).Scan(&count)
+			case "message":
+				err = transaction.QueryRow(`SELECT COUNT(*) FROM messages WHERE id=? AND (from_actor=? OR to_actor=?) AND event_sequence BETWEEN ? AND ?`, id, actor, actor, checkpoint.JournalStart, checkpoint.JournalEnd).Scan(&count)
+			case "collision":
+				err = transaction.QueryRow(`SELECT COUNT(*) FROM collisions c JOIN collision_actors a ON a.collision_id=c.id WHERE c.id=? AND a.session_uuid=? AND c.updated_sequence BETWEEN ? AND ?`, uuidBlob(id), actor, checkpoint.JournalStart, checkpoint.JournalEnd).Scan(&count)
+			case "test_result":
+				err = transaction.QueryRow(`SELECT COUNT(*) FROM test_results WHERE id=? AND actor=? AND repository_uuid=? AND workspace_uuid=? AND event_sequence BETWEEN ? AND ?`, id, actor, uuidBlob(checkpoint.RepositoryUUID), uuidBlob(checkpoint.WorkspaceUUID), checkpoint.JournalStart, checkpoint.JournalEnd).Scan(&count)
+			}
+			if err != nil {
+				return err
+			}
+			if count != 1 {
+				return fmt.Errorf("checkpoint %s reference %q is unknown, out of scope, or outside range", kind, id)
+			}
+		}
+		return nil
+	}
+	for kind, ids := range map[string]*[]string{"mutation": &checkpoint.MutationIDs, "message": &checkpoint.MessageIDs, "collision": &checkpoint.CollisionIDs, "test_result": &checkpoint.TestResultIDs} {
+		if err := validate(kind, ids); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func projectCheckpointEvidence(transaction *sql.Tx, checkpoint protocol.CheckpointRequest) error {
+	groups := []struct {
+		kind string
+		refs []string
+	}{
+		{"mutation", checkpoint.MutationIDs},
+		{"message", checkpoint.MessageIDs},
+		{"collision", checkpoint.CollisionIDs},
+		{"test_result", checkpoint.TestResultIDs},
+	}
+	for _, group := range groups {
+		for ordinal, ref := range group.refs {
+			text, binary := checkpointReference(ref)
+			var existingText sql.NullString
+			var existingUUID []byte
+			err := transaction.QueryRow(`SELECT ref_text, ref_uuid FROM checkpoint_evidence WHERE checkpoint_id = ? AND kind = ? AND ordinal = ?`, checkpoint.ID, group.kind, ordinal).Scan(&existingText, &existingUUID)
+			if err == nil {
+				if existingText.String != text || !reflect.DeepEqual(existingUUID, binary) {
+					return fmt.Errorf("conflicting checkpoint %s evidence at ordinal %d", group.kind, ordinal)
+				}
+				continue
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if _, err := transaction.Exec(`INSERT INTO checkpoint_evidence(checkpoint_id, kind, ordinal, ref_text, ref_uuid) VALUES (?, ?, ?, ?, ?)`, checkpoint.ID, group.kind, ordinal, text, binary); err != nil {
+				return fmt.Errorf("project checkpoint %s evidence: %w", group.kind, err)
+			}
+		}
+	}
+	return nil
+}
+
+func projectCheckpointClaims(transaction *sql.Tx, checkpoint protocol.CheckpointRequest) error {
+	claims := checkpoint.Claims
+	if len(claims) == 0 && strings.TrimSpace(checkpoint.Metadata["summary"]) != "" {
+		claims = []protocol.CheckpointClaim{{Kind: "summary", Statement: strings.TrimSpace(checkpoint.Metadata["summary"]), Status: protocol.ClaimAsserted}}
+	}
+	validEvidence := map[string]bool{"mutation": true, "message": true, "collision": true, "test_result": true}
+	for ordinal, claim := range claims {
+		claim.Kind = strings.TrimSpace(claim.Kind)
+		if !protocol.ValidCheckpointClaimKind(claim.Kind) || strings.TrimSpace(claim.Statement) == "" {
+			return fmt.Errorf("invalid checkpoint claim at ordinal %d", ordinal)
+		}
+		switch claim.Status {
+		case protocol.ClaimAsserted, protocol.ClaimVerified, protocol.ClaimFailed, protocol.ClaimBlocked:
+		default:
+			return fmt.Errorf("invalid checkpoint claim status %q", claim.Status)
+		}
+		for _, ref := range claim.Evidence {
+			if !validEvidence[ref.Kind] || ref.Ordinal < 0 {
+				return fmt.Errorf("invalid checkpoint claim evidence at ordinal %d", ordinal)
+			}
+			var count int
+			if err := transaction.QueryRow(`SELECT COUNT(*) FROM checkpoint_evidence WHERE checkpoint_id=? AND kind=? AND ordinal=?`, checkpoint.ID, ref.Kind, ref.Ordinal).Scan(&count); err != nil {
+				return err
+			}
+			if count != 1 {
+				return fmt.Errorf("checkpoint claim %d references unknown evidence %s[%d]", ordinal, ref.Kind, ref.Ordinal)
+			}
+		}
+		if claim.Kind == "test" || claim.Kind == "build" || claim.Kind == "runtime" {
+			required := map[protocol.CheckpointClaimStatus]protocol.TestOutcome{
+				protocol.ClaimVerified: protocol.TestPassed,
+				protocol.ClaimFailed:   protocol.TestFailed,
+				protocol.ClaimBlocked:  protocol.TestBlocked,
+			}[claim.Status]
+			if required != "" {
+				matched := false
+				for _, ref := range claim.Evidence {
+					if ref.Kind != "test_result" || ref.Ordinal < 0 || ref.Ordinal >= len(checkpoint.TestResultIDs) {
+						continue
+					}
+					var outcome protocol.TestOutcome
+					if err := transaction.QueryRow(`SELECT outcome FROM test_results WHERE id=?`, checkpoint.TestResultIDs[ref.Ordinal]).Scan(&outcome); err == nil && outcome == required {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					claim.Status = protocol.ClaimAsserted
+				}
+			}
+		}
+		var existingKind, existingStatement, existingStatus string
+		err := transaction.QueryRow(`SELECT kind, statement, status FROM checkpoint_claims WHERE checkpoint_id=? AND ordinal=?`, checkpoint.ID, ordinal).Scan(&existingKind, &existingStatement, &existingStatus)
+		if err == nil {
+			if existingKind != claim.Kind || existingStatement != claim.Statement || existingStatus != string(claim.Status) {
+				return fmt.Errorf("conflicting checkpoint claim at ordinal %d", ordinal)
+			}
+		} else if errors.Is(err, sql.ErrNoRows) {
+			if _, err := transaction.Exec(`INSERT INTO checkpoint_claims(checkpoint_id, ordinal, kind, statement, status) VALUES (?, ?, ?, ?, ?)`, checkpoint.ID, ordinal, claim.Kind, claim.Statement, claim.Status); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+		for _, evidence := range claim.Evidence {
+			if _, err := transaction.Exec(`INSERT INTO checkpoint_claim_evidence(checkpoint_id, claim_ordinal, evidence_kind, evidence_ordinal) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`, checkpoint.ID, ordinal, evidence.Kind, evidence.Ordinal); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func projectCheckpointMetadata(transaction *sql.Tx, checkpoint protocol.CheckpointRequest) error {
+	for key, value := range checkpoint.Metadata {
+		var existing string
+		err := transaction.QueryRow(`SELECT value FROM checkpoint_metadata WHERE checkpoint_id = ? AND key = ?`, checkpoint.ID, key).Scan(&existing)
+		if err == nil {
+			if existing != value {
+				return fmt.Errorf("conflicting checkpoint metadata key %q", key)
+			}
+			continue
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if _, err := transaction.Exec(`INSERT INTO checkpoint_metadata(checkpoint_id, key, value) VALUES (?, ?, ?)`, checkpoint.ID, key, value); err != nil {
+			return fmt.Errorf("project checkpoint metadata: %w", err)
+		}
+	}
+	return nil
+}
+
+func checkpointReference(value string) (any, any) {
+	if err := protocol.ValidateUUID(value); err == nil {
+		return nil, uuidBlob(value)
+	}
+	return value, nil
+}
+
 func checkpointWorkUnitUUID(value string) (any, error) {
 	if value == "" {
 		return nil, nil
 	}
-	blob := uuidBlob(value)
-	if len(blob) != 16 || blob[8]&0xc0 != 0x80 || blob[6]>>4 == 0 || blob[6]>>4 > 5 {
+	if err := protocol.ValidateUUID(value); err != nil {
 		return nil, fmt.Errorf("invalid checkpoint work_unit_uuid %q", value)
 	}
-	return blob, nil
+	return uuidBlob(value), nil
 }
 
 func uuidBlob(value string) []byte {

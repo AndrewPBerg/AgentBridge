@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -14,8 +13,15 @@ const Version = 1
 // boundaries. Persisted UUIDs must be 16-byte values with a recognized
 // version and RFC 4122 variant.
 func ValidateUUID(value string) error {
-	candidate := strings.TrimSpace(value)
-	compact := strings.ReplaceAll(candidate, "-", "")
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return fmt.Errorf("invalid UUID %q", value)
+	}
+	for _, character := range value {
+		if character >= 'A' && character <= 'F' {
+			return fmt.Errorf("invalid UUID %q", value)
+		}
+	}
+	compact := value[:8] + value[9:13] + value[14:18] + value[19:23] + value[24:]
 	decoded, err := hex.DecodeString(compact)
 	if err != nil || len(decoded) != 16 {
 		return fmt.Errorf("invalid UUID %q", value)
@@ -313,6 +319,20 @@ type SessionEventParams struct {
 	Event SessionEvent `json:"event"`
 }
 
+type TestOutcome string
+
+const (
+	TestPassed  TestOutcome = "passed"
+	TestFailed  TestOutcome = "failed"
+	TestBlocked TestOutcome = "blocked"
+
+	// Descriptive aliases keep call sites explicit while the short names remain
+	// convenient alongside the other protocol state constants.
+	TestOutcomePassed  = TestPassed
+	TestOutcomeFailed  = TestFailed
+	TestOutcomeBlocked = TestBlocked
+)
+
 type TestResult struct {
 	ID                string      `json:"id"`
 	Actor             string      `json:"actor"`
@@ -323,6 +343,7 @@ type TestResult struct {
 	Command           string      `json:"command"`
 	CWD               string      `json:"cwd"`
 	ExitCode          *int        `json:"exit_code,omitempty"`
+	Outcome           TestOutcome `json:"outcome"`
 	StartedAt         time.Time   `json:"started_at"`
 	CompletedAt       time.Time   `json:"completed_at"`
 	DurationMillis    int64       `json:"duration_ms,omitempty"`
@@ -336,28 +357,174 @@ type TestResult struct {
 	JJ                *JJContext  `json:"jj,omitempty"`
 }
 
+// NormalizeTestResult fills the outcome for legacy events and enforces the
+// unambiguous relationship between an outcome and process exit status.
+func NormalizeTestResult(result *TestResult) error {
+	if result.Outcome == "" {
+		switch {
+		case result.ExitCode == nil:
+			result.Outcome = TestBlocked
+		case *result.ExitCode == 0:
+			result.Outcome = TestPassed
+		default:
+			result.Outcome = TestFailed
+		}
+	}
+	switch result.Outcome {
+	case TestPassed:
+		if result.ExitCode == nil || *result.ExitCode != 0 {
+			return fmt.Errorf("test outcome %q requires exit_code 0", result.Outcome)
+		}
+	case TestFailed:
+		if result.ExitCode == nil || *result.ExitCode == 0 {
+			return fmt.Errorf("test outcome %q requires a non-zero exit_code", result.Outcome)
+		}
+	case TestBlocked:
+		if result.ExitCode != nil {
+			return fmt.Errorf("test outcome %q requires no exit_code", result.Outcome)
+		}
+	default:
+		return fmt.Errorf("invalid test outcome %q", result.Outcome)
+	}
+	return nil
+}
+
+type CheckpointClaimStatus string
+
+const (
+	ClaimAsserted CheckpointClaimStatus = "asserted"
+	ClaimVerified CheckpointClaimStatus = "verified"
+	ClaimFailed   CheckpointClaimStatus = "failed"
+	ClaimBlocked  CheckpointClaimStatus = "blocked"
+)
+
+type CheckpointEvidenceRef struct {
+	Kind    string `json:"kind"`
+	Ordinal int    `json:"ordinal"`
+}
+
+type CheckpointClaim struct {
+	Kind      string                  `json:"kind"`
+	Statement string                  `json:"statement"`
+	Status    CheckpointClaimStatus   `json:"status"`
+	Evidence  []CheckpointEvidenceRef `json:"evidence,omitempty"`
+}
+
+// ValidCheckpointClaimKind reports whether a claim kind is part of the stable protocol vocabulary.
+func ValidCheckpointClaimKind(kind string) bool {
+	switch kind {
+	case "summary", "implementation", "test", "build", "runtime", "review", "decision", "blocked", "mutation", "message", "collision":
+		return true
+	default:
+		return false
+	}
+}
+
 type CheckpointRequest struct {
-	ID                string      `json:"id"`
-	Actor             string      `json:"actor"`
-	DeclaredBy        string      `json:"declared_by,omitempty"`
-	SessionGeneration uint64      `json:"session_generation"`
-	RepositoryUUID    string      `json:"repository_uuid"`
-	WorkspaceUUID     string      `json:"workspace_uuid"`
-	WorkUnitUUID      string      `json:"work_unit_uuid,omitempty"`
-	CheckpointKind    string      `json:"checkpoint_kind"`
-	JournalStart      uint64      `json:"journal_start_sequence"`
-	JournalEnd        uint64      `json:"journal_end_sequence"`
-	BoundaryEventID   string      `json:"boundary_event_id,omitempty"`
-	BoundaryType      string      `json:"boundary_type,omitempty"`
-	TurnID            string      `json:"turn_id,omitempty"`
-	TurnIndex         *int        `json:"turn_index,omitempty"`
-	CompactionEventID string      `json:"compaction_event_id,omitempty"`
-	Git               *GitContext `json:"git,omitempty"`
-	JJ                *JJContext  `json:"jj,omitempty"`
+	ID                string            `json:"id"`
+	Actor             string            `json:"actor"`
+	DeclaredBy        string            `json:"declared_by,omitempty"`
+	SessionGeneration uint64            `json:"session_generation"`
+	RepositoryUUID    string            `json:"repository_uuid"`
+	WorkspaceUUID     string            `json:"workspace_uuid"`
+	WorkUnitUUID      string            `json:"work_unit_uuid,omitempty"`
+	CheckpointKind    string            `json:"checkpoint_kind"`
+	JournalStart      uint64            `json:"journal_start_sequence"`
+	JournalEnd        uint64            `json:"journal_end_sequence"`
+	BoundaryEventID   string            `json:"boundary_event_id,omitempty"`
+	BoundaryType      string            `json:"boundary_type,omitempty"`
+	TurnID            string            `json:"turn_id,omitempty"`
+	TurnIndex         *int              `json:"turn_index,omitempty"`
+	CompactionEventID string            `json:"compaction_event_id,omitempty"`
+	MutationIDs       []string          `json:"mutation_ids,omitempty"`
+	MessageIDs        []string          `json:"message_ids,omitempty"`
+	CollisionIDs      []string          `json:"collision_ids,omitempty"`
+	TestResultIDs     []string          `json:"test_result_ids,omitempty"`
+	Claims            []CheckpointClaim `json:"claims,omitempty"`
+	Metadata          map[string]string `json:"metadata,omitempty"`
+	Git               *GitContext       `json:"git,omitempty"`
+	JJ                *JJContext        `json:"jj,omitempty"`
 }
 
 type CheckpointRequestParams struct {
 	Request CheckpointRequest `json:"request"`
+}
+
+type WorkUnitState string
+
+const (
+	WorkUnitProposed  WorkUnitState = "proposed"
+	WorkUnitActive    WorkUnitState = "active"
+	WorkUnitBlocked   WorkUnitState = "blocked"
+	WorkUnitVerified  WorkUnitState = "verified"
+	WorkUnitCompleted WorkUnitState = "completed"
+	WorkUnitAbandoned WorkUnitState = "abandoned"
+)
+
+type WorkUnit struct {
+	UUID               string        `json:"work_unit_uuid"`
+	RepositoryUUID     string        `json:"repository_uuid"`
+	WorkspaceUUID      string        `json:"workspace_uuid"`
+	Objective          string        `json:"objective"`
+	AcceptanceCriteria string        `json:"acceptance_criteria,omitempty"`
+	Context            string        `json:"context,omitempty"`
+	State              WorkUnitState `json:"state"`
+	CreatedBy          string        `json:"created_by"`
+	CreatedAt          time.Time     `json:"created_at"`
+	UpdatedAt          time.Time     `json:"updated_at"`
+	CompletedAt        *time.Time    `json:"completed_at,omitempty"`
+}
+
+type WorkUnitActor struct {
+	WorkUnitUUID       string     `json:"work_unit_uuid"`
+	Actor              string     `json:"actor"`
+	JoinedAt           time.Time  `json:"joined_at"`
+	LeftAt             *time.Time `json:"left_at,omitempty"`
+	ParticipationState string     `json:"participation_state"`
+}
+
+type WorkUnitCreatedEvent struct {
+	WorkUnit WorkUnit `json:"work_unit"`
+}
+type WorkUnitUpdatedEvent struct {
+	UUID     string   `json:"work_unit_uuid"`
+	Actor    string   `json:"actor"`
+	Previous WorkUnit `json:"previous"`
+	Result   WorkUnit `json:"result"`
+}
+type WorkUnitActorEvent struct {
+	WorkUnitUUID string         `json:"work_unit_uuid"`
+	Actor        string         `json:"actor"`
+	At           time.Time      `json:"at"`
+	Previous     *WorkUnitActor `json:"previous,omitempty"`
+	Result       WorkUnitActor  `json:"result"`
+}
+type WorkUnitTransitionEvent struct {
+	WorkUnitUUID string        `json:"work_unit_uuid"`
+	Actor        string        `json:"actor"`
+	From         WorkUnitState `json:"from"`
+	To           WorkUnitState `json:"to"`
+	At           time.Time     `json:"at"`
+}
+
+type WorkUnitCreateParams struct {
+	WorkUnit WorkUnit `json:"work_unit"`
+}
+type WorkUnitUpdateParams struct {
+	WorkUnitUUID       string  `json:"work_unit_uuid"`
+	Actor              string  `json:"actor"`
+	Objective          *string `json:"objective,omitempty"`
+	AcceptanceCriteria *string `json:"acceptance_criteria,omitempty"`
+	Context            *string `json:"context,omitempty"`
+}
+type WorkUnitActorParams struct {
+	WorkUnitUUID string `json:"work_unit_uuid"`
+	Actor        string `json:"actor"`
+}
+type WorkUnitTransitionParams struct {
+	WorkUnitUUID string        `json:"work_unit_uuid"`
+	Actor        string        `json:"actor"`
+	State        WorkUnitState `json:"state"`
 }
 
 type TransitionParams struct {
