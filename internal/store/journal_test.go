@@ -37,13 +37,17 @@ func TestJournalPoisonsAfterAmbiguousSyncFailure(t *testing.T) {
 	}
 }
 
+//nolint:cyclop,gocognit // end-to-end test keeps setup and assertions together.
 func TestJournalReplaysAndTruncatesPartialCrashTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state", "events.jsonl")
 	journal, _, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, _ := json.Marshal(map[string]string{"address": "a"})
+	data, err := json.Marshal(map[string]string{"address": "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	event := protocol.Event{Version: 1, Sequence: 1, Type: "actor.upserted", At: time.Now(), Data: data}
 	if err := journal.Append(event); err != nil {
 		t.Fatal(err)
@@ -58,13 +62,19 @@ func TestJournalReplaysAndTruncatesPartialCrashTail(t *testing.T) {
 	if _, err := file.WriteString(`{"version":1,"sequence":2`); err != nil {
 		t.Fatal(err)
 	}
-	file.Close()
+	if err := file.Close(); err != nil {
+		t.Errorf("close file: %v", err)
+	}
 
 	reopened, events, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
+	defer func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened: %v", err)
+		}
+	}()
 	if len(events) != 1 || events[0].Sequence != 1 {
 		t.Fatalf("events = %#v", events)
 	}

@@ -11,6 +11,7 @@ register → heartbeat → intent.begin/end → mailbox poll/ack → collision t
 Status: operational.
 
 The TypeScript extension has direct lifecycle and tool hooks, context/session access, steer injection, and explicit settlement events. It is the reference adapter.
+It never starts the daemon; lifecycle belongs exclusively to `agent-bridge.service` under `systemd --user`. Connection failures report the restart command and wait for service recovery.
 
 ## Codex CLI
 

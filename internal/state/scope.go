@@ -9,8 +9,14 @@ import (
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
 )
 
-func scopeID(_ string, key string) string {
+func scopeID(_, key string) string {
 	return deterministicUUID(filepath.Clean(key))
+}
+
+// UnknownActorUUID returns the deterministic synthetic actor for a workspace.
+// It is deliberately workspace-scoped and never addressable.
+func UnknownActorUUID(workspaceUUID string) string {
+	return deterministicUUID("unknown-external\x00" + workspaceUUID)
 }
 
 func deterministicUUID(key string) string {
@@ -22,6 +28,7 @@ func deterministicUUID(key string) string {
 	return encoded[:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:]
 }
 
+//nolint:gocritic // Actor is intentionally normalized by value.
 func normalizeActorScope(actor protocol.Actor) protocol.Actor {
 	repositoryKey := "dir\x00" + actor.CWD
 	repositoryRoot := actor.CWD
@@ -61,6 +68,7 @@ func normalizeActorScope(actor protocol.Actor) protocol.Actor {
 	return actor
 }
 
+//nolint:gocritic // Intent is intentionally normalized by value.
 func normalizeIntentScope(intent protocol.Intent) protocol.Intent {
 	actor := normalizeActorScope(protocol.Actor{CWD: intent.CWD, Git: intent.Git, JJ: intent.JJ})
 	intent.RepositoryUUID = actor.RepositoryUUID

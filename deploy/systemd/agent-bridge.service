@@ -1,0 +1,21 @@
+[Unit]
+Description=Agent Bridge coordination daemon
+Documentation=https://github.com/AndrewPBerg/agent-bridge
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agent-bridge serve
+Restart=always
+RestartSec=2s
+TimeoutStopSec=10s
+KillMode=control-group
+UMask=0077
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+
+[Install]
+WantedBy=default.target

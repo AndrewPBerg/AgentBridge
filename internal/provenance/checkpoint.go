@@ -24,6 +24,10 @@ type CheckpointIdentity struct {
 	EvidenceHash      string `json:"evidence_hash"`
 }
 
+// CheckpointID returns the deterministic identity for a checkpoint request and
+// its evidence. The value copy gives hashing an immutable request snapshot.
+//
+//nolint:gocritic // public value API preserves snapshot semantics
 func CheckpointID(request protocol.CheckpointRequest, evidence any) (string, error) {
 	if request.DeclaredBy == "" {
 		request.DeclaredBy = "agent"
@@ -48,6 +52,7 @@ func CheckpointID(request protocol.CheckpointRequest, evidence any) (string, err
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// ExtractionRunID returns the deterministic identity for an extraction run.
 func ExtractionRunID(checkpointID, model, promptVersion, schemaVersion string) string {
 	identity := struct {
 		CheckpointID  string `json:"checkpoint_id"`
@@ -55,7 +60,11 @@ func ExtractionRunID(checkpointID, model, promptVersion, schemaVersion string) s
 		PromptVersion string `json:"prompt_version"`
 		SchemaVersion string `json:"schema_version"`
 	}{checkpointID, model, promptVersion, schemaVersion}
-	encoded, _ := json.Marshal(identity)
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		// The identity contains only strings, so encoding errors are not expected.
+		return ""
+	}
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
 }

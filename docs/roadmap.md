@@ -254,6 +254,22 @@ Direction
 
 Checkpoints remain immutable evidence beneath WorkUnits and never become mutable issue records.
 
+### Organizing hierarchy and JJ changes
+
+The practical operator hierarchy is:
+
+```text
+Direction
+  -> WorkUnits
+    -> zero or more JJ changes
+      -> checkpoints and mutation evidence
+        -> observed file changes
+```
+
+A Direction composes the repository-scoped WorkUnits required for one integrated outcome. A WorkUnit composes the JJ changes that materialize that issue over time; it is not required to map one-to-one to a change. Checkpoints are immutable evidence boundaries over the mutations, tests, messages, and observed file changes that led toward or validated those JJ changes. They do not own files or replace JJ history.
+
+The eventual `work_unit_changes` relation should make the WorkUnit-to-JJ association explicit, including working, materialized, and follow-up changes. Checkpoint evidence should retain JJ identity plus normalized mutation/file references so operators can move from strategic outcome down to the exact observed changes without inferring hierarchy from timestamps or prose.
+
 ### Direction responsibilities
 
 A Direction should carry:
@@ -391,6 +407,31 @@ Projection tables provide current state and fast rollups. Historical events pres
 4. add convergence and Direction-level verification backed by checkpoint evidence;
 5. add multi-repository scope relations and cross-repository rollups; and
 6. design multi-machine authority and reconciliation only after local orchestration is proven.
+
+### Todo dogfood follow-up sequence
+
+The [cross-repository Go/Svelte Todo dogfood](todo-direction-dogfood.md) validated the hierarchy and evidence model while exposing operational gaps. Treat the following as current roadmap sequencing rather than leaving them only in the future parking lot.
+
+Immediate follow-up:
+
+- [x] add replay-safe Direction lifecycle transitions and compact Pi lifecycle controls;
+- [x] add deterministic `direction.status` rollup across attached repository-scoped WorkUnits;
+- [x] expose each rolled-up WorkUnit's effective repository/workspace root and scope kind so a parent-directory integration scope is explicit;
+- [x] provide a bounded non-Pi worker CLI for identity context, mailbox, test result, checkpoint, and lifecycle operations without raw JSON-RPC; and
+- [x] retain checkpoints as immutable evidence boundaries rather than treating them as subtasks.
+
+Deferred after the immediate operability slice:
+
+- [ ] first-class `parent actor -> launch -> child actor -> optional WorkUnit` provenance with a stable launch UUID and harness attachment events;
+- [ ] warn when mutations occur in a scope related to an active WorkUnit but lack WorkUnit context;
+- [ ] correlate instrumented creation of brand-new paths by matching active create intent with `Before.Exists=false` before Watchman classifies it as unknown;
+- [ ] retire Watchman workspace watches after no active actor remains, with a bounded grace period;
+- [ ] remove no-op legacy `activity.*` compatibility RPCs after deployed adapters no longer call them;
+- [ ] include actor aliases, roles, liveness, and recent activity in Direction rollups;
+- [ ] include open questions and message summaries in Direction status;
+- [ ] add explicit normalized WorkUnit-to-JJ-change relations;
+- [ ] inject a compact Pi hierarchy cue: `Direction -> WorkUnit -> JJ changes -> checkpoint/mutations -> files`; and
+- [ ] add dependencies and deterministic readiness only after local rollup and evidence behavior remain stable under dogfood.
 
 Exit condition for the local slice: several agents can coordinate one project-shaped Direction containing issues and sub-issues, inspect deterministic readiness and blockers, and verify the integrated outcome from descendant checkpoint evidence without confusing project state, executable work, VCS state, or provenance boundaries.
 
@@ -644,126 +685,43 @@ A linked local Direction can project multiple WorkUnits and evidence-backed chec
 - [Linear Agent](https://linear.app/docs/linear-agent): workspace reasoning over projects, issues, comments, activity history, and documents; comments and project documents are useful shared agent context.
 - Current Linear MCP tool contracts additionally confirm updateable comments across issues/projects/initiatives/documents/status updates, project documents with atomic exact-text patches, and project/initiative status updates with health.
 
-## Phase 5 — Human presence, external provenance, and safety work carried forward
+## Phase 5 — External-change provenance and safety work carried forward
 
 This lane may proceed alongside the checkpoint and WorkUnit substrates. Implement it in this order:
 
 ```text
-actor and live-feed substrate
-  -> Zed ACP human/multiplayer facade
+unknown-actor substrate
   -> Watchman external-change provenance
   -> observed-baseline protection
   -> destructive-operation admission and audited override
   -> richer collision evidence and adapter authorization
 ```
 
-The ordering is intentional. ACP needs honest human/session identity and an ordered live feed. Watchman needs persisted baselines and a non-addressable unknown actor. Blocking policy should consume those facts only after their replay and failure behavior are tested.
+Watchman is a conservative filesystem wake-up source, never authorship authority. Blocking policy should consume its reconciled, replay-tested facts only after continuity and failure behavior are proven.
 
-### Phase 5.0 — Actor kinds, addressability, and ordered live events
+### Phase 5.0 — Unknown actor identity and addressability
 
-The current implementation treats an actor address as a live session UUID. Extend that model minimally before adding ACP or Watchman:
+Add a deterministic, workspace-scoped `unknown` actor kind before ingesting external changes:
 
 ```text
-actor_kind      agent | human | unknown
+actor_kind      agent | unknown
 addressable     boolean
 presence_kind   lease | synthetic
 ```
 
-Initial rules:
+Rules:
 
-- `agent` actors are harness sessions with heartbeat leases and mailboxes.
-- `human` actors are adapter-backed sessions. The first ACP version uses a configured canonical human UUID and increments its generation on reconnect; Zed's opaque ACP session ID is adapter metadata, not the canonical actor UUID.
-- `unknown` is a canonical RFC 4122 version-5-compatible deterministic UUID derived from the workspace UUID and a fixed `unknown-external` namespace label, has synthetic presence, and is never active or addressable.
-- The ACP facade is a transport, not the author of relayed human or Herdr-agent events.
-- An unknown actor cannot send or receive messages, own leases, join collision negotiation, declare overrides, or be selected through aliases.
-- `Address` and every persisted actor reference must validate as canonical UUIDs at the protocol boundary and be stored as exactly 16-byte `BLOB` values. Do not silently convert arbitrary strings to blobs.
-- Before accepting human-authored events, bind requests to the registered actor UUID and generation and reject mismatched sender/actor fields. Current Pi and Go clients open one socket per call, so do not assume connection affinity: either migrate them to authenticated persistent connections or, preferably for the first slice, return an ephemeral registration credential that every actor-scoped request must carry. Keep that credential memory-only, rotate it on registration/restart, and never journal or project it. Full method-level capability policy follows in Phase 5.9, but transport-level anti-impersonation is a Phase 5.0 prerequisite.
+- existing Pi actors remain addressable, lease-backed `agent` sessions;
+- each workspace receives one canonical RFC 4122 version-5-compatible unknown actor UUID derived from the workspace UUID and a fixed `unknown-external` namespace label;
+- unknown actors have synthetic presence and are never active or addressable;
+- unknown actors cannot send or receive messages, own leases, join collision negotiation, declare overrides, or be selected through aliases; and
+- every persisted actor reference remains a validated canonical UUID stored as exactly a 16-byte `BLOB`.
 
-The first migration may add `actor_kind`, `addressable`, and `presence_kind` to the existing `actors` projection because the canonical actor UUID remains the session address. Backfill existing rows as `agent`, addressable, lease-backed. Reject invalid enum combinations at replay and registration rather than guessing. Add explicit engine tests for every forbidden unknown-actor operation and projection tests asserting `typeof(column) = 'blob' AND length(column) = 16` for every new UUID-bearing column. If concurrent independent ACP presences for one human become necessary, introduce a normalized principal-to-presence relation rather than placing presence UUIDs in JSON.
+Backfill existing actors as agent/addressable/lease-backed. Reject invalid enum combinations at replay and registration. Add engine tests for every forbidden unknown-actor operation and projection tests asserting BLOB type and length for every new UUID relation.
 
-Real-time consumers also need an ordered daemon feed. Add a cursor-based subscription or bounded long-poll API over journal sequence with these properties:
+Exit condition: replay deterministically reconstructs the same non-addressable unknown actor for a workspace, and no coordination API can treat it as a live peer.
 
-- durable events replay from `after_sequence` before live delivery;
-- every frame includes journal sequence and repository/workspace scope;
-- reconnect resumes without duplication or reordering;
-- ephemeral high-rate presence updates use a separate connection-local sequence and are never presented as durable provenance;
-- projection-backed payloads include the projection watermark and cannot be presented as newer than their evidence; and
-- slow consumers are disconnected with an explicit resumable cursor rather than causing coordination-path backpressure.
-
-Do not stream full transcripts, reasoning, or unbounded terminal output. Durable activity boundaries may cite bounded output/test evidence; token-by-token output and cursor-like presence are ephemeral.
-
-Exit condition: a replay fixture can represent addressable agent and human sessions plus a deterministic non-addressable unknown actor, and a reconnecting subscriber receives a causally ordered, deduplicated durable feed followed by live events.
-
-### Phase 5.1 — Zed ACP contract spike
-
-Build a disposable protocol spike before the product facade. Use a custom Zed External Agent launched through `agent_servers` and ACP v1 over stdio newline-delimited JSON-RPC: one encoded protocol message per line and no non-ACP output on stdout. Verify behavior against a pinned Zed version and save fixture transcripts for:
-
-1. `initialize` capability negotiation and `clientInfo` contents;
-2. `session/new`, `session/load` or the explicit decision not to advertise loading, and absolute `cwd` handling;
-3. `session/prompt` completion and cancellation;
-4. `session/update` message chunks and tool-call updates with `locations`;
-5. updates sent while no prompt request is active;
-6. reconnect/process death and duplicate session creation; and
-7. Zed's ACP log output through `dev: open acp logs`.
-
-Stock ACP provides no authenticated human identity, native multi-participant identity, cursor/selection stream, or arbitrary editor-buffer edit notification. Configure the human UUID and display name in Agent Bridge-owned local configuration; never derive identity from `clientInfo`, a display name, or the active OS user. Custom `_...` methods and `_meta` are allowed by ACP but must not become required unless Zed advertises matching support.
-
-The idle-update experiment is a release gate. If stock Zed does not render `session/update` notifications outside an active prompt, document that limitation and use explicit refresh/replay while pursuing a Zed-side capability. Do not keep a fake prompt or tool call open indefinitely merely to obtain a spinner-backed event channel.
-
-Exit condition: checked-in protocol fixtures state exactly which standard ACP messages Zed accepts, when it renders them, and which desired multiplayer behaviors require Zed-specific support.
-
-### Phase 5.2 — Zed ACP human and Herdr multiplayer facade
-
-Use the ACP process as an Agent Bridge facade, not as an agent runtime:
-
-```text
-Herdr-hosted Pi agents -> Agent Bridge daemon -> ACP facade -> Zed Agent Panel
-            shared workspace files <--------------------------> Zed editor
-```
-
-Herdr remains the runtime and supervisory UI. For each ACP session the facade should:
-
-1. resolve `cwd` through repository/workspace scope and register the configured human actor generation;
-2. subscribe to the ordered Agent Bridge feed from its journal cursor;
-3. translate an explicit `@alias message` or structured command into a durable human-authored `message.send`;
-4. poll the human mailbox and acknowledge only after the facade has durably advanced its delivery cursor and successfully serialized the ACP update; ACP provides no proof that Zed rendered a notification, so delivery remains at-least-once across process failure;
-5. label relayed events with the original actor alias and UUID in visible text and `_meta`, never the facade identity;
-6. map live tool activity to ACP `tool_call`/`tool_call_update`, using globally unique per-session tool-call IDs and absolute path/optional line `locations`;
-7. render mutations, collisions, checkpoints, WorkUnits, and bounded diffs/evidence as compact updates without exposing stored secrets or full transcripts; and
-8. return deterministic `end_turn`, `cancelled`, and error outcomes for every `session/prompt`.
-
-Start read-only except for human messaging and explicit checkpoint/WorkUnit actions. Do not proxy model execution, filesystem writes, or shell commands through this facade. ACP `fs/read_text_file` can expose unsaved editor contents only when an agent explicitly requests a read; it is not a general Zed edit-event stream. A manual Zed save therefore remains unknown unless a future Zed adapter emits a causal save event.
-
-Required acceptance tests:
-
-- a Zed-authored message is journaled under the human UUID;
-- a relayed Herdr mutation retains the Herdr agent UUID;
-- an active ACP session does not cause a manual file save to be attributed to the human;
-- duplicate prompt retries do not duplicate durable messages;
-- reconnect resumes from the last acknowledged journal/mailbox cursor;
-- projection lag cannot reorder the displayed feed; and
-- malformed/out-of-scope paths are rejected without terminating the daemon.
-
-Exit condition: Andrew can open a Zed workspace, see and address active Herdr agents in a labeled coordination feed, and contribute durable human-authored messages/checkpoints while all agent runtimes remain independently hosted in Herdr.
-
-### Phase 5.3 — Agent presence and follow-along
-
-Add a bounded adapter event vocabulary for live activity:
-
-```text
-activity.started
-activity.updated      ephemeral and rate-limited
-activity.completed
-presence.focused      ephemeral path + optional line/symbol
-```
-
-The Pi adapter can source these from documented `tool_execution_start/update/end`, `tool_call`, `tool_result`, turn hooks, and `agent_settled`. Persist start/completion boundaries and evidence references; rate-limit or drop intermediate updates under load. A tool-reported path/line is logical focus, not a literal editor cursor.
-
-ACP tool locations can enable Zed follow-along for current paths and lines. Literal cursors, selections, unsaved buffer operations, or participant avatars require an explicit Zed client/extension capability and must retain the originating human or agent UUID. Never infer a cursor from the most recently modified file.
-
-Exit condition: several Herdr agents can produce simultaneously visible, correctly labeled path/tool/activity streams in Zed without adding high-rate noise to the journal or model context.
-
-### Phase 5.4 — Watchman transport and coverage
+### Phase 5.1 — Watchman transport and coverage
 
 Use Watchman as the preferred event-driven recursive source. Do not add a steady polling fallback. If Watchman is missing or unhealthy, keep coordination available, mark external provenance as degraded, and surface the condition through `doctor` and status.
 
@@ -783,7 +741,7 @@ Respect existing `.watchmanconfig` and global Watchman policy; do not rewrite pr
 
 Exit condition: fixture and real-Watchman tests can establish, reconnect, and tear down multiple workspace subscriptions without duplicate Agent Bridge subscriptions, path-scope escapes, or changes to user Watchman configuration.
 
-### Phase 5.5 — Baseline bootstrap, continuity, and replay
+### Phase 5.2 — Baseline bootstrap, continuity, and replay
 
 Watchman is a wake-up and opaque-cursor source, not snapshot, wall-clock, or authorship authority. Maintain a journal-derived latest baseline for each `(workspace_uuid, canonical_path)`. Baseline updates become visible only after the corresponding Agent Bridge event is durable.
 
@@ -809,7 +767,7 @@ Never convert a fresh-instance result into one unknown mutation per existing fil
 
 Exit condition: restart, recrawl, clock invalidation, and subscription-cancellation fixtures converge to the real filesystem state without missed actual differences or fabricated authorship.
 
-### Phase 5.6 — External-change events and conservative correlation
+### Phase 5.3 — External-change events and conservative correlation
 
 Add authoritative journal events and normalized projections such as:
 
@@ -869,7 +827,7 @@ A Watchman notification is explained by an instrumented intent only when all hig
 - the intent's after snapshot exactly matches the newly observed filesystem state; and
 - no intervening durable observation contradicts that transition.
 
-Buffer events overlapping active intents until `intent.end` or a bounded timeout. Timing overlap, process lifetime, an active ACP human, or Watchman state metadata alone never proves authorship. If several intents could explain the same transition, record ambiguous-known correlation; if the final state differs from the instrumented after snapshot, record unknown or mixed evidence rather than suppressing it.
+Buffer events overlapping active intents until `intent.end` or a bounded timeout. Timing overlap, process lifetime, an active human editor, or Watchman state metadata alone never proves authorship. If several intents could explain the same transition, record ambiguous-known correlation; if the final state differs from the instrumented after snapshot, record unknown or mixed evidence rather than suppressing it.
 
 Notify active actors in the workspace initially, then narrow by path/WorkUnit scope when richer scope exists. The message must say “unattributed external change observed,” include path/change kind/bounded snapshot evidence and continuity confidence, and instruct agents to re-read before writing. Unknown actors never receive collision or mailbox messages.
 
@@ -885,7 +843,7 @@ Stress with real filesystem writers:
 
 Exit condition: unexplained saved changes eventually produce one conservative durable observation, known instrumented final states do not produce duplicate unknown attribution, and mixed states remain explicitly ambiguous.
 
-### Phase 5.7 — Observed-baseline preflight protection
+### Phase 5.4 — Observed-baseline preflight protection
 
 Build protection from explicit read observations and the baseline projection, not from Watchman timing. Add a `file.observed` event containing actor UUID/generation, workspace/path, observation kind, snapshot, tool/turn evidence, and journal sequence.
 
@@ -903,7 +861,7 @@ Pi's `tool_call` hook can block, but preflight is not an OS-level transaction ag
 
 Exit condition: an instrumented whole-file write based on a file another actor changed since observation is blocked before execution, while fresh exact-text edits and disjoint writes remain low-friction.
 
-### Phase 5.8 — Destructive-operation admission and human overrides
+### Phase 5.5 — Destructive-operation admission and human overrides
 
 Evolve `intent.begin` into an atomic policy decision:
 
@@ -915,11 +873,11 @@ Classify restore/reset/clean/delete and workspace-wide VCS operations by blast r
 
 At minimum cover `rm`, recursive moves/deletes, `git restore/checkout/reset/clean/stash`, and JJ restore/abandon/working-copy or operation-log transitions documented in [the JJ-native workflow roadmap](workflow-roadmap.md). The daemon evaluates active actors/intents, workspace scope, external observations since the actor baseline/checkpoint, and operation ownership before deciding.
 
-A human override is a separate durable event, not a boolean on the blocked attempt. It must include human actor UUID, blocked decision/event ID, exact operation fingerprint and scope, reason, expiry or one-shot use, and resulting outcome. Reject reuse for changed arguments, paths, workspace, or generation. Unknown actors and unbound clients cannot override. Zed ACP may present the decision, but the daemon owns authorization and audit.
+A human override is a separate durable event, not a boolean on the blocked attempt. It must include human actor UUID, blocked decision/event ID, exact operation fingerprint and scope, reason, expiry or one-shot use, and resulting outcome. Reject reuse for changed arguments, paths, workspace, or generation. Unknown actors and unbound clients cannot override. The daemon owns authorization and audit regardless of the presenting adapter.
 
 Exit condition: destructive shared-workspace operations cannot execute through the Pi adapter without a deterministic grant or matching one-shot human override, and replay explains both the original block and override use.
 
-### Phase 5.9 — Richer collision evidence and adapter authorization
+### Phase 5.6 — Richer collision evidence and adapter authorization
 
 Add richer evidence incrementally without replacing exact-path facts:
 
@@ -934,7 +892,7 @@ Separate adapter-declared capabilities from daemon-effective authorization. Vali
 
 ```text
 session.register  mailbox.receive  message.send
-activity.report   file.observe     file.preflight
+external.observe   file.observe     file.preflight
 human.override    collision.block  turn.steer
 ```
 
@@ -946,45 +904,9 @@ Exit condition: future adapters can participate at an explicitly bounded compati
 
 Implementation should verify the installed versions rather than freezing assumptions. Primary references used for this plan:
 
-- [Zed External Agents](https://zed.dev/docs/ai/external-agents)
-- [ACP overview](https://agentclientprotocol.com/protocol/v1/overview), [transports](https://agentclientprotocol.com/protocol/v1/transports), [session setup](https://agentclientprotocol.com/protocol/v1/session-setup), [prompt turns](https://agentclientprotocol.com/protocol/v1/prompt-turn), [tool calls](https://agentclientprotocol.com/protocol/v1/tool-calls), [filesystem methods](https://agentclientprotocol.com/protocol/v1/file-system), and [extensibility](https://agentclientprotocol.com/protocol/v1/extensibility)
 - [Watchman `watch-project`](https://facebook.github.io/watchman/docs/cmd/watch-project), [`subscribe`](https://facebook.github.io/watchman/docs/cmd/subscribe), [clocks](https://facebook.github.io/watchman/docs/clockspec), [queries](https://facebook.github.io/watchman/docs/cmd/query), [configuration](https://facebook.github.io/watchman/docs/config), [query synchronization](https://facebook.github.io/watchman/docs/cookies), [installation](https://facebook.github.io/watchman/docs/install), and [recrawl/poison troubleshooting](https://facebook.github.io/watchman/docs/troubleshooting)
 - installed Pi extension and RPC documentation for blocking `tool_call`, `tool_execution_*`, `sendMessage`, settlement, RPC UI degradation, and strict JSONL framing
 - [the canonical prototype retrospective](retrospective.md) and [the JJ-native workflow roadmap](workflow-roadmap.md)
-
-## Deferred — ACP golden-path collision handling
-
-Once the Zed ACP buffer bridge, observed baselines, and deterministic mutation admission are proven, make collaborative reconciliation the golden path for ordinary file contention. This changes collision behavior without replacing Agent Bridge authority:
-
-```text
-same-buffer overlap
-  -> current compatible edits       -> apply collaboratively
-  -> stale but uniquely rebasable   -> rebase and apply
-  -> concurrent compatible edits    -> serialize through the editor
-  -> ambiguous/destructive/semantic -> negotiate, block, or ask the human
-```
-
-Agent Bridge remains authoritative for actor identity, buffer observations, expected baselines, admission ordering, ownership, durable evidence, and escalation. ACP is the shared-buffer transport and editor actuator. Zed cursor/tool-location UI is a rebuildable projection and never becomes authorship or policy truth.
-
-The daemon should return a structured contention outcome such as:
-
-```text
-auto_merged | rebased | serialized | waiting | negotiating | blocked | resolved
-```
-
-For an ACP-backed exact edit, do not emit a stop-and-talk collision merely because another actor touched the same path. First verify the observed buffer version/hash, attempt the exact edit against the current buffer, and admit it when the target remains unique and peer work is preserved. Journal the decision, participating actors, baseline/version evidence, transformed ranges where available, and resulting snapshot hash without storing buffer contents by default.
-
-Escalate to the durable collision lifecycle when reconciliation is ambiguous, ranges overlap incompatibly, a whole-file/destructive operation would discard work, generated/runtime resources conflict, a semantic disagreement remains despite a technically mergeable result, ACP is unavailable, or Watchman observes an unattributed state transition. Shell, Git/JJ, database, process, and cross-workspace conflicts remain Agent Bridge policy even when file buffers are collaborative.
-
-Prerequisites:
-
-1. a validated always-on editor bridge with bounded `fs/read_text_file` and `fs/write_text_file` routing;
-2. explicit actor observations and stale-baseline protection;
-3. atomic daemon admission and one-shot human override;
-4. buffer/range/version evidence sufficient to prove peer work was preserved; and
-5. measured false-merge, rebase-failure, negotiation, and fallback rates.
-
-Exit condition: two instrumented actors can edit one Zed buffer without routine interruption or silent overwrite, while every non-mechanical conflict still produces a replayable Agent Bridge decision and safe escalation.
 
 ## Deferred — Bounded session communication scopes
 
@@ -1021,6 +943,6 @@ Revisit it only after:
 - treating Spark output as coordination truth;
 - injecting summaries into every agent turn;
 - autonomous semantic blocking;
-- broad cross-harness expansion beyond the bounded Zed ACP bridge before the Pi workflow is solid;
+- broad cross-harness expansion before the Pi workflow is solid;
 - cloud upload of provenance or semantic checkpoints by default; and
 - a standalone second chat UI disconnected from the existing Herdr and Zed surfaces.

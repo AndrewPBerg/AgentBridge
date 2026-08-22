@@ -1,4 +1,5 @@
 /agent-bridge
+/bin/
 /.yosoi/
 /packages/pi-extension/node_modules/
 *.log

@@ -21,10 +21,12 @@ const (
 	defaultRecentWindow = 30 * time.Second
 )
 
+// Appender persists state events.
 type Appender interface {
 	Append(protocol.Event) error
 }
 
+// Engine maintains coordination state and its event journal.
 type Engine struct {
 	mu sync.Mutex
 
@@ -51,15 +53,20 @@ type Engine struct {
 	testResultSequence map[string]uint64
 	workUnits          map[string]protocol.WorkUnit
 	workUnitActors     map[string]map[string]protocol.WorkUnitActor
+	directions         map[string]protocol.Direction
+	externalChanges    map[string]protocol.ExternalChange
+	continuity         map[string]protocol.WatchContinuity
 	poisoned           error
 }
 
+// Options configures an Engine.
 type Options struct {
 	Now          func() time.Time
 	ActorTTL     time.Duration
 	RecentWindow time.Duration
 }
 
+// New creates an Engine and replays events into it.
 func New(journal Appender, events []protocol.Event, options Options) (*Engine, error) {
 	now := options.Now
 	if now == nil {
@@ -94,6 +101,9 @@ func New(journal Appender, events []protocol.Event, options Options) (*Engine, e
 		testResultSequence: make(map[string]uint64),
 		workUnits:          make(map[string]protocol.WorkUnit),
 		workUnitActors:     make(map[string]map[string]protocol.WorkUnitActor),
+		directions:         make(map[string]protocol.Direction),
+		externalChanges:    make(map[string]protocol.ExternalChange),
+		continuity:         make(map[string]protocol.WatchContinuity),
 	}
 	for _, event := range events {
 		if event.Sequence != engine.eventSequence+1 {
@@ -136,12 +146,14 @@ func (e *Engine) record(eventType string, value any) error {
 	return nil
 }
 
+//nolint:gocritic // Events are decoded from value-based protocol APIs.
 func decode[T any](event protocol.Event) (T, error) {
 	var value T
 	err := json.Unmarshal(event.Data, &value)
 	return value, err
 }
 
+//nolint:cyclop,gocognit,funlen,gocritic,maintidx // Event replay dispatches all journal event types.
 func (e *Engine) apply(event protocol.Event) error {
 	switch event.Type {
 	case "actor.upserted":
@@ -149,7 +161,42 @@ func (e *Engine) apply(event protocol.Event) error {
 		if err != nil {
 			return err
 		}
+		if actor.ActorKind == "" {
+			actor.ActorKind = "agent"
+		}
+		if actor.PresenceKind == "" {
+			actor.PresenceKind = "lease"
+		}
+		if actor.ActorKind == "agent" && !actor.Addressable {
+			actor.Addressable = true
+		}
 		e.actors[actor.Address] = actor
+	case "activity.started", "activity.completed":
+		// Legacy execution-presence events from the abandoned Zed ACP
+		// experiment remain journal history but no longer affect coordination.
+		break
+	case "external_change.observed":
+		change, err := decode[protocol.ExternalChange](event)
+		if err != nil {
+			return err
+		}
+		if err := validateExternalChange(change); err != nil {
+			return err
+		}
+		if existing, ok := e.externalChanges[change.ID]; ok && !reflect.DeepEqual(existing, change) {
+			return errors.New("conflicting external change replay")
+		}
+		e.externalChanges[change.ID] = change
+	case "watch.continuity_lost", "watch.continuity_restored":
+		status, err := decode[protocol.WatchContinuity](event)
+		if err != nil {
+			return err
+		}
+		if err := validateWatchContinuity(status); err != nil {
+			return err
+		}
+		status.State = strings.TrimPrefix(event.Type, "watch.continuity_")
+		e.continuity[status.WorkspaceUUID] = status
 	case "intent.started", "intent.completed":
 		intent, err := decode[protocol.Intent](event)
 		if err != nil {
@@ -248,6 +295,11 @@ func (e *Engine) apply(event protocol.Event) error {
 		if err != nil {
 			return err
 		}
+		if request.RepositoryUUID == "" || request.WorkspaceUUID == "" {
+			// Checkpoints written before authority scopes existed remain raw
+			// journal history but cannot participate in current coordination.
+			break
+		}
 		if request.ID == "" || protocol.ValidateUUID(request.RepositoryUUID) != nil || protocol.ValidateUUID(request.WorkspaceUUID) != nil {
 			return errors.New("invalid checkpoint identity")
 		}
@@ -257,7 +309,12 @@ func (e *Engine) apply(event protocol.Event) error {
 		}
 		if request.WorkUnitUUID != "" {
 			unit, ok := e.workUnits[request.WorkUnitUUID]
-			if !ok || unit.RepositoryUUID != request.RepositoryUUID || unit.WorkspaceUUID != request.WorkspaceUUID || !activeWorkUnitParticipant(e, request.WorkUnitUUID, request.Actor) {
+			if !ok {
+				// Legacy checkpoints could carry provisional WorkUnit UUIDs
+				// before WorkUnits existed. Preserve the checkpoint as standalone
+				// during replay; live admission rejects unknown WorkUnits.
+				request.WorkUnitUUID = ""
+			} else if unit.RepositoryUUID != request.RepositoryUUID || unit.WorkspaceUUID != request.WorkspaceUUID || !activeWorkUnitParticipant(e, request.WorkUnitUUID, request.Actor) {
 				return errors.New("invalid checkpoint work unit")
 			}
 		}
@@ -271,6 +328,48 @@ func (e *Engine) apply(event protocol.Event) error {
 			return errors.New("conflicting checkpoint replay")
 		}
 		e.checkpoints[request.ID] = request
+	case "direction.created":
+		created, err := decode[protocol.DirectionCreatedEvent](event)
+		if err != nil {
+			return err
+		}
+		if err := validateDirectionCreation(created.Direction); err != nil {
+			return err
+		}
+		if _, ok := e.actors[created.Direction.CreatedBy]; !ok {
+			return fmt.Errorf("unknown direction creator %q", created.Direction.CreatedBy)
+		}
+		if existing, ok := e.directions[created.Direction.UUID]; ok {
+			if !reflect.DeepEqual(existing, created.Direction) {
+				return fmt.Errorf("direction %q already exists", created.Direction.UUID)
+			}
+			break
+		}
+		e.directions[created.Direction.UUID] = created.Direction
+	case "direction.transitioned":
+		transition, err := decode[protocol.DirectionTransitionEvent](event)
+		if err != nil {
+			return err
+		}
+		direction, ok := e.directions[transition.DirectionUUID]
+		if !ok {
+			return fmt.Errorf("unknown direction %q", transition.DirectionUUID)
+		}
+		if protocol.ValidateUUID(transition.DirectionUUID) != nil || protocol.ValidateUUID(transition.Actor) != nil || transition.At.IsZero() || direction.State != transition.From || !validDirectionTransition(transition.From, transition.To) {
+			return errors.New("invalid direction transition")
+		}
+		if _, ok := e.actors[transition.Actor]; !ok {
+			return fmt.Errorf("unknown actor %q", transition.Actor)
+		}
+		at := transition.At.UTC()
+		direction.State = transition.To
+		direction.UpdatedAt = at
+		if transition.To == protocol.DirectionCompleted {
+			direction.CompletedAt = &at
+		} else {
+			direction.CompletedAt = nil
+		}
+		e.directions[direction.UUID] = direction
 	case "work_unit.created":
 		created, err := decode[protocol.WorkUnitCreatedEvent](event)
 		if err != nil {
@@ -278,6 +377,11 @@ func (e *Engine) apply(event protocol.Event) error {
 		}
 		if err := validateWorkUnitCreation(created.WorkUnit); err != nil {
 			return err
+		}
+		if created.WorkUnit.DirectionUUID != "" {
+			if _, ok := e.directions[created.WorkUnit.DirectionUUID]; !ok {
+				return fmt.Errorf("unknown direction %q", created.WorkUnit.DirectionUUID)
+			}
 		}
 		creator, ok := e.actors[created.WorkUnit.CreatedBy]
 		if !ok || creator.RepositoryUUID != created.WorkUnit.RepositoryUUID || creator.WorkspaceUUID != created.WorkUnit.WorkspaceUUID {
@@ -318,7 +422,7 @@ func (e *Engine) apply(event protocol.Event) error {
 			return fmt.Errorf("unknown work unit %q", transition.WorkUnitUUID)
 		}
 		if protocol.ValidateUUID(transition.WorkUnitUUID) != nil || protocol.ValidateUUID(transition.Actor) != nil || unit.State != transition.From {
-			return fmt.Errorf("invalid work unit transition")
+			return errors.New("invalid work unit transition")
 		}
 		actor, ok := e.actors[transition.Actor]
 		if !ok || !sameWorkUnitScope(unit, actor) || !validWorkUnitTransition(transition.From, transition.To) || !activeWorkUnitParticipant(e, transition.WorkUnitUUID, transition.Actor) {
@@ -374,11 +478,34 @@ func (e *Engine) apply(event protocol.Event) error {
 	return nil
 }
 
+//nolint:gocritic // Validation mirrors the value-based public API.
+func validateActorRegistration(actor protocol.Actor) error {
+	if actor.ActorKind == "unknown" || actor.Address == "" || !actor.Addressable && actor.ActorKind != "" {
+		return errors.New("synthetic unknown actors cannot register")
+	}
+	if actor.Address == "" || actor.Harness == "" || actor.SessionUUID == "" || actor.CWD == "" {
+		return errors.New("address, harness, session_uuid, and cwd are required")
+	}
+	if err := protocol.ValidateUUID(actor.Address); err != nil {
+		return fmt.Errorf("invalid actor address: %w", err)
+	}
+	if err := protocol.ValidateUUID(actor.SessionUUID); err != nil {
+		return fmt.Errorf("invalid actor session_uuid: %w", err)
+	}
+	if actor.Address != actor.SessionUUID {
+		return errors.New("actor address and session_uuid must be equal")
+	}
+	return nil
+}
+
+// Register adds or refreshes an actor session.
+//
+//nolint:gocritic // Public API uses value snapshots.
 func (e *Engine) Register(actor protocol.Actor) (protocol.Actor, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if actor.Address == "" || actor.Harness == "" || actor.SessionUUID == "" || actor.CWD == "" {
-		return protocol.Actor{}, errors.New("address, harness, session_uuid, and cwd are required")
+	if err := validateActorRegistration(actor); err != nil {
+		return protocol.Actor{}, err
 	}
 	previous := e.actors[actor.Address]
 	if actor.Alias == "" {
@@ -395,18 +522,27 @@ func (e *Engine) Register(actor protocol.Actor) (protocol.Actor, error) {
 		actor.State = "waiting"
 	}
 	actor = normalizeActorScope(actor)
+	actor.ActorKind = "agent"
+	actor.Addressable = true
+	actor.PresenceKind = "lease"
 	if err := e.record("actor.upserted", actor); err != nil {
 		return protocol.Actor{}, err
 	}
 	return actor, nil
 }
 
+// Heartbeat refreshes an actor session's presence.
+//
+//nolint:unparam // Return value is part of the public API.
 func (e *Engine) Heartbeat(params protocol.HeartbeatParams) (protocol.Actor, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	actor, ok := e.actors[params.Address]
 	if !ok {
 		return protocol.Actor{}, fmt.Errorf("unknown actor %q", params.Address)
+	}
+	if isUnknownActor(actor) {
+		return protocol.Actor{}, errors.New("unknown actor cannot heartbeat")
 	}
 	actor.HeartbeatAt = e.now().UTC()
 	if params.State != "" {
@@ -436,6 +572,9 @@ func (e *Engine) Heartbeat(params protocol.HeartbeatParams) (protocol.Actor, err
 	return actor, nil
 }
 
+// SetAlias assigns an active actor alias.
+//
+//nolint:unparam // Return value is part of the public API.
 func (e *Engine) SetAlias(address, alias string) (protocol.Actor, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -443,10 +582,14 @@ func (e *Engine) SetAlias(address, alias string) (protocol.Actor, error) {
 	if !ok {
 		return protocol.Actor{}, fmt.Errorf("unknown actor %q", address)
 	}
+	if isUnknownActor(actor) {
+		return protocol.Actor{}, errors.New("unknown actor cannot have an alias")
+	}
 	alias = strings.TrimPrefix(strings.TrimSpace(alias), "@")
 	if alias == "" {
 		return protocol.Actor{}, errors.New("alias is required")
 	}
+	//nolint:gocritic // Intentional value snapshot.
 	for _, candidate := range e.actors {
 		if candidate.Address != address && candidate.Alias == alias && candidate.WorkspaceUUID == actor.WorkspaceUUID && e.active(candidate) {
 			return protocol.Actor{}, fmt.Errorf("alias @%s is already active in workspace %s", alias, actor.WorkspaceUUID)
@@ -460,6 +603,7 @@ func (e *Engine) SetAlias(address, alias string) (protocol.Actor, error) {
 }
 
 func (e *Engine) notifyDeadCollisionsLocked(deadActor string) {
+	//nolint:gocritic // Intentional value snapshot.
 	for _, collision := range e.collisions {
 		if collision.DeadActor != "" || collision.State == protocol.CollisionResolved || (collision.Actors[0] != deadActor && collision.Actors[1] != deadActor) {
 			continue
@@ -473,11 +617,14 @@ func (e *Engine) notifyDeadCollisionsLocked(deadActor string) {
 				continue
 			}
 			message := e.nextMessage("agent-bridge", recipient, "collision-dead", fmt.Sprintf("Agent %s is no longer alive while collision %s remains active on %s. Reassess ownership before continuing.", deadActor, collision.ID, collision.Path), protocol.SendParams{ID: collision.ID + ":dead:" + recipient}, collision.ID)
-			_ = e.enqueue(message)
+			if err := e.enqueue(message); err != nil {
+				continue
+			}
 		}
 	}
 }
 
+//nolint:gocritic // Actor is read as a value to keep presence checks side-effect free.
 func (e *Engine) active(actor protocol.Actor) bool {
 	return actor.State != "dead" && e.now().Sub(actor.HeartbeatAt) <= e.actorTTL
 }
@@ -487,6 +634,7 @@ func (e *Engine) active(actor protocol.Actor) bool {
 // their last state (often "waiting") forever when stale sessions were listed.
 func (e *Engine) expireStaleLocked() {
 	now := e.now().UTC()
+	//nolint:gocritic // Intentional value snapshot written back by address.
 	for address, actor := range e.actors {
 		if actor.State == "dead" || now.Sub(actor.HeartbeatAt) <= e.actorTTL {
 			continue
@@ -501,15 +649,18 @@ func (e *Engine) expireStaleLocked() {
 	}
 }
 
+// Sessions returns actors, optionally including stale sessions.
 func (e *Engine) Sessions(includeStale bool) []protocol.Actor {
 	return e.SessionsScoped(includeStale, protocol.ScopeFilter{})
 }
 
+// SessionsScoped returns actors filtered by authority scope.
 func (e *Engine) SessionsScoped(includeStale bool, scope protocol.ScopeFilter) []protocol.Actor {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.expireStaleLocked()
 	actors := make([]protocol.Actor, 0, len(e.actors))
+	//nolint:gocritic // Intentional value snapshot.
 	for _, actor := range e.actors {
 		if !includeStale && !e.active(actor) {
 			continue
@@ -530,6 +681,7 @@ func (e *Engine) SessionsScoped(includeStale bool, scope protocol.ScopeFilter) [
 }
 
 func (e *Engine) actorTouchesDirectory(address, directory string) bool {
+	//nolint:gocritic // Intentional value snapshot.
 	for _, intent := range e.intents {
 		if intent.Actor != address || !e.intentRecent(intent) {
 			continue
@@ -543,6 +695,7 @@ func (e *Engine) actorTouchesDirectory(address, directory string) bool {
 	return false
 }
 
+//nolint:cyclop,gocognit // Selector matching applies ordered scope fallback rules.
 func (e *Engine) resolve(selector, senderAddress string) (protocol.Actor, error) {
 	normalized := strings.TrimPrefix(strings.TrimSpace(selector), "@")
 	if actor, ok := e.actors[normalized]; ok {
@@ -550,6 +703,7 @@ func (e *Engine) resolve(selector, senderAddress string) (protocol.Actor, error)
 	}
 	sender := e.actors[senderAddress]
 	var matches []protocol.Actor
+	//nolint:gocritic // Intentional value snapshot.
 	for _, actor := range e.actors {
 		matched := actor.SessionUUID == normalized
 		if !matched && actor.JJ != nil {
@@ -587,6 +741,7 @@ func (e *Engine) resolve(selector, senderAddress string) (protocol.Actor, error)
 
 func filterActors(values []protocol.Actor, keep func(protocol.Actor) bool) []protocol.Actor {
 	result := make([]protocol.Actor, 0, len(values))
+	//nolint:gocritic // Intentional value snapshot.
 	for _, actor := range values {
 		if keep(actor) {
 			result = append(result, actor)
@@ -595,6 +750,7 @@ func filterActors(values []protocol.Actor, keep func(protocol.Actor) bool) []pro
 	return result
 }
 
+//nolint:gocritic // Send parameters are consumed as a value snapshot.
 func (e *Engine) nextMessage(from, to, kind, body string, params protocol.SendParams, collisionID string) protocol.Message {
 	e.globalSequence++
 	e.senderSequences[from]++
@@ -619,19 +775,30 @@ func (e *Engine) nextMessage(from, to, kind, body string, params protocol.SendPa
 	}
 }
 
+//nolint:gocritic // Messages are journaled as value snapshots.
 func (e *Engine) enqueue(message protocol.Message) error {
 	return e.record("message.enqueued", message)
 }
 
+// Send enqueues a message for another actor.
+//
+//nolint:cyclop,gocritic // Admission and routing checks remain one atomic operation over a value snapshot.
 func (e *Engine) Send(params protocol.SendParams) (protocol.Message, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, ok := e.actors[params.From]; !ok {
+	sender, ok := e.actors[params.From]
+	if !ok {
 		return protocol.Message{}, fmt.Errorf("unknown sender %q", params.From)
+	}
+	if isUnknownActor(sender) {
+		return protocol.Message{}, errors.New("unknown actor cannot send")
 	}
 	target, err := e.resolve(params.To, params.From)
 	if err != nil {
 		return protocol.Message{}, err
+	}
+	if isUnknownActor(target) {
+		return protocol.Message{}, errors.New("unknown actor cannot receive mailbox messages")
 	}
 	body := strings.TrimSpace(params.Body)
 	if body == "" {
@@ -659,6 +826,7 @@ func (e *Engine) Send(params protocol.SendParams) (protocol.Message, error) {
 }
 
 func (e *Engine) markNegotiating(left, right string) error {
+	//nolint:gocritic // Intentional value snapshot.
 	for _, collision := range e.collisions {
 		if collision.State != protocol.CollisionOpen || !sameActors(collision.Actors, left, right) {
 			continue
@@ -673,11 +841,18 @@ func (e *Engine) markNegotiating(left, right string) error {
 	return nil
 }
 
+// BeginIntent records an intent and detects collisions.
+//
+//nolint:gocritic // Public API uses value snapshots.
 func (e *Engine) BeginIntent(intent protocol.Intent) ([]protocol.Collision, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, ok := e.actors[intent.Actor]; !ok {
+	actor, ok := e.actors[intent.Actor]
+	if !ok {
 		return nil, fmt.Errorf("unknown actor %q", intent.Actor)
+	}
+	if isUnknownActor(actor) {
+		return nil, errors.New("unknown actor cannot begin intents")
 	}
 	if intent.ID == "" || intent.ToolCallID == "" || len(intent.Paths) == 0 {
 		return nil, errors.New("intent id, tool_call_id, and paths are required")
@@ -692,6 +867,11 @@ func (e *Engine) BeginIntent(intent protocol.Intent) ([]protocol.Collision, erro
 	if err := e.record("intent.started", intent); err != nil {
 		return nil, err
 	}
+	return e.beginIntentCollisions(intent)
+}
+
+//nolint:gocritic // Intents are compared as value snapshots.
+func (e *Engine) beginIntentCollisions(intent protocol.Intent) ([]protocol.Collision, error) {
 	var found []protocol.Collision
 	for _, other := range e.intents {
 		if other.ID == intent.ID || other.Actor == intent.Actor || !e.intentRecent(other) {
@@ -711,6 +891,7 @@ func (e *Engine) BeginIntent(intent protocol.Intent) ([]protocol.Collision, erro
 	return uniqueCollisions(found), nil
 }
 
+//nolint:gocritic // Intent is inspected as a value snapshot.
 func (e *Engine) intentRecent(intent protocol.Intent) bool {
 	if intent.ExpiresAt.Before(e.now()) {
 		return false
@@ -718,6 +899,7 @@ func (e *Engine) intentRecent(intent protocol.Intent) bool {
 	return intent.CompletedAt == nil || e.now().Sub(*intent.CompletedAt) <= e.recentWindow
 }
 
+//nolint:gocritic // Intents are compared as value snapshots.
 func (e *Engine) ensureCollision(left, right protocol.Intent, path string) (protocol.Collision, bool, error) {
 	actors := [2]string{left.Actor, right.Actor}
 	intents := [2]string{left.ID, right.ID}
@@ -749,6 +931,7 @@ func (e *Engine) ensureCollision(left, right protocol.Intent, path string) (prot
 	return collision, true, nil
 }
 
+//nolint:gocritic // Collision and intents are consumed as value snapshots.
 func (e *Engine) ensureCollisionSignals(collision protocol.Collision, left, right protocol.Intent) error {
 	byActor := map[string]protocol.Intent{left.Actor: left, right.Actor: right}
 	for _, to := range collision.Actors {
@@ -770,6 +953,7 @@ func (e *Engine) ensureCollisionSignals(collision protocol.Collision, left, righ
 }
 
 func (e *Engine) hasCollisionSignal(collisionID, recipient string) bool {
+	//nolint:gocritic // Intentional value snapshot.
 	for _, message := range e.messages {
 		if message.CollisionID == collisionID && message.To == recipient && message.Kind == "collision" {
 			return true
@@ -778,6 +962,9 @@ func (e *Engine) hasCollisionSignal(collisionID, recipient string) bool {
 	return false
 }
 
+// EndIntent records completion of an intent.
+//
+//nolint:gocritic,unparam // Parameters and return value are part of the public API.
 func (e *Engine) EndIntent(params protocol.IntentEndParams) (protocol.Intent, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -801,6 +988,9 @@ func (e *Engine) EndIntent(params protocol.IntentEndParams) (protocol.Intent, er
 	return intent, nil
 }
 
+// RecordTestResult records a test result for an actor.
+//
+//nolint:cyclop,gocritic,unparam // Validation is kept at the public API boundary.
 func (e *Engine) RecordTestResult(result protocol.TestResult) (protocol.TestResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -843,6 +1033,115 @@ func (e *Engine) RecordTestResult(result protocol.TestResult) (protocol.TestResu
 	return result, nil
 }
 
+//nolint:gocritic // Directions are validated as value snapshots.
+func validateDirectionCreation(direction protocol.Direction) error {
+	if err := protocol.ValidateUUID(direction.UUID); err != nil {
+		return fmt.Errorf("direction_uuid: %w", err)
+	}
+	if strings.TrimSpace(direction.Objective) == "" {
+		return errors.New("objective is required")
+	}
+	if err := protocol.ValidateUUID(direction.CreatedBy); err != nil {
+		return fmt.Errorf("created_by: %w", err)
+	}
+	if direction.State != protocol.DirectionDraft || direction.CreatedAt.IsZero() || direction.UpdatedAt.IsZero() || !direction.UpdatedAt.Equal(direction.CreatedAt) || direction.CompletedAt != nil {
+		return errors.New("invalid direction creation")
+	}
+	return nil
+}
+
+// CreateDirection creates a coordination direction.
+//
+//nolint:gocritic // Directions are consumed as a value snapshot.
+func (e *Engine) CreateDirection(direction protocol.Direction) (protocol.Direction, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := protocol.ValidateUUID(direction.UUID); err != nil {
+		return protocol.Direction{}, fmt.Errorf("direction_uuid: %w", err)
+	}
+	if strings.TrimSpace(direction.Objective) == "" {
+		return protocol.Direction{}, errors.New("objective is required")
+	}
+	if direction.CreatedBy == "" {
+		return protocol.Direction{}, errors.New("created_by is required")
+	}
+	if err := protocol.ValidateUUID(direction.CreatedBy); err != nil {
+		return protocol.Direction{}, fmt.Errorf("created_by: %w", err)
+	}
+	if _, ok := e.actors[direction.CreatedBy]; !ok {
+		return protocol.Direction{}, fmt.Errorf("unknown creator %q", direction.CreatedBy)
+	}
+	direction.State = protocol.DirectionDraft
+	if direction.CreatedAt.IsZero() {
+		direction.CreatedAt = e.now().UTC()
+	}
+	direction.UpdatedAt = direction.CreatedAt
+	direction.CompletedAt = nil
+	if existing, ok := e.directions[direction.UUID]; ok {
+		if reflect.DeepEqual(existing, direction) {
+			return existing, nil
+		}
+		return protocol.Direction{}, fmt.Errorf("direction %q conflicts with existing payload", direction.UUID)
+	}
+	if err := e.record("direction.created", protocol.DirectionCreatedEvent{Direction: direction}); err != nil {
+		return protocol.Direction{}, err
+	}
+	return direction, nil
+}
+
+// Direction returns a direction by UUID.
+func (e *Engine) Direction(uuid string) (protocol.Direction, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	direction, ok := e.directions[uuid]
+	if !ok {
+		return protocol.Direction{}, fmt.Errorf("unknown direction %q", uuid)
+	}
+	return direction, nil
+}
+
+func validDirectionTransition(from, to protocol.DirectionState) bool {
+	allowed := map[protocol.DirectionState]map[protocol.DirectionState]bool{
+		protocol.DirectionDraft:      {protocol.DirectionActive: true, protocol.DirectionAbandoned: true},
+		protocol.DirectionActive:     {protocol.DirectionPaused: true, protocol.DirectionConverging: true, protocol.DirectionAbandoned: true},
+		protocol.DirectionPaused:     {protocol.DirectionActive: true, protocol.DirectionAbandoned: true},
+		protocol.DirectionConverging: {protocol.DirectionActive: true, protocol.DirectionVerified: true, protocol.DirectionAbandoned: true},
+		protocol.DirectionVerified:   {protocol.DirectionCompleted: true, protocol.DirectionAbandoned: true},
+	}
+	return allowed[from][to]
+}
+
+// TransitionDirection changes a direction's lifecycle state.
+func (e *Engine) TransitionDirection(params protocol.DirectionTransitionParams) (protocol.Direction, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	direction, ok := e.directions[params.DirectionUUID]
+	if !ok {
+		return protocol.Direction{}, fmt.Errorf("unknown direction %q", params.DirectionUUID)
+	}
+	if err := protocol.ValidateUUID(params.Actor); err != nil {
+		return protocol.Direction{}, fmt.Errorf("actor: %w", err)
+	}
+	if _, ok := e.actors[params.Actor]; !ok {
+		return protocol.Direction{}, fmt.Errorf("unknown actor %q", params.Actor)
+	}
+	if params.State == direction.State {
+		if direction.State == protocol.DirectionCompleted || direction.State == protocol.DirectionAbandoned {
+			return protocol.Direction{}, errors.New("terminal direction is immutable")
+		}
+		return direction, nil
+	}
+	if !validDirectionTransition(direction.State, params.State) {
+		return protocol.Direction{}, fmt.Errorf("invalid direction transition %s -> %s", direction.State, params.State)
+	}
+	at := e.now().UTC()
+	if err := e.record("direction.transitioned", protocol.DirectionTransitionEvent{DirectionUUID: direction.UUID, Actor: params.Actor, From: direction.State, To: params.State, At: at}); err != nil {
+		return protocol.Direction{}, err
+	}
+	return e.directions[direction.UUID], nil
+}
+
+//nolint:gocritic // Work units are validated as value snapshots.
 func validateWorkUnitStructure(unit protocol.WorkUnit) error {
 	for name, value := range map[string]string{"work_unit_uuid": unit.UUID, "repository_uuid": unit.RepositoryUUID, "workspace_uuid": unit.WorkspaceUUID, "created_by": unit.CreatedBy} {
 		if err := protocol.ValidateUUID(value); err != nil {
@@ -855,9 +1154,15 @@ func validateWorkUnitStructure(unit protocol.WorkUnit) error {
 	return nil
 }
 
+//nolint:gocritic // Work units are validated as value snapshots.
 func validateWorkUnitCreation(unit protocol.WorkUnit) error {
 	if err := validateWorkUnitStructure(unit); err != nil {
 		return err
+	}
+	if unit.DirectionUUID != "" {
+		if err := protocol.ValidateUUID(unit.DirectionUUID); err != nil {
+			return fmt.Errorf("direction_uuid: %w", err)
+		}
 	}
 	if unit.State != protocol.WorkUnitProposed {
 		return errors.New("new work units must be proposed")
@@ -870,10 +1175,14 @@ func activeWorkUnitParticipant(e *Engine, workUnit, actor string) bool {
 	return ok && member.LeftAt == nil && member.ParticipationState == "active"
 }
 
+//nolint:gocritic // Scope comparison is intentionally side-effect free.
 func sameWorkUnitScope(unit protocol.WorkUnit, actor protocol.Actor) bool {
 	return unit.RepositoryUUID == actor.RepositoryUUID && unit.WorkspaceUUID == actor.WorkspaceUUID
 }
 
+// CreateWorkUnit creates a work unit.
+//
+//nolint:cyclop,gocritic // Validation and idempotency are kept at the public API boundary.
 func (e *Engine) CreateWorkUnit(unit protocol.WorkUnit) (protocol.WorkUnit, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -913,12 +1222,21 @@ func (e *Engine) CreateWorkUnit(unit protocol.WorkUnit) (protocol.WorkUnit, erro
 		unit.CreatedAt = e.now().UTC()
 	}
 	unit.UpdatedAt = unit.CreatedAt
+	if err := validateWorkUnitCreation(unit); err != nil {
+		return protocol.WorkUnit{}, err
+	}
+	if unit.DirectionUUID != "" {
+		if _, ok := e.directions[unit.DirectionUUID]; !ok {
+			return protocol.WorkUnit{}, fmt.Errorf("unknown direction %q", unit.DirectionUUID)
+		}
+	}
 	if err := e.record("work_unit.created", protocol.WorkUnitCreatedEvent{WorkUnit: unit}); err != nil {
 		return protocol.WorkUnit{}, err
 	}
 	return unit, nil
 }
 
+// WorkUnit returns a work unit and its participants.
 func (e *Engine) WorkUnit(uuid string) (protocol.WorkUnit, []protocol.WorkUnitActor, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -934,6 +1252,9 @@ func (e *Engine) WorkUnit(uuid string) (protocol.WorkUnit, []protocol.WorkUnitAc
 	return unit, actors, nil
 }
 
+// UpdateWorkUnit updates mutable work unit fields.
+//
+//nolint:cyclop,gocritic // Validation and mutation are kept atomic under one lock.
 func (e *Engine) UpdateWorkUnit(params protocol.WorkUnitUpdateParams) (protocol.WorkUnit, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -974,6 +1295,9 @@ func (e *Engine) UpdateWorkUnit(params protocol.WorkUnitUpdateParams) (protocol.
 	return result, nil
 }
 
+// JoinWorkUnit adds an actor to a work unit.
+//
+//nolint:unparam // Return value is part of the public API.
 func (e *Engine) JoinWorkUnit(params protocol.WorkUnitActorParams) (protocol.WorkUnitActor, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1005,6 +1329,7 @@ func (e *Engine) JoinWorkUnit(params protocol.WorkUnitActorParams) (protocol.Wor
 	return result, nil
 }
 
+// LeaveWorkUnit removes an actor from a work unit.
 func (e *Engine) LeaveWorkUnit(params protocol.WorkUnitActorParams) (protocol.WorkUnitActor, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1021,7 +1346,7 @@ func (e *Engine) LeaveWorkUnit(params protocol.WorkUnitActorParams) (protocol.Wo
 	}
 	current, ok := e.workUnitActors[params.WorkUnitUUID][params.Actor]
 	if !ok || current.LeftAt != nil {
-		return protocol.WorkUnitActor{}, fmt.Errorf("actor is not an active work unit participant")
+		return protocol.WorkUnitActor{}, errors.New("actor is not an active work unit participant")
 	}
 	at := e.now().UTC()
 	previous := current
@@ -1047,6 +1372,9 @@ func validWorkUnitTransition(from, to protocol.WorkUnitState) bool {
 	return false
 }
 
+// TransitionWorkUnit changes a work unit's lifecycle state.
+//
+//nolint:unparam // Return value is part of the public API.
 func (e *Engine) TransitionWorkUnit(params protocol.WorkUnitTransitionParams) (protocol.WorkUnit, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1077,6 +1405,9 @@ func (e *Engine) TransitionWorkUnit(params protocol.WorkUnitTransitionParams) (p
 	return e.workUnits[unit.UUID], nil
 }
 
+// RequestCheckpoint admits a checkpoint request.
+//
+//nolint:cyclop,gocognit,funlen,gocritic,maintidx // Checkpoint admission validates scope, evidence, and idempotency together.
 func (e *Engine) RequestCheckpoint(request protocol.CheckpointRequest) (protocol.CheckpointRequest, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1140,6 +1471,7 @@ func (e *Engine) RequestCheckpoint(request protocol.CheckpointRequest) (protocol
 	}
 	if request.JournalStart == 0 {
 		var priorEnd uint64
+		//nolint:gocritic // Intentional value snapshot.
 		for _, previous := range e.checkpoints {
 			if previous.Actor == request.Actor && previous.SessionGeneration == request.SessionGeneration &&
 				previous.RepositoryUUID == request.RepositoryUUID && previous.WorkspaceUUID == request.WorkspaceUUID &&
@@ -1156,7 +1488,7 @@ func (e *Engine) RequestCheckpoint(request protocol.CheckpointRequest) (protocol
 	if request.JournalStart > request.JournalEnd {
 		return protocol.CheckpointRequest{}, errors.New("checkpoint journal range is invalid")
 	}
-	derive := func(ids *[]string, sequences map[string]uint64, relevant func(string) bool) error {
+	derive := func(ids *[]string, sequences map[string]uint64, relevant func(string) bool) {
 		if len(*ids) == 0 {
 			for id, sequence := range sequences {
 				if sequence >= request.JournalStart && sequence <= request.JournalEnd && relevant(id) {
@@ -1170,32 +1502,23 @@ func (e *Engine) RequestCheckpoint(request protocol.CheckpointRequest) (protocol
 				return sequences[(*ids)[i]] < sequences[(*ids)[j]]
 			})
 		}
-		return nil
 	}
-	if err := derive(&request.MutationIDs, e.intentSequence, func(id string) bool {
+	derive(&request.MutationIDs, e.intentSequence, func(id string) bool {
 		intent, ok := e.intents[id]
 		return ok && intent.CompletedAt != nil && intent.Actor == request.Actor && intent.RepositoryUUID == request.RepositoryUUID && intent.WorkspaceUUID == request.WorkspaceUUID
-	}); err != nil {
-		return protocol.CheckpointRequest{}, err
-	}
-	if err := derive(&request.MessageIDs, e.messageSequence, func(id string) bool {
+	})
+	derive(&request.MessageIDs, e.messageSequence, func(id string) bool {
 		message, ok := e.messages[id]
 		return ok && (message.From == request.Actor || message.To == request.Actor)
-	}); err != nil {
-		return protocol.CheckpointRequest{}, err
-	}
-	if err := derive(&request.CollisionIDs, e.collisionSequence, func(id string) bool {
+	})
+	derive(&request.CollisionIDs, e.collisionSequence, func(id string) bool {
 		collision, ok := e.collisions[id]
 		return ok && (collision.Actors[0] == request.Actor || collision.Actors[1] == request.Actor)
-	}); err != nil {
-		return protocol.CheckpointRequest{}, err
-	}
-	if err := derive(&request.TestResultIDs, e.testResultSequence, func(id string) bool {
+	})
+	derive(&request.TestResultIDs, e.testResultSequence, func(id string) bool {
 		result, ok := e.testResults[id]
 		return ok && result.Actor == request.Actor && result.RepositoryUUID == request.RepositoryUUID && result.WorkspaceUUID == request.WorkspaceUUID
-	}); err != nil {
-		return protocol.CheckpointRequest{}, err
-	}
+	})
 	if err := e.validateCheckpointReferences(request); err != nil {
 		return protocol.CheckpointRequest{}, err
 	}
@@ -1222,6 +1545,7 @@ func (e *Engine) RequestCheckpoint(request protocol.CheckpointRequest) (protocol
 	return request, nil
 }
 
+//nolint:cyclop,gocritic // Evidence is collected from each journal index in sequence order.
 func earliestCheckpointEvidence(e *Engine, request protocol.CheckpointRequest) uint64 {
 	earliest := request.JournalEnd
 	found := false
@@ -1249,6 +1573,7 @@ func earliestCheckpointEvidence(e *Engine, request protocol.CheckpointRequest) u
 	return earliest
 }
 
+//nolint:cyclop,gocognit,gocritic // Each reference type has distinct scope and journal rules.
 func (e *Engine) validateCheckpointReferences(request protocol.CheckpointRequest) error {
 	checkRange := func(kind, id string, sequence uint64) error {
 		if sequence < request.JournalStart || sequence > request.JournalEnd {
@@ -1298,11 +1623,13 @@ func (e *Engine) validateCheckpointReferences(request protocol.CheckpointRequest
 	return nil
 }
 
+//nolint:gocritic // Requests are validated as value snapshots.
 func validateCheckpointClaims(request protocol.CheckpointRequest, results map[string]protocol.TestResult) error {
-	copy := request
-	return normalizeCheckpointClaims(&copy, results)
+	claims := request
+	return normalizeCheckpointClaims(&claims, results)
 }
 
+//nolint:cyclop,gocognit // Claim normalization applies protocol-specific evidence rules.
 func normalizeCheckpointClaims(request *protocol.CheckpointRequest, results map[string]protocol.TestResult) error {
 	if request.Metadata != nil && len(request.Claims) == 0 && strings.TrimSpace(request.Metadata["summary"]) != "" {
 		request.Claims = []protocol.CheckpointClaim{{Kind: "summary", Statement: strings.TrimSpace(request.Metadata["summary"]), Status: protocol.ClaimAsserted}}
@@ -1358,6 +1685,9 @@ func normalizeCheckpointClaims(request *protocol.CheckpointRequest, results map[
 	return nil
 }
 
+// RecordSessionEvent records a session event.
+//
+//nolint:gocritic,unparam // Event and return value are part of the public API.
 func (e *Engine) RecordSessionEvent(event protocol.SessionEvent) (protocol.SessionEvent, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1376,11 +1706,16 @@ func (e *Engine) RecordSessionEvent(event protocol.SessionEvent) (protocol.Sessi
 	return event, nil
 }
 
+// Poll returns messages waiting for an actor.
 func (e *Engine) Poll(actor string, limit int) ([]protocol.Message, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, ok := e.actors[actor]; !ok {
+	registered, ok := e.actors[actor]
+	if !ok {
 		return nil, fmt.Errorf("unknown actor %q", actor)
+	}
+	if isUnknownActor(registered) {
+		return nil, errors.New("unknown actor cannot poll mailbox")
 	}
 	e.expireStaleLocked()
 	messages := make([]protocol.Message, 0)
@@ -1399,11 +1734,13 @@ func (e *Engine) Poll(actor string, limit int) ([]protocol.Message, error) {
 	return result, nil
 }
 
+//nolint:cyclop,gocognit // Ordering performs per-sender sorting followed by a k-way merge.
 func orderMailbox(messages []protocol.Message) []protocol.Message {
 	if len(messages) < 2 {
 		return messages
 	}
 	groups := make(map[string][]protocol.Message)
+	//nolint:gocritic // Intentional value snapshot.
 	for _, message := range messages {
 		groups[message.From] = append(groups[message.From], message)
 	}
@@ -1450,21 +1787,36 @@ type ackEvent struct {
 	At         time.Time `json:"at"`
 }
 
+// Ack acknowledges messages for an actor.
 func (e *Engine) Ack(params protocol.AckParams) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, ok := e.actors[params.Actor]; !ok {
+	registered, ok := e.actors[params.Actor]
+	if !ok {
 		return fmt.Errorf("unknown actor %q", params.Actor)
+	}
+	if isUnknownActor(registered) {
+		return errors.New("unknown actor cannot acknowledge mailbox")
 	}
 	return e.record("message.acked", ackEvent{Actor: params.Actor, MessageIDs: params.MessageIDs, At: e.now().UTC()})
 }
 
+// Transition changes a collision lifecycle state.
+//
+//nolint:cyclop,gocognit,gocritic,unparam // Collision transitions enforce state-specific authorization rules.
 func (e *Engine) Transition(params protocol.TransitionParams) (protocol.Collision, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	collision, ok := e.collisions[params.CollisionID]
 	if !ok {
 		return protocol.Collision{}, fmt.Errorf("unknown collision %q", params.CollisionID)
+	}
+	actor, exists := e.actors[params.Actor]
+	if !exists {
+		return protocol.Collision{}, fmt.Errorf("unknown actor %q", params.Actor)
+	}
+	if isUnknownActor(actor) {
+		return protocol.Collision{}, errors.New("unknown actor cannot override collision")
 	}
 	if params.Actor != collision.Actors[0] && params.Actor != collision.Actors[1] {
 		return protocol.Collision{}, errors.New("actor is not a collision participant")
@@ -1535,6 +1887,7 @@ func intersect(left, right []string) []string {
 func uniqueCollisions(values []protocol.Collision) []protocol.Collision {
 	seen := make(map[string]struct{}, len(values))
 	result := make([]protocol.Collision, 0, len(values))
+	//nolint:gocritic // Intentional value snapshot.
 	for _, value := range values {
 		if _, ok := seen[value.ID]; ok {
 			continue

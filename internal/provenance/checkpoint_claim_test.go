@@ -1,6 +1,7 @@
 package provenance
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -20,7 +21,11 @@ func TestCheckpointClaimsRejectMalformedKindStatusAndOrdinal(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer database.Close()
+			defer func() {
+				if err := database.Close(); err != nil {
+					t.Errorf("close database: %v", err)
+				}
+			}()
 			request := base
 			request.ID = "malformed-" + name
 			request.Claims = []protocol.CheckpointClaim{claim}
@@ -36,7 +41,11 @@ func TestCheckpointClaimLegacyMetadataBackfillsQueryableClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
 	request := protocol.CheckpointRequest{ID: "legacy", Actor: "01234567-89ab-4def-8123-456789abcdef", RepositoryUUID: "11111111-1111-5111-8111-111111111111", WorkspaceUUID: "22222222-2222-5222-8222-222222222222", CheckpointKind: "settled", Metadata: map[string]string{"summary": "legacy summary"}}
 	if err := database.Project(event(t, 1, "checkpoint.requested", request)); err != nil {
 		t.Fatal(err)
@@ -55,11 +64,15 @@ func TestCheckpointClaimVerifiedDowngradesFailedAndMissingResults(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
 	actor := "01234567-89ab-4def-8123-456789abcdef"
 	repo := "11111111-1111-5111-8111-111111111111"
 	workspace := "22222222-2222-5222-8222-222222222222"
-	if _, err := database.db.Exec(`INSERT INTO test_results(id, actor, session_generation, command, cwd, completed_at, started_at, output_truncated, repository_uuid, workspace_uuid, data, event_sequence, exit_code) VALUES ('failed', ?, 1, 'go test', '/', 'now', 'now', 0, ?, ?, '{}', 2, 1)`, uuidBlob(actor), uuidBlob(repo), uuidBlob(workspace)); err != nil {
+	if _, err := database.db.ExecContext(context.Background(), `INSERT INTO test_results(id, actor, session_generation, command, cwd, completed_at, started_at, output_truncated, repository_uuid, workspace_uuid, data, event_sequence, exit_code) VALUES ('failed', ?, 1, 'go test', '/', 'now', 'now', 0, ?, ?, '{}', 2, 1)`, uuidBlob(actor), uuidBlob(repo), uuidBlob(workspace)); err != nil {
 		t.Fatal(err)
 	}
 	request := protocol.CheckpointRequest{ID: "failed-result", Actor: actor, RepositoryUUID: repo, WorkspaceUUID: workspace, CheckpointKind: "settled", JournalStart: 1, JournalEnd: 2, TestResultIDs: []string{"failed"}, Claims: []protocol.CheckpointClaim{{Kind: "test", Statement: "passes", Status: protocol.ClaimVerified, Evidence: []protocol.CheckpointEvidenceRef{{Kind: "test_result", Ordinal: 0}}}}}
@@ -67,7 +80,7 @@ func TestCheckpointClaimVerifiedDowngradesFailedAndMissingResults(t *testing.T) 
 		t.Fatal(err)
 	}
 	var status string
-	if err := database.db.QueryRow(`SELECT status FROM checkpoint_claims WHERE checkpoint_id='failed-result'`).Scan(&status); err != nil {
+	if err := database.db.QueryRowContext(context.Background(), `SELECT status FROM checkpoint_claims WHERE checkpoint_id='failed-result'`).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
 	if status != string(protocol.ClaimAsserted) {
@@ -81,24 +94,29 @@ func TestCheckpointClaimVerifiedDowngradesFailedAndMissingResults(t *testing.T) 
 	}
 }
 
+//nolint:cyclop,gocognit // end-to-end test keeps setup and assertions together.
 func TestCheckpointClaimQueryEvidenceOrderingAndSchemaForeignKeys(t *testing.T) {
 	database, err := Open(filepath.Join(t.TempDir(), "claims.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
 	request := protocol.CheckpointRequest{ID: "ordering", Actor: "01234567-89ab-4def-8123-456789abcdef", RepositoryUUID: "11111111-1111-5111-8111-111111111111", WorkspaceUUID: "22222222-2222-5222-8222-222222222222", CheckpointKind: "settled"}
 	if err := database.Project(event(t, 1, "checkpoint.requested", request)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.db.Exec(`INSERT INTO checkpoint_claims(checkpoint_id, ordinal, kind, statement, status) VALUES ('ordering', 0, 'summary', 'ordered', 'asserted')`); err != nil {
+	if _, err := database.db.ExecContext(context.Background(), `INSERT INTO checkpoint_claims(checkpoint_id, ordinal, kind, statement, status) VALUES ('ordering', 0, 'summary', 'ordered', 'asserted')`); err != nil {
 		t.Fatal(err)
 	}
 	for _, ref := range []protocol.CheckpointEvidenceRef{{Kind: "test_result", Ordinal: 0}, {Kind: "mutation", Ordinal: 0}, {Kind: "message", Ordinal: 0}} {
-		if _, err := database.db.Exec(`INSERT INTO checkpoint_evidence(checkpoint_id, kind, ordinal, ref_text, ref_uuid) VALUES ('ordering', ?, ?, ?, NULL)`, ref.Kind, ref.Ordinal, ref.Kind+"-ref"); err != nil {
+		if _, err := database.db.ExecContext(context.Background(), `INSERT INTO checkpoint_evidence(checkpoint_id, kind, ordinal, ref_text, ref_uuid) VALUES ('ordering', ?, ?, ?, NULL)`, ref.Kind, ref.Ordinal, ref.Kind+"-ref"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := database.db.Exec(`INSERT INTO checkpoint_claim_evidence(checkpoint_id, claim_ordinal, evidence_kind, evidence_ordinal) VALUES ('ordering', 0, ?, ?)`, ref.Kind, ref.Ordinal); err != nil {
+		if _, err := database.db.ExecContext(context.Background(), `INSERT INTO checkpoint_claim_evidence(checkpoint_id, claim_ordinal, evidence_kind, evidence_ordinal) VALUES ('ordering', 0, ?, ?)`, ref.Kind, ref.Ordinal); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -112,11 +130,15 @@ func TestCheckpointClaimQueryEvidenceOrderingAndSchemaForeignKeys(t *testing.T) 
 			t.Fatalf("evidence[%d] = %#v, want kind %q", i, ref, want[i])
 		}
 	}
-	rows, err := database.db.Query(`PRAGMA foreign_key_check`)
+	rows, err := database.db.QueryContext(context.Background(), `PRAGMA foreign_key_check`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close rows: %v", err)
+		}
+	}()
 	if rows.Next() {
 		t.Fatal("schema has foreign key violations")
 	}
@@ -125,12 +147,17 @@ func TestCheckpointClaimQueryEvidenceOrderingAndSchemaForeignKeys(t *testing.T) 
 	}
 }
 
+//nolint:cyclop,gocognit // end-to-end test keeps setup and assertions together.
 func TestCheckpointClaimOutcomesPersistAndEnforceEvidence(t *testing.T) {
 	database, err := Open(filepath.Join(t.TempDir(), "claims.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
 	actor := "01234567-89ab-4def-8123-456789abcdef"
 	repo := "11111111-1111-5111-8111-111111111111"
 	workspace := "22222222-2222-5222-8222-222222222222"
@@ -168,11 +195,15 @@ func TestCheckpointClaimOutcomesPersistAndEnforceEvidence(t *testing.T) {
 			t.Fatalf("claim %d status = %q, want %q", i, got.Claims[i].Status, status)
 		}
 	}
-	rows, err := database.db.Query(`SELECT outcome FROM test_results ORDER BY event_sequence`)
+	rows, err := database.db.QueryContext(context.Background(), `SELECT outcome FROM test_results ORDER BY event_sequence`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close rows: %v", err)
+		}
+	}()
 	for i, outcome := range []protocol.TestOutcome{protocol.TestPassed, protocol.TestFailed, protocol.TestBlocked} {
 		if !rows.Next() {
 			t.Fatalf("missing outcome row %d", i)
@@ -181,6 +212,9 @@ func TestCheckpointClaimOutcomesPersistAndEnforceEvidence(t *testing.T) {
 		if err := rows.Scan(&stored); err != nil || stored != outcome {
 			t.Fatalf("stored outcome %d = %q, err=%v", i, stored, err)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 	inconsistent := protocol.TestResult{ID: "bad", Actor: actor, Command: "go test", ExitCode: &zero, Outcome: protocol.TestFailed, RepositoryUUID: repo, WorkspaceUUID: workspace}
 	if err := database.Project(event(t, 5, "test.result", inconsistent)); err == nil {
@@ -193,8 +227,12 @@ func TestCheckpointClaimEvidenceHasCompositeForeignKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
-	if _, err := database.db.Exec(`INSERT INTO checkpoint_claim_evidence(checkpoint_id, claim_ordinal, evidence_kind, evidence_ordinal) VALUES ('missing', 0, 'test_result', 0)`); err == nil {
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
+	if _, err := database.db.ExecContext(context.Background(), `INSERT INTO checkpoint_claim_evidence(checkpoint_id, claim_ordinal, evidence_kind, evidence_ordinal) VALUES ('missing', 0, 'test_result', 0)`); err == nil {
 		t.Fatal("orphan claim evidence was accepted")
 	}
 }
@@ -204,7 +242,11 @@ func TestCheckpointClaimConflictIsExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
 	base := protocol.CheckpointRequest{ID: "exact", Actor: "01234567-89ab-4def-8123-456789abcdef", RepositoryUUID: "11111111-1111-5111-8111-111111111111", WorkspaceUUID: "22222222-2222-5222-8222-222222222222", CheckpointKind: "settled", Claims: []protocol.CheckpointClaim{{Kind: "summary", Statement: "one", Status: protocol.ClaimAsserted}}}
 	if err := database.Project(event(t, 1, "checkpoint.requested", base)); err != nil {
 		t.Fatal(err)

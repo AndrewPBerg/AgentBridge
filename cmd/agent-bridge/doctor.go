@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
@@ -30,6 +31,12 @@ type doctorFailure struct{}
 
 func (doctorFailure) Error() string { return "doctor found deployment problems" }
 
+func closeQuietly(c io.Closer) {
+	if err := c.Close(); err != nil {
+		return
+	}
+}
+
 func doctor(args []string) error {
 	if len(args) != 0 {
 		return errors.New("usage: agent-bridge doctor")
@@ -41,6 +48,7 @@ func doctor(args []string) error {
 	report.checkPath("journal", defaultJournal(), false)
 	report.checkPath("database", defaultDatabase(), false)
 	report.checkSocket(defaultSocket())
+	report.checkWatchman()
 	report.checkDeployment()
 	if jsonOutput {
 		if err := printJSON(map[string]any{"ok": !report.failed, "checks": report.checks}); err != nil {
@@ -78,18 +86,18 @@ func (r *doctorReport) checkPath(label, path string, directory bool) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			r.warn(label, fmt.Sprintf("missing: %s", path))
+			r.warn(label, "missing: "+path)
 			return
 		}
 		r.fail(label, fmt.Sprintf("cannot inspect %s: %v", path, err))
 		return
 	}
 	if directory && !info.IsDir() {
-		r.fail(label, fmt.Sprintf("not a directory: %s", path))
+		r.fail(label, "not a directory: "+path)
 		return
 	}
 	if !directory && info.IsDir() {
-		r.fail(label, fmt.Sprintf("is a directory: %s", path))
+		r.fail(label, "is a directory: "+path)
 		return
 	}
 	if info.Mode().Perm()&0o077 != 0 {
@@ -123,6 +131,26 @@ func (r *doctorReport) checkSocket(path string) {
 	r.ok("daemon", "responding on "+path)
 }
 
+func (r *doctorReport) checkWatchman() {
+	binary, err := exec.LookPath("watchman")
+	if err != nil {
+		r.warn("Watchman", "executable not found; external-change provenance is disabled")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, binary, "version").CombinedOutput()
+	if err != nil {
+		r.warn("Watchman", fmt.Sprintf("version check failed: %v", err))
+		return
+	}
+	detail := strings.TrimSpace(string(output))
+	if len(detail) > 160 {
+		detail = detail[:160] + "…"
+	}
+	r.ok("Watchman", binary+" "+detail)
+}
+
 func (r *doctorReport) checkDeployment() {
 	sourceRoot := sourceRoot()
 	if sourceRoot == "" {
@@ -139,10 +167,10 @@ func (r *doctorReport) checkDeployment() {
 		piHome = filepath.Join(home, ".pi")
 	}
 	targetRoot := filepath.Join(piHome, "agent")
-	compareTrees(r, "Pi adapter", filepath.Join(sourceRoot, "packages/pi-extension"), filepath.Join(targetRoot, "extensions", "agent-bridge"), []string{
+	compareTrees(r, "Pi adapter", filepath.Join(sourceRoot, "packages", "pi-extension"), filepath.Join(targetRoot, "extensions", "agent-bridge"), []string{
 		"client.ts", "git.ts", "herdr.ts", "index.ts", "intent.ts", "jj.ts", "provenance.ts", "protocol.ts", "talk-modal.ts", "README.md",
 	})
-	compareTrees(r, "Pi skill", filepath.Join(sourceRoot, "skills/agent-bridge"), filepath.Join(targetRoot, "skills", "agent-bridge"), []string{
+	compareTrees(r, "Pi skill", filepath.Join(sourceRoot, "skills", "agent-bridge"), filepath.Join(targetRoot, "skills", "agent-bridge"), []string{
 		"SKILL.md", "references/provenance.md",
 	})
 }
@@ -156,7 +184,7 @@ func sourceRoot() string {
 		return ""
 	}
 	for current := cwd; current != filepath.Dir(current); current = filepath.Dir(current) {
-		if _, err := os.Stat(filepath.Join(current, "packages/pi-extension")); err == nil {
+		if _, err := os.Stat(filepath.Join(current, "packages", "pi-extension")); err == nil {
 			return current
 		}
 	}
@@ -173,18 +201,26 @@ func compareTrees(r *doctorReport, label, source, target string, files []string)
 		}
 	}
 	if len(mismatches) > 0 {
-		r.fail(label, fmt.Sprintf("installed files differ or are missing: %s", strings.Join(mismatches, ", ")))
+		r.fail(label, "installed files differ or are missing: "+strings.Join(mismatches, ", "))
 		return
 	}
 	r.ok(label, "installed files match source")
 }
 
 func fileHash(path string) ([sha256.Size]byte, error) {
-	file, err := os.Open(path)
+	cleanPath := filepath.Clean(path)
+	if cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
+		return [sha256.Size]byte{}, errors.New("path traversal is not allowed")
+	}
+	absolutePath, err := filepath.Abs(cleanPath)
 	if err != nil {
 		return [sha256.Size]byte{}, err
 	}
-	defer file.Close()
+	file, err := os.Open(filepath.Clean(absolutePath))
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	defer closeQuietly(file)
 	hash := sha256.New()
 	if _, err := io.Copy(hash, file); err != nil {
 		return [sha256.Size]byte{}, err

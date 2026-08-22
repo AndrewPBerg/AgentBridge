@@ -1,6 +1,7 @@
 package provenance
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -25,7 +26,11 @@ func TestCheckpointProjectionRejectsInvalidUUIDs(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer database.Close()
+			defer func() {
+				if err := database.Close(); err != nil {
+					t.Errorf("close database: %v", err)
+				}
+			}()
 			checkpoint := base
 			mutate(&checkpoint)
 			if err := database.Project(event(t, 1, "checkpoint.requested", checkpoint)); err == nil {
@@ -35,12 +40,64 @@ func TestCheckpointProjectionRejectsInvalidUUIDs(t *testing.T) {
 	}
 }
 
+func TestCheckpointProjectionPrunesLegacyPreScopeCheckpoint(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "legacy-pre-scope.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
+	checkpoint := protocol.CheckpointRequest{
+		ID: "legacy-pre-scope", Actor: "pi:01234567-89ab-4def-8123-456789abcdef", CheckpointKind: "settled",
+	}
+	if err := database.Project(event(t, 1, "checkpoint.requested", checkpoint)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Checkpoint(checkpoint.ID); err == nil {
+		t.Fatal("legacy pre-scope checkpoint was projected")
+	}
+}
+
+func TestCheckpointProjectionBackfillsLegacyUnknownWorkUnitAsStandalone(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "legacy-work-unit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
+	checkpoint := protocol.CheckpointRequest{
+		ID: "legacy-standalone", Actor: "01234567-89ab-4def-8123-456789abcdef", SessionGeneration: 1,
+		RepositoryUUID: "11111111-1111-5111-8111-111111111111", WorkspaceUUID: "22222222-2222-5222-8222-222222222222",
+		WorkUnitUUID: "33333333-3333-5333-8333-333333333333", CheckpointKind: "settled", JournalStart: 1, JournalEnd: 1,
+	}
+	if err := database.Project(event(t, 1, "checkpoint.requested", checkpoint)); err != nil {
+		t.Fatal(err)
+	}
+	projected, err := database.Checkpoint(checkpoint.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projected.WorkUnitUUID != "" {
+		t.Fatalf("legacy unknown WorkUnit relation was retained: %#v", projected)
+	}
+}
+
 func TestCheckpointProjectionAcceptsFirstMultiResultRangeAndReplay(t *testing.T) {
 	database, err := Open(filepath.Join(t.TempDir(), "checkpoint-range.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
 	actor := "01234567-89ab-4def-8123-456789abcdef"
 	repo := "11111111-1111-5111-8111-111111111111"
 	workspace := "22222222-2222-5222-8222-222222222222"
@@ -67,11 +124,20 @@ func TestCheckpointProjectionAcceptsFirstMultiResultRangeAndReplay(t *testing.T)
 }
 
 func TestCheckpointProjectionStoresDeclarationAndSupportsWorkUnitQueries(t *testing.T) {
+	database, checkpoint := setupCheckpointQueryFixture(t)
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
+	assertCheckpointQuery(t, database, &checkpoint)
+}
+
+func setupCheckpointQueryFixture(t *testing.T) (*DB, protocol.CheckpointRequest) {
 	database, err := Open(filepath.Join(t.TempDir(), "agent-bridge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
 
 	checkpoint := protocol.CheckpointRequest{
 		ID: "one", Actor: "01234567-89ab-4def-8123-456789abcdef", DeclaredBy: "human",
@@ -91,19 +157,19 @@ func TestCheckpointProjectionStoresDeclarationAndSupportsWorkUnitQueries(t *test
 		t.Fatal(err)
 	}
 	actorBlob := uuidBlob(checkpoint.Actor)
-	if _, err := database.db.Exec(`INSERT INTO mutations(id, actor, session_generation, tool_call_id, tool, operation, cwd, workspace_key, paths_json, relative_paths_json, started_at, completed_at, before_json, after_json, updated_sequence, repository_uuid, workspace_uuid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "mutation-1", actorBlob, 1, "call", "tool", "op", "/", "workspace", "[]", "[]", at.Format(time.RFC3339Nano), at.Format(time.RFC3339Nano), "[]", "[]", 10, uuidBlob(checkpoint.RepositoryUUID), uuidBlob(checkpoint.WorkspaceUUID)); err != nil {
+	if _, err := database.db.ExecContext(context.Background(), `INSERT INTO mutations(id, actor, session_generation, tool_call_id, tool, operation, cwd, workspace_key, paths_json, relative_paths_json, started_at, completed_at, before_json, after_json, updated_sequence, repository_uuid, workspace_uuid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "mutation-1", actorBlob, 1, "call", "tool", "op", "/", "workspace", "[]", "[]", at.Format(time.RFC3339Nano), at.Format(time.RFC3339Nano), "[]", "[]", 10, uuidBlob(checkpoint.RepositoryUUID), uuidBlob(checkpoint.WorkspaceUUID)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.db.Exec(`INSERT INTO messages(id, kind, from_actor, to_actor, body, global_sequence, sender_sequence, recipient_sequence, created_at, data, event_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "message-1", "note", actorBlob, actorBlob, "body", 1, 1, 1, at.Format(time.RFC3339Nano), "{}", 11); err != nil {
+	if _, err := database.db.ExecContext(context.Background(), `INSERT INTO messages(id, kind, from_actor, to_actor, body, global_sequence, sender_sequence, recipient_sequence, created_at, data, event_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "message-1", "note", actorBlob, actorBlob, "body", 1, 1, 1, at.Format(time.RFC3339Nano), "{}", 11); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.db.Exec(`INSERT INTO collisions(id, path, state, created_at, updated_at, data, updated_sequence) VALUES (?, ?, ?, ?, ?, ?, ?)`, []byte("collision-1"), "/", "open", at.Format(time.RFC3339Nano), at.Format(time.RFC3339Nano), "{}", 12); err != nil {
+	if _, err := database.db.ExecContext(context.Background(), `INSERT INTO collisions(id, path, state, created_at, updated_at, data, updated_sequence) VALUES (?, ?, ?, ?, ?, ?, ?)`, []byte("collision-1"), "/", "open", at.Format(time.RFC3339Nano), at.Format(time.RFC3339Nano), "{}", 12); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.db.Exec(`INSERT INTO collision_actors(collision_id, ordinal, session_uuid) VALUES (?, ?, ?)`, []byte("collision-1"), 0, actorBlob); err != nil {
+	if _, err := database.db.ExecContext(context.Background(), `INSERT INTO collision_actors(collision_id, ordinal, session_uuid) VALUES (?, ?, ?)`, []byte("collision-1"), 0, actorBlob); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.db.Exec(`INSERT INTO test_results(id, actor, session_generation, command, cwd, completed_at, started_at, output_truncated, repository_uuid, workspace_uuid, data, event_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "test-1", actorBlob, 1, "go test", "/", at.Format(time.RFC3339Nano), at.Format(time.RFC3339Nano), 0, uuidBlob(checkpoint.RepositoryUUID), uuidBlob(checkpoint.WorkspaceUUID), "{}", 10); err != nil {
+	if _, err := database.db.ExecContext(context.Background(), `INSERT INTO test_results(id, actor, session_generation, command, cwd, completed_at, started_at, output_truncated, repository_uuid, workspace_uuid, data, event_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "test-1", actorBlob, 1, "go test", "/", at.Format(time.RFC3339Nano), at.Format(time.RFC3339Nano), 0, uuidBlob(checkpoint.RepositoryUUID), uuidBlob(checkpoint.WorkspaceUUID), "{}", 10); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.Project(event(t, 13, "checkpoint.requested", checkpoint)); err != nil {
@@ -113,6 +179,16 @@ func TestCheckpointProjectionStoresDeclarationAndSupportsWorkUnitQueries(t *test
 		t.Fatal(err)
 	}
 
+	return database, checkpoint
+}
+
+func assertCheckpointQuery(t *testing.T, database *DB, checkpoint *protocol.CheckpointRequest) {
+	assertProjectedCheckpointRecord(t, database, checkpoint)
+	assertProjectedCheckpointRelations(t, database, checkpoint.ID)
+	assertCheckpointProjectionConflicts(t, database, checkpoint)
+}
+
+func assertProjectedCheckpointRecord(t *testing.T, database *DB, checkpoint *protocol.CheckpointRequest) {
 	checkpoints, err := database.ListCheckpoints(checkpoint.WorkUnitUUID, 10)
 	if err != nil {
 		t.Fatal(err)
@@ -120,56 +196,80 @@ func TestCheckpointProjectionStoresDeclarationAndSupportsWorkUnitQueries(t *test
 	if len(checkpoints) != 1 {
 		t.Fatalf("checkpoints = %#v", checkpoints)
 	}
-	got := checkpoints[0]
-	if got.ID != checkpoint.ID || got.Actor != checkpoint.Actor || got.DeclaredBy != "human" || got.WorkUnitUUID != checkpoint.WorkUnitUUID || got.JournalStart != 10 || got.JournalEnd != 12 ||
-		got.BoundaryEventID != checkpoint.BoundaryEventID || got.TurnID != checkpoint.TurnID || got.CompactionEventID != checkpoint.CompactionEventID ||
-		got.Git == nil || got.Git.Head != checkpoint.Git.Head || got.JJ == nil || got.JJ.ChangeID != checkpoint.JJ.ChangeID ||
-		len(got.MutationIDs) != 1 || got.MutationIDs[0] != "mutation-1" || len(got.MessageIDs) != 1 || len(got.CollisionIDs) != 1 || len(got.TestResultIDs) != 1 || got.Metadata["summary"] != "ready" {
-		t.Fatalf("checkpoint = %#v", got)
-	}
+	got := &checkpoints[0]
+	assertProjectedCheckpointIdentity(t, got, checkpoint)
+	assertProjectedCheckpointContext(t, got, checkpoint)
+	assertProjectedCheckpointEvidence(t, got)
 	if status, err := database.Status(); err != nil || status.Checkpoints != 1 {
 		t.Fatalf("status = %#v, err = %v", status, err)
 	}
+}
+
+func assertProjectedCheckpointIdentity(t *testing.T, got *CheckpointRecord, checkpoint *protocol.CheckpointRequest) {
+	if got.ID != checkpoint.ID || got.Actor != checkpoint.Actor || got.DeclaredBy != "human" || got.WorkUnitUUID != checkpoint.WorkUnitUUID || got.JournalStart != 10 || got.JournalEnd != 12 {
+		t.Fatalf("checkpoint identity = %#v", got)
+	}
+}
+
+func assertProjectedCheckpointContext(t *testing.T, got *CheckpointRecord, checkpoint *protocol.CheckpointRequest) {
+	if got.BoundaryEventID != checkpoint.BoundaryEventID || got.TurnID != checkpoint.TurnID || got.CompactionEventID != checkpoint.CompactionEventID || got.Git == nil || got.Git.Head != checkpoint.Git.Head || got.JJ == nil || got.JJ.ChangeID != checkpoint.JJ.ChangeID {
+		t.Fatalf("checkpoint context = %#v", got)
+	}
+}
+
+func assertProjectedCheckpointEvidence(t *testing.T, got *CheckpointRecord) {
+	if len(got.MutationIDs) != 1 || got.MutationIDs[0] != "mutation-1" || len(got.MessageIDs) != 1 || len(got.CollisionIDs) != 1 || len(got.TestResultIDs) != 1 || got.Metadata["summary"] != "ready" {
+		t.Fatalf("checkpoint evidence = %#v", got)
+	}
+}
+
+func assertProjectedCheckpointRelations(t *testing.T, database *DB, checkpointID string) {
 	var evidenceCount, metadataCount int
-	if err := database.db.QueryRow(`SELECT COUNT(*) FROM checkpoint_evidence WHERE checkpoint_id = ?`, checkpoint.ID).Scan(&evidenceCount); err != nil {
+	if err := database.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM checkpoint_evidence WHERE checkpoint_id = ?`, checkpointID).Scan(&evidenceCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.db.QueryRow(`SELECT COUNT(*) FROM checkpoint_metadata WHERE checkpoint_id = ?`, checkpoint.ID).Scan(&metadataCount); err != nil {
+	if err := database.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM checkpoint_metadata WHERE checkpoint_id = ?`, checkpointID).Scan(&metadataCount); err != nil {
 		t.Fatal(err)
 	}
 	if evidenceCount != 4 || metadataCount != 1 {
 		t.Fatalf("relational checkpoint projection = evidence %d, metadata %d", evidenceCount, metadataCount)
 	}
+}
 
+func assertCheckpointProjectionConflicts(t *testing.T, database *DB, checkpoint *protocol.CheckpointRequest) {
 	turnIndex := 9
-	conflictingCheckpoint := checkpoint
+	conflictingCheckpoint := *checkpoint
 	conflictingCheckpoint.TurnIndex = &turnIndex
 	if err := database.Project(event(t, 14, "checkpoint.requested", conflictingCheckpoint)); err == nil {
 		t.Fatal("conflicting checkpoint payload was projected")
 	}
 
-	transaction, err := database.db.Begin()
+	transaction, err := database.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	conflictingEvidence := checkpoint
+	conflictingEvidence := *checkpoint
 	conflictingEvidence.MutationIDs = []string{"different-mutation"}
-	if err := projectCheckpointEvidence(transaction, conflictingEvidence); err == nil {
-		transaction.Rollback()
+	if err := projectCheckpointEvidencePtr(transaction, &conflictingEvidence); err == nil {
+		if err := transaction.Rollback(); err != nil {
+			t.Errorf("rollback: %v", err)
+		}
 		t.Fatal("conflicting checkpoint evidence was projected")
 	}
 	if err := transaction.Rollback(); err != nil {
 		t.Fatal(err)
 	}
 
-	transaction, err = database.db.Begin()
+	transaction, err = database.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	conflictingMetadata := checkpoint
+	conflictingMetadata := *checkpoint
 	conflictingMetadata.Metadata = map[string]string{"summary": "different"}
-	if err := projectCheckpointMetadata(transaction, conflictingMetadata); err == nil {
-		transaction.Rollback()
+	if err := projectCheckpointMetadataPtr(transaction, &conflictingMetadata); err == nil {
+		if err := transaction.Rollback(); err != nil {
+			t.Errorf("rollback: %v", err)
+		}
 		t.Fatal("conflicting checkpoint metadata was projected")
 	}
 	if err := transaction.Rollback(); err != nil {

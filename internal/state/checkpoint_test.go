@@ -1,11 +1,54 @@
 package state
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
 )
+
+func TestCheckpointReplaySkipsLegacyPreScopeCheckpoint(t *testing.T) {
+	engine, journal, _ := newTestEngine(t)
+	register(t, engine, "legacy-pre-scope")
+	checkpoint := protocol.CheckpointRequest{ID: "legacy-pre-scope", Actor: "pi:01234567-89ab-4def-8123-456789abcdef", CheckpointKind: "settled"}
+	data, err := json.Marshal(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := append(append([]protocol.Event(nil), journal.events...), protocol.Event{Version: protocol.Version, Sequence: 2, Type: "checkpoint.requested", At: time.Now().UTC(), Data: data})
+	replayed, err := New(&memoryJournal{}, events, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := replayed.checkpoints[checkpoint.ID]; exists {
+		t.Fatal("legacy pre-scope checkpoint entered coordination state")
+	}
+}
+
+func TestCheckpointReplayBackfillsLegacyUnknownWorkUnitAsStandalone(t *testing.T) {
+	engine, journal, _ := newTestEngine(t)
+	actor := register(t, engine, "legacy-work-unit")
+	checkpoint := protocol.CheckpointRequest{
+		ID: "legacy-work-unit-checkpoint", Actor: actor.Address, SessionGeneration: actor.Generation,
+		RepositoryUUID: actor.RepositoryUUID, WorkspaceUUID: actor.WorkspaceUUID,
+		WorkUnitUUID: "33333333-3333-5333-8333-333333333333", CheckpointKind: "settled", JournalStart: 1, JournalEnd: 1,
+	}
+	data, err := json.Marshal(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := append(append([]protocol.Event(nil), journal.events...), protocol.Event{Version: protocol.Version, Sequence: 2, Type: "checkpoint.requested", At: time.Now().UTC(), Data: data})
+	replayed, err := New(&memoryJournal{}, events, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projected := replayed.checkpoints[checkpoint.ID]
+	if projected.WorkUnitUUID != "" {
+		t.Fatalf("legacy unknown WorkUnit relation survived replay: %#v", projected)
+	}
+}
 
 func TestCheckpointRequestIsIdempotentAndCapturesRange(t *testing.T) {
 	engine, journal, _ := newTestEngine(t)

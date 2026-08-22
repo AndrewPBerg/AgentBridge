@@ -15,6 +15,7 @@ The adapter owns only Pi-specific behavior:
 - acknowledgement after `agent_settled`
 - `/bridge` commands
 - `/checkpoint [kind]` human checkpoint declaration
+- `/work` WorkUnit creation and session selection
 - `bridge_message`, `bridge_collision`, and `bridge_checkpoint` tools
 
 The Go daemon owns actors, aliases, ordered durable queues, collision state, selector resolution, and event persistence.
@@ -38,6 +39,13 @@ The extension starts `agent-bridge serve` automatically when the socket is unava
 /bus list
 /bus name walkie
 /bus status
+/direction <objective>              # create and select
+/direction | /direction status       # objective, state, and compact WorkUnit counts
+/direction use <uuid> | /direction clear
+/direction start|pause|converge|verify|complete|abandon
+/work <objective> (includes the selected Direction)
+/work use <uuid>
+/work status | /work clear
 /checkpoint [manual|settled|handoff|test]
 ```
 

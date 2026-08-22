@@ -9,12 +9,12 @@ import (
 	"path/filepath"
 )
 
+//nolint:cyclop,gocognit,funlen // command dispatch keeps each CLI's flag and usage contract explicit.
 func provenanceCommand(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: agent-bridge provenance <status|snapshot|checkpoints|who-changed|why|agent|since-compaction|mutations|explain|timeline|session>")
 	}
-	switch args[0] {
-	case "snapshot":
+	if args[0] == "snapshot" {
 		if len(args) != 2 {
 			return errors.New("usage: agent-bridge provenance snapshot <absolute-output-path>")
 		}
@@ -140,6 +140,7 @@ func provenanceCommand(args []string) error {
 	}
 }
 
+//nolint:cyclop // migration preserves the durable temp-file and directory-sync sequence.
 func migrateLegacyJournal(target string) error {
 	if _, err := os.Stat(target); err == nil {
 		return nil
@@ -158,7 +159,7 @@ func migrateLegacyJournal(target string) error {
 	if err != nil {
 		return fmt.Errorf("open legacy journal: %w", err)
 	}
-	defer source.Close()
+	defer closeQuietly(source)
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		return err
 	}
@@ -171,13 +172,13 @@ func migrateLegacyJournal(target string) error {
 		return err
 	}
 	if _, err := io.Copy(destination, source); err != nil {
-		destination.Close()
-		os.Remove(temporary)
+		closeQuietly(destination)
+		removeQuietly(temporary)
 		return fmt.Errorf("copy legacy journal: %w", err)
 	}
 	if err := destination.Sync(); err != nil {
-		destination.Close()
-		os.Remove(temporary)
+		closeQuietly(destination)
+		removeQuietly(temporary)
 		return fmt.Errorf("sync migrated journal: %w", err)
 	}
 	if err := destination.Close(); err != nil {
@@ -190,6 +191,6 @@ func migrateLegacyJournal(target string) error {
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	defer closeQuietly(directory)
 	return directory.Sync()
 }

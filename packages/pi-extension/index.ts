@@ -14,6 +14,8 @@ import type {
   CheckpointRequest,
   Collision,
   CollisionState,
+  Direction,
+  DirectionStatus,
   MutationIntent,
   SessionEvent,
   TestResult,
@@ -52,6 +54,7 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
   let recoveryPromise: Promise<void> | undefined;
   let lastError = "";
   let selectedWorkUnit: WorkUnit | undefined;
+  let selectedDirection: Direction | undefined;
   // Test results are emitted by the Pi tool/runtime boundary. Keep only results
   // captured after the last checkpoint; the daemon assigns evidence ordinals.
   let capturedTestResults: Array<{ id: string; outcome: "passed" | "failed" | "blocked" }> = [];
@@ -148,7 +151,9 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
               `Sequences: global=${message.global_sequence} sender=${message.sender_sequence} recipient=${message.recipient_sequence}${message.client_sequence ? ` client=${message.client_sequence}` : ""}`,
               message.collision_id
                 ? `Coordinate with bridge_message, then update ${message.collision_id} using bridge_collision.`
-                : "Reply with bridge_message if coordination is needed.",
+                : message.kind === "external_change"
+                  ? "This source is non-addressable. Do not reply; re-read the affected path before writing."
+                  : "Reply with bridge_message if coordination is needed.",
             ].join("\n"),
             display: true,
             details: { message },
@@ -222,6 +227,56 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
       throw new Error("WorkUnit belongs to a different repository or workspace");
     }
     return unit;
+  }
+
+  function normalizeDirection(result: unknown): Direction {
+    const direction = ((result as { direction?: unknown } | undefined)?.direction ?? result) as Direction;
+    if (!direction || typeof direction !== "object") throw new Error("Daemon returned no Direction");
+    canonicalUUID(direction.direction_uuid, "Direction UUID");
+    if (typeof direction.objective !== "string" || typeof direction.state !== "string")
+      throw new Error("Daemon returned an invalid Direction");
+    return direction;
+  }
+
+  async function fetchDirection(uuid: string): Promise<Direction> {
+    const directionUUID = canonicalUUID(uuid, "Direction UUID");
+    return normalizeDirection(await call("direction.get", { direction_uuid: directionUUID }));
+  }
+
+  async function fetchDirectionStatus(uuid: string): Promise<DirectionStatus> {
+    const directionUUID = canonicalUUID(uuid, "Direction UUID");
+    const result = await call<DirectionStatus>("direction.status", { direction_uuid: directionUUID });
+    const direction = normalizeDirection(result);
+    if (!Array.isArray(result.work_units)) throw new Error("Daemon returned an invalid Direction status");
+    return { direction, work_units: result.work_units as WorkUnit[] };
+  }
+
+  function formatDirectionStatus(status: DirectionStatus): string {
+    const counts = new Map<string, number>();
+    for (const unit of status.work_units) {
+      const scope = unit.workspace_kind && unit.workspace_root ? `@${unit.workspace_kind}:${unit.workspace_root}` : "";
+      const key = `${unit.state}${scope}`;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    const summary = [...counts.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([label, count]) => {
+        const separator = label.indexOf("@");
+        return separator < 0 ? `${label}=${count}` : `${label.slice(0, separator)}=${count}${label.slice(separator)}`;
+      })
+      .join(" ");
+    return `${status.direction.objective} · ${status.direction.state} · WorkUnits ${summary || "none"}`;
+  }
+
+  async function fetchSelectedDirection(): Promise<Direction | undefined> {
+    if (!selectedDirection) return undefined;
+    try {
+      selectedDirection = await fetchDirection(selectedDirection.direction_uuid);
+      return selectedDirection;
+    } catch (error) {
+      selectedDirection = undefined;
+      throw new Error(`Selected Direction cleared: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   async function fetchWorkUnit(workUnitUUID: string): Promise<WorkUnit> {
@@ -731,7 +786,75 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     handler: handleBus,
   });
 
+  const directionUsage =
+    "Usage: /direction <objective> | /direction status | /direction use <uuid> | /direction start|pause|converge|verify|complete|abandon | /direction clear";
   const workUsage = "Usage: /work <objective> | /work use <uuid> | /work status | /work clear";
+  pi.registerCommand("direction", {
+    description: "Manage session Direction",
+    getArgumentCompletions: (prefix: string) => {
+      if (prefix.trim().includes(" ")) return null;
+      const normalized = prefix.trim();
+      return ["status", "use", "start", "pause", "converge", "verify", "complete", "abandon", "clear"]
+        .filter((value) => value.startsWith(normalized))
+        .map((value) => ({ value, label: value }));
+    },
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const input = String(args ?? "").trim();
+      const [action, ...rest] = input.split(/\s+/);
+      try {
+        if (!actor) throw new Error("Agent Bridge is not attached to an active session");
+        if (action === "status" || !input) {
+          if (!selectedDirection) return void ctx.ui.notify("No Direction selected.", "info");
+          try {
+            const status = await fetchDirectionStatus(selectedDirection.direction_uuid);
+            selectedDirection = status.direction;
+            return void ctx.ui.notify(formatDirectionStatus(status), "info");
+          } catch (error) {
+            selectedDirection = undefined;
+            throw new Error(`Selected Direction cleared: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        if (action === "clear") {
+          selectedDirection = undefined;
+          return void ctx.ui.notify("Direction selection cleared.", "info");
+        }
+        if (action === "use") {
+          if (!rest[0]) throw new Error("/direction use requires a Direction UUID");
+          selectedDirection = await fetchDirection(rest[0]);
+          return void ctx.ui.notify(`Selected Direction ${selectedDirection.direction_uuid}.`, "info");
+        }
+        const transitions: Record<string, string> = {
+          start: "active",
+          pause: "paused",
+          converge: "converging",
+          verify: "verified",
+          complete: "completed",
+          abandon: "abandoned",
+        };
+        const transition = action === undefined ? undefined : transitions[action];
+        if (transition) {
+          if (!selectedDirection) throw new Error("No Direction selected.");
+          selectedDirection = normalizeDirection(
+            await call("direction.transition", {
+              direction_uuid: selectedDirection.direction_uuid,
+              actor: actor.address,
+              state: transition,
+            }),
+          );
+          return void ctx.ui.notify(`Direction ${selectedDirection.state}.`, "info");
+        }
+        if (!input) throw new Error(directionUsage);
+        selectedDirection = normalizeDirection(
+          await call("direction.create", {
+            direction: { direction_uuid: randomUUID(), objective: input, created_by: actor.address },
+          }),
+        );
+        ctx.ui.notify(`Created and selected Direction ${selectedDirection.direction_uuid}.`, "info");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+      }
+    },
+  });
 
   pi.registerCommand("work", {
     description: "Create, select, inspect, or clear the session WorkUnit",
@@ -774,9 +897,10 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
           ctx.ui.notify(`Selected WorkUnit ${unit.work_unit_uuid}.`, "info");
           return;
         }
-        const objective = input.startsWith("<") ? "" : input;
+        const objective = input;
         if (!objective || objective === "use" || objective === "status" || objective === "clear") throw new Error(workUsage);
         const scope = requireWorkUnitScope();
+        const direction = await fetchSelectedDirection();
         const unit = normalizeWorkUnit(
           await call("work_unit.create", {
             work_unit: {
@@ -785,6 +909,7 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
               workspace_uuid: scope.workspace_uuid,
               objective,
               created_by: actor.address,
+              direction_uuid: direction?.direction_uuid,
             },
           }),
         );
@@ -1044,6 +1169,7 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     actor = undefined;
     sessionCtx = undefined;
     selectedWorkUnit = undefined;
+    selectedDirection = undefined;
     capturedTestResults = [];
     verificationRuns.clear();
     deliveredInRuntime.clear();

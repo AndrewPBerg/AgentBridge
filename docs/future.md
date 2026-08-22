@@ -156,6 +156,54 @@ A useful one-hour implementation slice would be:
 4. minimal huddle formation and durable fan-out; and
 5. a three-Pi-session demonstration.
 
+## Deferred session awakening
+
+Agent Bridge currently provides durable mail but cannot wake an offline harness session to answer a coordination request. Explore an explicit, policy-controlled `agent-bridge awaken` capability:
+
+- an agent or human requests that a known, recently registered session resume and inspect a bounded message or question;
+- the harness adapter, not the daemon, decides whether a dormant session can be resumed, restarted, or must be reported unavailable;
+- every request, adapter outcome, and resulting session generation is recorded as provenance; and
+- the capability must not become arbitrary process control, hidden prompt injection, or autonomous/unbounded agent spawning.
+
+The first experiment should only target one local Pi session with an explicit user-approved policy, a timeout, and a deterministic unavailable result. Cross-machine wake, cost/budget policies, and automatic recruitment remain later work.
+
+## Deferred harness-managed worker identities
+
+Background workers launched by a harness should eventually be registered as ordinary Agent Bridge actors rather than reporting only to their parent process. This enables durable, ordered peer messaging, WorkUnit participation, collision delivery, and checkpoints between sibling workers without making the parent a mandatory relay.
+
+Parent/child launch provenance must be first-class rather than inferred from parent tool calls, timestamps, paths, or later child registration. The authoritative relation should be `parent actor -> launch -> child actor -> optional WorkUnit`, represented with normalized UUID BLOB columns:
+
+```text
+actor_launches
+  launch_uuid BLOB PRIMARY KEY
+  parent_actor_uuid BLOB NOT NULL
+  child_actor_uuid BLOB
+  work_unit_uuid BLOB
+  harness_job_id TEXT
+  state TEXT NOT NULL
+  requested_at DATETIME NOT NULL
+  attached_at DATETIME
+  terminated_at DATETIME
+```
+
+Possible journal events are `actor.launch_requested`, `actor.launch_attached`, and `actor.launch_terminated`. A stable launch UUID must make retries idempotent and connect a child that registers after the spawn request. The parent relation records causal provenance, not permanent hierarchy or authority; once attached, the child is an ordinary equal participant and directly addressable peer.
+
+The harness must still own lifecycle policy: it grants a worker a canonical session UUID, constrained capabilities, repository/workspace scope, and the explicit launch provenance link. Workers must not gain recursive spawning or unrestricted process control merely by becoming addressable peers. The first experiment should register two local bounded workers, attach each to its launch and WorkUnit, allow direct `bridge_message`, and prove mailbox replay and shutdown behavior.
+
+## Deferred Pi hierarchy context cue
+
+Pi should make the selected coordination hierarchy visible in prompt context without injecting a large project plan on every turn. A compact harness-authored cue could include:
+
+```text
+Direction: <uuid> · <objective>
+WorkUnit: <uuid> · <objective>
+JJ: <working/materialized change identities>
+Latest checkpoint: <kind/status/boundary>
+Relevant files: <bounded mutation paths>
+```
+
+This context must be derived from authoritative selection, WorkUnit/JJ relations, and checkpoint evidence—not inferred from the latest timestamps or model prose. It should refresh when selection, JJ identity, checkpoint boundary, or compaction changes, and remain small enough that detailed rollups are fetched lazily. The cue explains the mental model `Direction -> WorkUnits -> JJ changes -> checkpoints/mutations -> files` while keeping lifecycle state, VCS state, and evidence boundaries distinct.
+
 ## Context management
 
 Swarm context should not mean copying every transcript to every peer. That would waste tokens, leak irrelevant information, and create anchoring.

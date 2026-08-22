@@ -8,12 +8,17 @@ import (
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
 )
 
+//nolint:cyclop,gocognit // end-to-end test keeps setup and assertions together.
 func TestWorkUnitActorLeaveProjectsAndReplays(t *testing.T) {
 	database, err := Open(filepath.Join(t.TempDir(), "bridge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
 	at := time.Now().UTC()
 	unit := protocol.WorkUnit{
 		UUID: "21234567-89ab-4def-8123-456789abcdef", RepositoryUUID: "01234567-89ab-4def-8123-456789abcdef",

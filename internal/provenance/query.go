@@ -1,6 +1,7 @@
 package provenance
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
 )
 
+// MutationRecord describes a recorded mutation.
 type MutationRecord struct {
 	ID                string          `json:"id"`
 	Actor             string          `json:"actor"`
@@ -43,6 +45,7 @@ type MutationRecord struct {
 	UpdatedSequence   uint64          `json:"updated_sequence"`
 }
 
+// ActorScope identifies a repository and workspace scope.
 type ActorScope struct {
 	RepositoryUUID string
 	WorkspaceUUID  string
@@ -55,6 +58,7 @@ func selectedScope(scopes []ActorScope) ActorScope {
 	return ActorScope{}
 }
 
+// MutationFilter selects mutations for a query.
 type MutationFilter struct {
 	Actor          string
 	Path           string
@@ -64,6 +68,7 @@ type MutationFilter struct {
 	Failed         bool
 }
 
+// EventRecord describes a projected event.
 type EventRecord struct {
 	Sequence uint64          `json:"sequence"`
 	Type     string          `json:"type"`
@@ -71,6 +76,7 @@ type EventRecord struct {
 	Data     json.RawMessage `json:"data"`
 }
 
+// Status reports provenance database projection counts.
 type Status struct {
 	DatabasePath      string `json:"database_path"`
 	ProjectedSequence uint64 `json:"projected_sequence"`
@@ -84,10 +90,15 @@ type Status struct {
 	Collisions        int64  `json:"collisions"`
 }
 
+// WorkUnitRecord describes a projected work unit.
 type WorkUnitRecord struct {
 	UUID               string                   `json:"work_unit_uuid"`
+	DirectionUUID      string                   `json:"direction_uuid,omitempty"`
 	RepositoryUUID     string                   `json:"repository_uuid"`
+	RepositoryRoot     string                   `json:"repository_root,omitempty"`
 	WorkspaceUUID      string                   `json:"workspace_uuid"`
+	WorkspaceRoot      string                   `json:"workspace_root,omitempty"`
+	WorkspaceKind      string                   `json:"workspace_kind,omitempty"`
 	Objective          string                   `json:"objective"`
 	AcceptanceCriteria string                   `json:"acceptance_criteria,omitempty"`
 	Context            string                   `json:"context,omitempty"`
@@ -98,24 +109,99 @@ type WorkUnitRecord struct {
 	CompletedAt        string                   `json:"completed_at,omitempty"`
 	Participants       []protocol.WorkUnitActor `json:"participants"`
 	Checkpoints        []CheckpointRecord       `json:"checkpoints"`
+	CheckpointCount    int                      `json:"checkpoint_count"`
+	LatestCheckpoint   *CheckpointRecord        `json:"latest_checkpoint,omitempty"`
 }
 
+// DirectionEvidenceSummary is derived from projected checkpoints and claims.
+// It is informational and never changes lifecycle authority.
+type DirectionEvidenceSummary struct {
+	Checkpoints    int `json:"checkpoints"`
+	Claims         int `json:"claims"`
+	AssertedClaims int `json:"asserted_claims"`
+	VerifiedClaims int `json:"verified_claims"`
+	FailedClaims   int `json:"failed_claims"`
+	BlockedClaims  int `json:"blocked_claims"`
+}
+
+// DirectionReadinessSummary describes whether projected evidence is sufficient
+// for a direction to be considered ready. It is a derived query result.
+type DirectionReadinessSummary struct {
+	Ready           bool     `json:"ready"`
+	WorkUnitsReady  int      `json:"work_units_ready"`
+	BlockingReasons []string `json:"blocking_reasons,omitempty"`
+}
+
+// DirectionStatus is the deterministic, read-only rollup for a direction.
+type DirectionStatus struct {
+	Direction protocol.Direction        `json:"direction"`
+	WorkUnits []WorkUnitRecord          `json:"work_units"`
+	Evidence  DirectionEvidenceSummary  `json:"evidence"`
+	Readiness DirectionReadinessSummary `json:"readiness"`
+}
+
+// Direction returns the direction identified by uuid.
+func (d *DB) Direction(uuid string) (protocol.Direction, error) {
+	var direction protocol.Direction
+	var id, creator []byte
+	var createdAt, updatedAt string
+	var completed sql.NullString
+	err := d.db.QueryRowContext(context.Background(), `SELECT direction_uuid, objective, COALESCE(success_criteria, ''), COALESCE(constraints, ''), COALESCE(context, ''), state, created_by, created_at, updated_at, completed_at FROM directions WHERE direction_uuid = ?`, uuidBlob(uuid)).Scan(
+		&id, &direction.Objective, &direction.SuccessCriteria, &direction.Constraints, &direction.Context,
+		&direction.State, &creator, &createdAt, &updatedAt, &completed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return direction, fmt.Errorf("unknown direction %q", uuid)
+	}
+	if err != nil {
+		return direction, err
+	}
+	direction.UUID, direction.CreatedBy = uuidString(id), uuidString(creator)
+	direction.CreatedAt = parseTime(createdAt)
+	direction.UpdatedAt = parseTime(updatedAt)
+	if completed.Valid {
+		at := parseTime(completed.String)
+		direction.CompletedAt = &at
+	}
+	return direction, nil
+}
+
+// WorkUnit returns the work unit identified by uuid.
+//
+//nolint:cyclop // query hydration keeps the direct and rollup APIs consistent.
 func (d *DB) WorkUnit(uuid string) (WorkUnitRecord, error) {
 	var record WorkUnitRecord
-	var id, repo, workspace, creator []byte
-	err := d.db.QueryRow(`SELECT work_unit_uuid, repository_uuid, workspace_uuid, objective, COALESCE(acceptance_criteria,''), COALESCE(context,''), state, created_by, created_at, updated_at, COALESCE(completed_at,'') FROM work_units WHERE work_unit_uuid=?`, uuidBlob(uuid)).Scan(&id, &repo, &workspace, &record.Objective, &record.AcceptanceCriteria, &record.Context, &record.State, &creator, &record.CreatedAt, &record.UpdatedAt, &record.CompletedAt)
+	var id, direction, repo, workspace, creator []byte
+	var repositoryRoot, workspaceRoot, workspaceKind sql.NullString
+	err := d.db.QueryRowContext(context.Background(), `SELECT u.work_unit_uuid, u.direction_uuid, u.repository_uuid, u.workspace_uuid,
+		r.root, w.root, w.kind, u.objective, COALESCE(u.acceptance_criteria,''), COALESCE(u.context,''), u.state,
+		u.created_by, u.created_at, u.updated_at, COALESCE(u.completed_at,'')
+		FROM work_units u
+		LEFT JOIN repositories r ON r.id = u.repository_uuid
+		LEFT JOIN workspaces w ON w.id = u.workspace_uuid
+		WHERE u.work_unit_uuid=?`, uuidBlob(uuid)).Scan(&id, &direction, &repo, &workspace,
+		&repositoryRoot, &workspaceRoot, &workspaceKind, &record.Objective, &record.AcceptanceCriteria,
+		&record.Context, &record.State, &creator, &record.CreatedAt, &record.UpdatedAt, &record.CompletedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return record, fmt.Errorf("unknown work unit %q", uuid)
 	}
 	if err != nil {
 		return record, err
 	}
-	record.UUID, record.RepositoryUUID, record.WorkspaceUUID, record.CreatedBy = uuidString(id), uuidString(repo), uuidString(workspace), uuidString(creator)
-	rows, err := d.db.Query(`SELECT actor_uuid, joined_at, left_at, participation_state FROM work_unit_actors WHERE work_unit_uuid=? ORDER BY actor_uuid`, uuidBlob(uuid))
+	record.UUID, record.DirectionUUID, record.RepositoryUUID, record.WorkspaceUUID, record.CreatedBy = uuidString(id), uuidString(direction), uuidString(repo), uuidString(workspace), uuidString(creator)
+	if repositoryRoot.Valid {
+		record.RepositoryRoot = repositoryRoot.String
+	}
+	if workspaceRoot.Valid {
+		record.WorkspaceRoot = workspaceRoot.String
+	}
+	if workspaceKind.Valid {
+		record.WorkspaceKind = workspaceKind.String
+	}
+	rows, err := d.db.QueryContext(context.Background(), `SELECT actor_uuid, joined_at, left_at, participation_state FROM work_unit_actors WHERE work_unit_uuid=? ORDER BY actor_uuid`, uuidBlob(uuid))
 	if err != nil {
 		return record, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	record.Participants = []protocol.WorkUnitActor{}
 	for rows.Next() {
 		var actor []byte
@@ -135,14 +221,178 @@ func (d *DB) WorkUnit(uuid string) (WorkUnitRecord, error) {
 		return record, err
 	}
 	record.Checkpoints, err = d.ListCheckpoints(uuid, 1000)
-	return record, err
+	if err != nil {
+		return record, err
+	}
+	record.CheckpointCount = len(record.Checkpoints)
+	if record.CheckpointCount > 0 {
+		record.LatestCheckpoint = &record.Checkpoints[record.CheckpointCount-1]
+	}
+	return record, nil
+}
+
+// DirectionStatus returns a deterministic, read-only rollup of a direction
+// and all attached work units, including work units in other repositories.
+func (d *DB) DirectionStatus(uuid string) (DirectionStatus, error) {
+	result := DirectionStatus{WorkUnits: make([]WorkUnitRecord, 0)}
+	direction, err := d.Direction(uuid)
+	if err != nil {
+		return result, err
+	}
+	result.Direction = direction
+	workUnits, err := d.directionWorkUnitUUIDs(uuid)
+	if err != nil {
+		return result, err
+	}
+	for _, workUnit := range workUnits {
+		record, evidence, err := d.directionWorkUnitRollup(workUnit)
+		if err != nil {
+			return result, err
+		}
+		result.WorkUnits = append(result.WorkUnits, record)
+		mergeDirectionEvidence(&result.Evidence, &evidence)
+	}
+	result.Readiness = deriveDirectionReadiness(result.WorkUnits, result.Evidence)
+	return result, nil
+}
+
+func (d *DB) directionWorkUnitUUIDs(directionUUID string) ([][]byte, error) {
+	rows, err := d.db.QueryContext(context.Background(), `SELECT work_unit_uuid FROM work_units WHERE direction_uuid = ? ORDER BY repository_uuid, workspace_uuid, work_unit_uuid`, uuidBlob(directionUUID))
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+	var result [][]byte
+	for rows.Next() {
+		var workUnit []byte
+		if err := rows.Scan(&workUnit); err != nil {
+			return nil, err
+		}
+		result = append(result, append([]byte(nil), workUnit...))
+	}
+	return result, rows.Err()
+}
+
+func (d *DB) directionWorkUnitRollup(workUnit []byte) (WorkUnitRecord, DirectionEvidenceSummary, error) {
+	record, err := d.WorkUnit(uuidString(workUnit))
+	if err != nil {
+		return record, DirectionEvidenceSummary{}, err
+	}
+	if err := d.populateDirectionCheckpointSummary(workUnit, &record); err != nil {
+		return record, DirectionEvidenceSummary{}, err
+	}
+	evidence, err := d.directionClaimEvidence(workUnit)
+	if err != nil {
+		return record, evidence, err
+	}
+	evidence.Checkpoints = record.CheckpointCount
+	return record, evidence, nil
+}
+
+func (d *DB) populateDirectionCheckpointSummary(workUnit []byte, record *WorkUnitRecord) error {
+	if err := d.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM checkpoint_requests WHERE work_unit_uuid = ?`, workUnit).Scan(&record.CheckpointCount); err != nil {
+		return err
+	}
+	if record.CheckpointCount == 0 {
+		return nil
+	}
+	if record.CheckpointCount <= len(record.Checkpoints) {
+		record.LatestCheckpoint = &record.Checkpoints[len(record.Checkpoints)-1]
+		return nil
+	}
+	row := d.db.QueryRowContext(context.Background(), `SELECT id, actor, declared_by, session_generation, repository_uuid, workspace_uuid,
+		COALESCE(work_unit_uuid, ''), checkpoint_kind, journal_start_sequence, journal_end_sequence,
+		data, event_sequence FROM checkpoint_requests WHERE work_unit_uuid = ? ORDER BY event_sequence DESC, id DESC LIMIT 1`, workUnit)
+	latest, err := scanCheckpoint(row)
+	if err != nil {
+		return err
+	}
+	if err := d.hydrateCheckpoint(&latest); err != nil {
+		return err
+	}
+	record.LatestCheckpoint = &latest
+	return nil
+}
+
+func (d *DB) directionClaimEvidence(workUnit []byte) (DirectionEvidenceSummary, error) {
+	var evidence DirectionEvidenceSummary
+	rows, err := d.db.QueryContext(context.Background(), `SELECT c.status FROM checkpoint_claims c JOIN checkpoint_requests p ON p.id = c.checkpoint_id WHERE p.work_unit_uuid = ? ORDER BY p.event_sequence, p.id, c.ordinal`, workUnit)
+	if err != nil {
+		return evidence, err
+	}
+	defer closeRows(rows)
+	for rows.Next() {
+		var status protocol.CheckpointClaimStatus
+		if err := rows.Scan(&status); err != nil {
+			return evidence, err
+		}
+		evidence.Claims++
+		incrementDirectionClaimStatus(&evidence, status)
+	}
+	return evidence, rows.Err()
+}
+
+func incrementDirectionClaimStatus(evidence *DirectionEvidenceSummary, status protocol.CheckpointClaimStatus) {
+	switch status {
+	case protocol.ClaimAsserted:
+		evidence.AssertedClaims++
+	case protocol.ClaimVerified:
+		evidence.VerifiedClaims++
+	case protocol.ClaimFailed:
+		evidence.FailedClaims++
+	case protocol.ClaimBlocked:
+		evidence.BlockedClaims++
+	}
+}
+
+func mergeDirectionEvidence(target, addition *DirectionEvidenceSummary) {
+	target.Checkpoints += addition.Checkpoints
+	target.Claims += addition.Claims
+	target.AssertedClaims += addition.AssertedClaims
+	target.VerifiedClaims += addition.VerifiedClaims
+	target.FailedClaims += addition.FailedClaims
+	target.BlockedClaims += addition.BlockedClaims
+}
+
+func deriveDirectionReadiness(workUnits []WorkUnitRecord, evidence DirectionEvidenceSummary) DirectionReadinessSummary {
+	readiness := DirectionReadinessSummary{}
+	if len(workUnits) == 0 {
+		readiness.BlockingReasons = []string{"no work units attached"}
+		return readiness
+	}
+	for index := range workUnits {
+		unit := &workUnits[index]
+		if unit.State == protocol.WorkUnitVerified || unit.State == protocol.WorkUnitCompleted {
+			readiness.WorkUnitsReady++
+		} else {
+			readiness.BlockingReasons = append(readiness.BlockingReasons, "work unit "+unit.UUID+" is "+string(unit.State))
+		}
+	}
+	if evidence.FailedClaims > 0 {
+		readiness.BlockingReasons = append(readiness.BlockingReasons, "failed evidence claims")
+	}
+	if evidence.BlockedClaims > 0 {
+		readiness.BlockingReasons = append(readiness.BlockingReasons, "blocked evidence claims")
+	}
+	readiness.Ready = readiness.WorkUnitsReady == len(workUnits) && len(readiness.BlockingReasons) == 0
+	return readiness
+}
+
+func closeRows(rows *sql.Rows) {
+	if err := rows.Close(); err != nil {
+		return
+	}
 }
 
 func parseTime(value string) time.Time {
-	parsed, _ := time.Parse(time.RFC3339Nano, value)
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}
+	}
 	return parsed
 }
 
+// CheckpointClaimRecord describes a checkpoint claim and its evidence.
 type CheckpointClaimRecord struct {
 	Kind      string                           `json:"kind"`
 	Statement string                           `json:"statement"`
@@ -150,6 +400,7 @@ type CheckpointClaimRecord struct {
 	Evidence  []protocol.CheckpointEvidenceRef `json:"evidence,omitempty"`
 }
 
+// CheckpointRecord describes a projected checkpoint.
 type CheckpointRecord struct {
 	ID                string                  `json:"id"`
 	Actor             string                  `json:"actor"`
@@ -178,6 +429,7 @@ type CheckpointRecord struct {
 	EventSequence     uint64                  `json:"event_sequence"`
 }
 
+// RepositoryRecord describes a projected repository.
 type RepositoryRecord struct {
 	ID           string `json:"id"`
 	Root         string `json:"root"`
@@ -186,6 +438,7 @@ type RepositoryRecord struct {
 	JJRepoPath   string `json:"jj_repo_path,omitempty"`
 }
 
+// WorkspaceRecord describes a projected workspace.
 type WorkspaceRecord struct {
 	ID              string `json:"id"`
 	RepositoryUUID  string `json:"repository_uuid"`
@@ -197,11 +450,13 @@ type WorkspaceRecord struct {
 	JJChangeID      string `json:"jj_change_id,omitempty"`
 }
 
+// ScopeRecords contains projected repositories and workspaces.
 type ScopeRecords struct {
 	Repositories []RepositoryRecord `json:"repositories"`
 	Workspaces   []WorkspaceRecord  `json:"workspaces"`
 }
 
+// SessionRecord describes a projected session event.
 type SessionRecord struct {
 	ID                string          `json:"id"`
 	Actor             string          `json:"actor"`
@@ -214,31 +469,34 @@ type SessionRecord struct {
 	EventSequence     uint64          `json:"event_sequence"`
 }
 
+// Scopes returns all projected repositories and workspaces.
 func (d *DB) Scopes() (ScopeRecords, error) {
 	result := ScopeRecords{Repositories: make([]RepositoryRecord, 0), Workspaces: make([]WorkspaceRecord, 0)}
-	repositories, err := d.db.Query(`SELECT id, root, kind, COALESCE(git_common_dir, ''), COALESCE(jj_repo_path, '') FROM repositories ORDER BY root, id`)
+	repositories, err := d.db.QueryContext(context.Background(), `SELECT id, root, kind, COALESCE(git_common_dir, ''), COALESCE(jj_repo_path, '') FROM repositories ORDER BY root, id`)
 	if err != nil {
 		return result, err
 	}
+	defer closeRows(repositories)
 	for repositories.Next() {
 		var record RepositoryRecord
 		var id []byte
 		if err := repositories.Scan(&id, &record.Root, &record.Kind, &record.GitCommonDir, &record.JJRepoPath); err != nil {
-			repositories.Close()
+			closeRows(repositories)
 			return result, err
 		}
 		record.ID = uuidString(id)
 		result.Repositories = append(result.Repositories, record)
 	}
-	if err := repositories.Close(); err != nil {
+	if err := repositories.Err(); err != nil {
+		closeRows(repositories)
 		return result, err
 	}
-	workspaces, err := d.db.Query(`SELECT id, repository_uuid, root, kind, COALESCE(git_branch, ''), COALESCE(git_head, ''),
+	workspaces, err := d.db.QueryContext(context.Background(), `SELECT id, repository_uuid, root, kind, COALESCE(git_branch, ''), COALESCE(git_head, ''),
 		COALESCE(jj_workspace_name, ''), COALESCE(jj_change_id, '') FROM workspaces ORDER BY root, id`)
 	if err != nil {
 		return result, err
 	}
-	defer workspaces.Close()
+	defer closeRows(workspaces)
 	for workspaces.Next() {
 		var record WorkspaceRecord
 		var id, repositoryUUID []byte
@@ -253,9 +511,10 @@ func (d *DB) Scopes() (ScopeRecords, error) {
 	return result, workspaces.Err()
 }
 
+// Status returns projection status and record counts.
 func (d *DB) Status() (Status, error) {
 	status := Status{DatabasePath: d.path}
-	err := d.db.QueryRow(`SELECT
+	err := d.db.QueryRowContext(context.Background(), `SELECT
 		COALESCE((SELECT MAX(sequence) FROM events), 0),
 		(SELECT COUNT(*) FROM events),
 		(SELECT COUNT(*) FROM actors),
@@ -271,6 +530,7 @@ func (d *DB) Status() (Status, error) {
 	return status, err
 }
 
+// ListCheckpoints returns checkpoints, optionally filtered by work unit.
 func (d *DB) ListCheckpoints(workUnitUUID string, limit int) ([]CheckpointRecord, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 50
@@ -289,11 +549,11 @@ func (d *DB) ListCheckpoints(workUnitUUID string, limit int) ([]CheckpointRecord
 		query += ` ORDER BY journal_end_sequence DESC, event_sequence DESC, id DESC LIMIT ?`
 	}
 	arguments = append(arguments, limit)
-	rows, err := d.db.Query(query, arguments...)
+	rows, err := d.db.QueryContext(context.Background(), query, arguments...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	result := make([]CheckpointRecord, 0)
 	for rows.Next() {
 		record, err := scanCheckpoint(rows)
@@ -308,8 +568,9 @@ func (d *DB) ListCheckpoints(workUnitUUID string, limit int) ([]CheckpointRecord
 	return result, rows.Err()
 }
 
+// Checkpoint returns the checkpoint identified by id.
 func (d *DB) Checkpoint(id string) (CheckpointRecord, error) {
-	row := d.db.QueryRow(`SELECT id, actor, declared_by, session_generation, repository_uuid, workspace_uuid,
+	row := d.db.QueryRowContext(context.Background(), `SELECT id, actor, declared_by, session_generation, repository_uuid, workspace_uuid,
 		COALESCE(work_unit_uuid, ''), checkpoint_kind, journal_start_sequence, journal_end_sequence,
 		data, event_sequence FROM checkpoint_requests WHERE id = ?`, id)
 	record, err := scanCheckpoint(row)
@@ -331,11 +592,21 @@ func (d *DB) hydrateCheckpoint(record *CheckpointRecord) error {
 	record.CollisionIDs = nil
 	record.TestResultIDs = nil
 	record.Claims = nil
-	rows, err := d.db.Query(`SELECT kind, ref_text, ref_uuid FROM checkpoint_evidence WHERE checkpoint_id = ? ORDER BY kind, ordinal`, record.ID)
+	if err := d.hydrateCheckpointEvidence(record); err != nil {
+		return err
+	}
+	if err := d.hydrateCheckpointClaims(record); err != nil {
+		return err
+	}
+	return d.hydrateCheckpointMetadata(record)
+}
+
+func (d *DB) hydrateCheckpointEvidence(record *CheckpointRecord) error {
+	rows, err := d.db.QueryContext(context.Background(), `SELECT kind, ref_text, ref_uuid FROM checkpoint_evidence WHERE checkpoint_id = ? ORDER BY kind, ordinal`, record.ID)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	for rows.Next() {
 		var kind string
 		var text sql.NullString
@@ -358,44 +629,50 @@ func (d *DB) hydrateCheckpoint(record *CheckpointRecord) error {
 			record.TestResultIDs = append(record.TestResultIDs, ref)
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	claimRows, err := d.db.Query(`SELECT ordinal, kind, statement, status FROM checkpoint_claims WHERE checkpoint_id=? ORDER BY ordinal`, record.ID)
+	return rows.Err()
+}
+
+func (d *DB) hydrateCheckpointClaims(record *CheckpointRecord) error {
+	claimRows, err := d.db.QueryContext(context.Background(), `SELECT ordinal, kind, statement, status FROM checkpoint_claims WHERE checkpoint_id=? ORDER BY ordinal`, record.ID)
 	if err != nil {
 		return err
 	}
-	defer claimRows.Close()
+	defer closeRows(claimRows)
 	for claimRows.Next() {
 		var ordinal int
 		var claim CheckpointClaimRecord
 		if err := claimRows.Scan(&ordinal, &claim.Kind, &claim.Statement, &claim.Status); err != nil {
 			return err
 		}
-		evidenceRows, err := d.db.Query(`SELECT evidence_kind, evidence_ordinal FROM checkpoint_claim_evidence WHERE checkpoint_id=? AND claim_ordinal=? ORDER BY evidence_kind, evidence_ordinal`, record.ID, ordinal)
+		evidenceRows, err := d.db.QueryContext(context.Background(), `SELECT evidence_kind, evidence_ordinal FROM checkpoint_claim_evidence WHERE checkpoint_id=? AND claim_ordinal=? ORDER BY evidence_kind, evidence_ordinal`, record.ID, ordinal)
 		if err != nil {
 			return err
 		}
 		for evidenceRows.Next() {
 			var ref protocol.CheckpointEvidenceRef
 			if err := evidenceRows.Scan(&ref.Kind, &ref.Ordinal); err != nil {
-				evidenceRows.Close()
+				closeRows(evidenceRows)
 				return err
 			}
 			claim.Evidence = append(claim.Evidence, ref)
 		}
-		evidenceRows.Close()
+		if err := evidenceRows.Err(); err != nil {
+			closeRows(evidenceRows)
+			return err
+		}
+		closeRows(evidenceRows)
 		record.Claims = append(record.Claims, claim)
 	}
-	if err := claimRows.Err(); err != nil {
-		return err
-	}
+	return claimRows.Err()
+}
+
+func (d *DB) hydrateCheckpointMetadata(record *CheckpointRecord) error {
 	record.Metadata = map[string]string{}
-	metadata, err := d.db.Query(`SELECT key, value FROM checkpoint_metadata WHERE checkpoint_id = ? ORDER BY key`, record.ID)
+	metadata, err := d.db.QueryContext(context.Background(), `SELECT key, value FROM checkpoint_metadata WHERE checkpoint_id = ? ORDER BY key`, record.ID)
 	if err != nil {
 		return err
 	}
-	defer metadata.Close()
+	defer closeRows(metadata)
 	for metadata.Next() {
 		var key, value string
 		if err := metadata.Scan(&key, &value); err != nil {
@@ -439,6 +716,9 @@ func scanCheckpoint(row scanner) (CheckpointRecord, error) {
 	return record, nil
 }
 
+// ListMutations returns mutations matching filter.
+//
+//nolint:gocritic // MutationFilter is a stable value-type API boundary.
 func (d *DB) ListMutations(filter MutationFilter) ([]MutationRecord, error) {
 	limit := filter.Limit
 	if limit <= 0 || limit > 1000 {
@@ -470,7 +750,7 @@ func (d *DB) ListMutations(filter MutationFilter) ([]MutationRecord, error) {
 		conditions = append(conditions, "m.success = 0")
 	}
 	arguments = append(arguments, limit)
-	rows, err := d.db.Query(`SELECT
+	rows, err := d.db.QueryContext(context.Background(), `SELECT
 		m.id, m.actor, m.session_generation, COALESCE(m.turn_id, ''), m.turn_index, m.tool_call_id, m.tool, m.operation, m.cwd,
 		COALESCE(m.repository_uuid, ''), COALESCE(m.repository_root, ''), COALESCE(m.workspace_uuid, ''),
 		COALESCE(m.workspace_root, ''), COALESCE(m.workspace_kind, ''), m.workspace_key,
@@ -482,7 +762,7 @@ func (d *DB) ListMutations(filter MutationFilter) ([]MutationRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { closeRows(rows) }()
 	result := make([]MutationRecord, 0)
 	for rows.Next() {
 		record, err := scanMutation(rows)
@@ -494,8 +774,9 @@ func (d *DB) ListMutations(filter MutationFilter) ([]MutationRecord, error) {
 	return result, rows.Err()
 }
 
+// Mutation returns the mutation identified by id.
 func (d *DB) Mutation(id string) (MutationRecord, error) {
-	row := d.db.QueryRow(`SELECT
+	row := d.db.QueryRowContext(context.Background(), `SELECT
 		id, actor, session_generation, COALESCE(turn_id, ''), turn_index, tool_call_id, tool, operation, cwd,
 		COALESCE(repository_uuid, ''), COALESCE(repository_root, ''), COALESCE(workspace_uuid, ''),
 		COALESCE(workspace_root, ''), COALESCE(workspace_kind, ''), workspace_key,
@@ -559,6 +840,7 @@ func rawOptional(value string) json.RawMessage {
 	return json.RawMessage(value)
 }
 
+// Timeline returns events matching actor and eventType.
 func (d *DB) Timeline(actor, eventType string, limit int, scopes ...ActorScope) ([]EventRecord, error) {
 	if limit <= 0 || limit > 5000 {
 		limit = 100
@@ -579,11 +861,11 @@ func (d *DB) Timeline(actor, eventType string, limit int, scopes ...ActorScope) 
 		arguments = append(arguments, eventType)
 	}
 	arguments = append(arguments, limit)
-	rows, err := d.db.Query(`SELECT sequence, type, at, data FROM events WHERE `+strings.Join(conditions, " AND ")+` ORDER BY sequence DESC LIMIT ?`, arguments...)
+	rows, err := d.db.QueryContext(context.Background(), `SELECT sequence, type, at, data FROM events WHERE `+strings.Join(conditions, " AND ")+` ORDER BY sequence DESC LIMIT ?`, arguments...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { closeRows(rows) }()
 	result := make([]EventRecord, 0)
 	for rows.Next() {
 		var record EventRecord
@@ -597,6 +879,7 @@ func (d *DB) Timeline(actor, eventType string, limit int, scopes ...ActorScope) 
 	return result, rows.Err()
 }
 
+// SessionEvents returns session events for actor.
 func (d *DB) SessionEvents(actor string, limit int, scopes ...ActorScope) ([]SessionRecord, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
@@ -606,12 +889,12 @@ func (d *DB) SessionEvents(actor string, limit int, scopes ...ActorScope) ([]Ses
 	if err != nil {
 		return nil, err
 	}
-	rows, err := d.db.Query(`SELECT id, actor, session_generation, type, at, turn_index,
+	rows, err := d.db.QueryContext(context.Background(), `SELECT id, actor, session_generation, type, at, turn_index,
 		COALESCE(summary, ''), data, event_sequence FROM session_events WHERE actor = ? ORDER BY at DESC, event_sequence DESC, id DESC LIMIT ?`, uuidBlob(resolved), limit)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { closeRows(rows) }()
 	result := make([]SessionRecord, 0)
 	for rows.Next() {
 		var record SessionRecord

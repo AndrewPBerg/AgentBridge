@@ -56,6 +56,15 @@ async function start(pi: ReturnType<typeof createMockPi>, client: BridgeClient, 
   return ctx;
 }
 
+async function emitAll(pi: ReturnType<typeof createMockPi>, name: string, event: any, ctx: any) {
+  let result: any;
+  for (const handler of pi.events.get(name) ?? []) {
+    const next = await handler(event, ctx);
+    if (next !== undefined) result = next;
+  }
+  return result;
+}
+
 describe("Go Agent Bridge adapter", () => {
   const repositoryUUID = "11111111-1111-5111-8111-111111111111";
   const workspaceUUID = "22222222-2222-5222-8222-222222222222";
@@ -76,7 +85,9 @@ describe("Go Agent Bridge adapter", () => {
     const ctx = await start(pi, client);
     await pi.events.get("turn_start")?.[0]?.({ turnIndex: 2, timestamp: Date.now() }, ctx);
 
-    await pi.events.get("tool_call")?.[0]?.({ toolName: "edit", toolCallId: "edit-1", input: { path: "src/schema.ts" } }, ctx);
+    for (const handler of pi.events.get("tool_call") ?? []) {
+      await handler({ toolName: "edit", toolCallId: "edit-1", input: { path: "src/schema.ts" } }, ctx);
+    }
     expect(client.call).toHaveBeenCalledWith(
       "intent.begin",
       expect.objectContaining({
@@ -91,7 +102,9 @@ describe("Go Agent Bridge adapter", () => {
         }),
       }),
     );
-    await pi.events.get("tool_result")?.[0]?.({ toolName: "edit", toolCallId: "edit-1" }, ctx);
+    for (const handler of pi.events.get("tool_result") ?? []) {
+      await handler({ toolName: "edit", toolCallId: "edit-1" }, ctx);
+    }
     expect(client.call).toHaveBeenCalledWith(
       "intent.end",
       expect.objectContaining({
@@ -241,8 +254,10 @@ describe("Go Agent Bridge adapter", () => {
       return undefined;
     });
     const ctx = await start(pi, client);
-    await pi.events.get("tool_call")?.[0]?.({ toolName: "bash", toolCallId: "test-1", input: { command: "pnpm test" } }, ctx);
-    await pi.events.get("tool_result")?.[0]?.(
+    await emitAll(pi, "tool_call", { toolName: "bash", toolCallId: "test-1", input: { command: "pnpm test" } }, ctx);
+    await emitAll(
+      pi,
+      "tool_result",
       {
         toolName: "bash",
         toolCallId: "test-1",
@@ -293,8 +308,8 @@ describe("Go Agent Bridge adapter", () => {
         details: { output: "output", exitCode, cancelled: exitCode === undefined, truncated: false },
         isError,
       };
-      await pi.events.get("tool_call")?.[0]?.(event, ctx);
-      await pi.events.get("tool_result")?.[0]?.(event, ctx);
+      await emitAll(pi, "tool_call", event, ctx);
+      await emitAll(pi, "tool_result", event, ctx);
     };
     await record("failed-1", 1, true);
     await pi.tools.get("bridge_checkpoint").execute("failed", { kind: "failed" });
@@ -347,8 +362,10 @@ describe("Go Agent Bridge adapter", () => {
       return undefined;
     });
     const ctx = await start(pi, client);
-    await pi.events.get("tool_call")?.[0]?.({ toolName: "bash", toolCallId: "nope", input: { command: "echo hello" } }, ctx);
-    await pi.events.get("tool_result")?.[0]?.(
+    await emitAll(pi, "tool_call", { toolName: "bash", toolCallId: "nope", input: { command: "echo hello" } }, ctx);
+    await emitAll(
+      pi,
+      "tool_result",
       {
         toolName: "bash",
         toolCallId: "nope",
@@ -358,8 +375,10 @@ describe("Go Agent Bridge adapter", () => {
       },
       ctx,
     );
-    await pi.events.get("tool_call")?.[0]?.({ toolName: "bash", toolCallId: "bad", input: { command: "go test ./..." } }, ctx);
-    await pi.events.get("tool_result")?.[0]?.(
+    await emitAll(pi, "tool_call", { toolName: "bash", toolCallId: "bad", input: { command: "go test ./..." } }, ctx);
+    await emitAll(
+      pi,
+      "tool_result",
       {
         toolName: "bash",
         toolCallId: "bad",
@@ -398,8 +417,10 @@ describe("Go Agent Bridge adapter", () => {
       return undefined;
     });
     const ctx = await start(pi, client);
-    await pi.events.get("tool_call")?.[0]?.({ toolName: "bash", toolCallId: "keep", input: { command: "vitest run" } }, ctx);
-    await pi.events.get("tool_result")?.[0]?.(
+    await emitAll(pi, "tool_call", { toolName: "bash", toolCallId: "keep", input: { command: "vitest run" } }, ctx);
+    await emitAll(
+      pi,
+      "tool_result",
       { toolName: "bash", toolCallId: "keep", isError: false, details: { output: "ok", exitCode: 0, truncated: false } },
       ctx,
     );
@@ -421,8 +442,8 @@ describe("Go Agent Bridge adapter", () => {
     });
     const ctx = await start(pi, client);
     const event = { toolName: "bash", toolCallId: "verify-mutate", input: { command: "pnpm test && rm -f generated.txt" } };
-    await pi.events.get("tool_call")?.[0]?.(event, ctx);
-    await pi.events.get("tool_result")?.[0]?.({ ...event, isError: true, details: { output: "FAIL", exitCode: 1, truncated: false } }, ctx);
+    await emitAll(pi, "tool_call", event, ctx);
+    await emitAll(pi, "tool_result", { ...event, isError: true, details: { output: "FAIL", exitCode: 1, truncated: false } }, ctx);
     expect(client.call).toHaveBeenCalledWith(
       "intent.end",
       expect.objectContaining({ intent_id: expect.stringContaining("verify-mutate") }),
@@ -538,6 +559,80 @@ describe("Go Agent Bridge adapter", () => {
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });
 
+  it("shows compact Direction status and sends lifecycle transitions", async () => {
+    const pi = createMockPi();
+    const directionUUID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let direction = { direction_uuid: directionUUID, objective: "ship orchestration", state: "draft", created_by: "sender" };
+    const units = [
+      { ...workUnit("33333333-3333-5333-8333-333333333333"), state: "active" },
+      { ...workUnit("44444444-4444-5444-8444-444444444444"), state: "active" },
+      { ...workUnit("55555555-5555-5555-8555-555555555555"), state: "paused" },
+    ];
+    const client = mockClient((method, params) => {
+      if (method === "direction.create") return direction;
+      if (method === "direction.status") return { direction, work_units: units };
+      if (method === "direction.transition") {
+        direction = { ...direction, state: params.state };
+        return direction;
+      }
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.commands.get("direction").handler("ship orchestration", ctx);
+    await pi.commands.get("direction").handler("status", ctx);
+    expect(client.call).toHaveBeenCalledWith("direction.status", { direction_uuid: directionUUID });
+    expect(ctx.ui.notify).toHaveBeenCalledWith("ship orchestration · draft · WorkUnits active=2 paused=1", "info");
+    for (const [command, state] of [
+      ["start", "active"],
+      ["pause", "paused"],
+      ["converge", "converging"],
+      ["verify", "verified"],
+      ["complete", "completed"],
+      ["abandon", "abandoned"],
+    ]) {
+      await pi.commands.get("direction").handler(command, ctx);
+      expect(client.call).toHaveBeenCalledWith("direction.transition", { direction_uuid: directionUUID, actor: "sender", state });
+    }
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("rejects invalid Direction actions and clears a stale selection", async () => {
+    const pi = createMockPi();
+    const directionUUID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const direction = { direction_uuid: directionUUID, objective: "stale", state: "active", created_by: "sender" };
+    const client = mockClient((method) => {
+      if (method === "direction.get") return direction;
+      if (method === "direction.status") throw new Error("direction not found");
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.commands.get("direction").handler("start", ctx);
+    expect(client.call).not.toHaveBeenCalledWith("direction.transition", expect.anything());
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("No Direction selected"), "warning");
+    await pi.commands.get("direction").handler(`use ${directionUUID}`, ctx);
+    await pi.commands.get("direction").handler("status", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Selected Direction cleared"), "warning");
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("clears Direction selection on shutdown", async () => {
+    const pi = createMockPi();
+    const directionUUID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const client = mockClient((method) =>
+      method === "direction.get"
+        ? { direction_uuid: directionUUID, objective: "shutdown", state: "active", created_by: "sender" }
+        : undefined,
+    );
+    const ctx = await start(pi, client);
+    await pi.commands.get("direction").handler(`use ${directionUUID}`, ctx);
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    const secondPi = createMockPi();
+    const second = await start(secondPi, client, context("second"));
+    await secondPi.commands.get("direction").handler("status", second);
+    expect(second.ui.notify).toHaveBeenCalledWith("No Direction selected.", "info");
+    await secondPi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, second);
+  });
+
   it("creates, joins, and selects a WorkUnit, then reports and clears it", async () => {
     const pi = createMockPi();
     const client = mockClient((method, params) => {
@@ -547,10 +642,10 @@ describe("Go Agent Bridge adapter", () => {
       return undefined;
     });
     const ctx = await start(pi, client);
-    await pi.commands.get("work").handler("ship orchestration", ctx);
+    await pi.commands.get("work").handler("<3 remaining tasks", ctx);
     expect(client.call).toHaveBeenCalledWith(
       "work_unit.create",
-      expect.objectContaining({ work_unit: expect.objectContaining({ created_by: "sender" }) }),
+      expect.objectContaining({ work_unit: expect.objectContaining({ created_by: "sender", objective: "<3 remaining tasks" }) }),
     );
     expect(client.call).toHaveBeenCalledWith("work_unit.join", expect.objectContaining({ actor: "sender" }));
     await pi.commands.get("work").handler("status", ctx);

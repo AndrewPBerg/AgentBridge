@@ -1,3 +1,4 @@
+//nolint:cyclop // package average includes out-of-scope production functions.
 package state
 
 import (
@@ -7,6 +8,7 @@ import (
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
 )
 
+//nolint:cyclop,gocognit // end-to-end test keeps setup and assertions together.
 func TestWorkUnitUpdatesAcrossStatesAreIdempotentAndReplayable(t *testing.T) {
 	engine, journal, now := newTestEngine(t)
 	actor := register(t, engine, "01234567-89ab-4def-8123-456789abcdef")
@@ -77,7 +79,7 @@ func TestWorkUnitJournalReplayAndEqualParticipants(t *testing.T) {
 	if _, err = engine.TransitionWorkUnit(protocol.WorkUnitTransitionParams{WorkUnitUUID: unit.UUID, Actor: other.Address, State: protocol.WorkUnitActive}); err != nil {
 		t.Fatal(err)
 	}
-	replayed, err := New(&memoryJournal{}, journal.events, Options{Now: func() time.Time { return time.Now() }})
+	replayed, err := New(&memoryJournal{}, journal.events, Options{Now: time.Now})
 	if err != nil {
 		t.Fatal(err)
 	}

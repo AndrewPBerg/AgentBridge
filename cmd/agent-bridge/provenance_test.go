@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -26,7 +27,7 @@ func TestMigrateLegacyJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(migrated) != string(content) {
+	if !bytes.Equal(migrated, content) {
 		t.Fatalf("migrated content = %q", migrated)
 	}
 	info, err := os.Stat(target)

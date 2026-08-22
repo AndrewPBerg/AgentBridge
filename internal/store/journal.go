@@ -13,6 +13,9 @@ import (
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
 )
 
+func ignoreError(error) {}
+
+// ErrJournalPoisoned indicates that an append may not have been durable.
 var ErrJournalPoisoned = errors.New("journal is poisoned; restart the daemon before retrying")
 
 type appendFile interface {
@@ -21,6 +24,7 @@ type appendFile interface {
 	Close() error
 }
 
+// Journal is an append-only event journal.
 type Journal struct {
 	mu       sync.Mutex
 	file     appendFile
@@ -28,6 +32,9 @@ type Journal struct {
 	poisoned bool
 }
 
+// Open opens path, replaying valid events and repairing a partial final line.
+//
+//nolint:cyclop // open performs the ordered durability and repair checks.
 func Open(path string) (*Journal, []protocol.Event, error) {
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
@@ -46,30 +53,30 @@ func Open(path string) (*Journal, []protocol.Event, error) {
 		return nil, nil, fmt.Errorf("open journal: %w", err)
 	}
 	if err := file.Chmod(0o600); err != nil {
-		file.Close()
+		ignoreError(file.Close())
 		return nil, nil, fmt.Errorf("secure journal: %w", err)
 	}
 	events, validBytes, err := readEvents(file)
 	if err != nil {
-		file.Close()
+		ignoreError(file.Close())
 		return nil, nil, err
 	}
 	if err := file.Truncate(validBytes); err != nil {
-		file.Close()
+		ignoreError(file.Close())
 		return nil, nil, fmt.Errorf("truncate partial journal tail: %w", err)
 	}
 	if err := file.Sync(); err != nil {
-		file.Close()
+		ignoreError(file.Close())
 		return nil, nil, fmt.Errorf("sync repaired journal: %w", err)
 	}
 	if created {
 		if err := syncDirectory(directory); err != nil {
-			file.Close()
+			ignoreError(file.Close())
 			return nil, nil, err
 		}
 	}
 	if _, err := file.Seek(0, io.SeekEnd); err != nil {
-		file.Close()
+		ignoreError(file.Close())
 		return nil, nil, fmt.Errorf("seek journal end: %w", err)
 	}
 	return &Journal{file: file, path: path}, events, nil
@@ -110,13 +117,16 @@ func syncDirectory(path string) error {
 	if err != nil {
 		return fmt.Errorf("open journal directory for sync: %w", err)
 	}
-	defer directory.Close()
+	defer func() { ignoreError(directory.Close()) }()
 	if err := directory.Sync(); err != nil {
 		return fmt.Errorf("sync journal directory: %w", err)
 	}
 	return nil
 }
 
+// Append durably appends event, poisoning the journal after a partial failure.
+//
+//nolint:gocritic // event is passed by value as part of the journal API.
 func (j *Journal) Append(event protocol.Event) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -148,6 +158,7 @@ func (j *Journal) Append(event protocol.Event) error {
 	return nil
 }
 
+// Close closes the journal. It is safe to call more than once.
 func (j *Journal) Close() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -159,4 +170,5 @@ func (j *Journal) Close() error {
 	return err
 }
 
+// Path returns the journal file path.
 func (j *Journal) Path() string { return j.path }

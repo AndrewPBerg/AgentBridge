@@ -18,6 +18,7 @@ import (
 	"github.com/AndrewPBerg/agent-bridge/internal/server"
 	"github.com/AndrewPBerg/agent-bridge/internal/state"
 	"github.com/AndrewPBerg/agent-bridge/internal/store"
+	watchsidecar "github.com/AndrewPBerg/agent-bridge/internal/watchman"
 )
 
 func main() {
@@ -31,41 +32,7 @@ func main() {
 	}
 }
 
-func run(args []string) error {
-	if len(args) == 0 {
-		return usageError()
-	}
-	switch args[0] {
-	case "serve":
-		return serve(args[1:])
-	case "ping":
-		return callAndPrint("ping", map[string]any{})
-	case "stop":
-		return callAndPrint("daemon.shutdown", map[string]any{})
-	case "sessions":
-		return sessions(args[1:])
-	case "scopes":
-		return callAndPrint("provenance.scopes", map[string]any{})
-	case "send":
-		return send(args[1:])
-	case "request":
-		return request(args[1:])
-	case "provenance":
-		return provenanceCommand(args[1:])
-	case "doctor":
-		return doctor(args[1:])
-	case "version", "--version", "-v":
-		fmt.Println("agent-bridge dev")
-		return nil
-	default:
-		return usageError()
-	}
-}
-
-func usageError() error {
-	return errors.New("usage: agent-bridge <serve|stop|ping|sessions|scopes|send|request|provenance|doctor|version>")
-}
-
+//nolint:cyclop // startup keeps ownership, replay, projection, Watchman, and serving in one ordered lifecycle.
 func serve(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	socket := flags.String("socket", defaultSocket(), "Unix socket path")
@@ -74,21 +41,32 @@ func serve(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if os.Getenv("AGENT_BRIDGE_STATE_DIR") == "" && os.Getenv("INVOCATION_ID") == "" && os.Getenv("AGENT_BRIDGE_ALLOW_UNMANAGED") != "1" {
+		return errors.New("production daemon lifecycle is managed by systemd; run: systemctl --user start agent-bridge.service")
+	}
 	if os.Getenv("AGENT_BRIDGE_STATE_DIR") == "" && *journalPath == defaultJournal() {
 		if err := migrateLegacyJournal(*journalPath); err != nil {
 			return err
 		}
 	}
+	metadata, err := newDaemonMetadata(*socket, *databasePath, *journalPath)
+	if err != nil {
+		return fmt.Errorf("create daemon metadata: %w", err)
+	}
+	if err := writeDaemonMetadata(metadata); err != nil {
+		return fmt.Errorf("write daemon metadata: %w", err)
+	}
+	defer removeDaemonMetadata(metadata)
 	journal, events, err := store.Open(*journalPath)
 	if err != nil {
 		return err
 	}
-	defer journal.Close()
+	defer closeQuietly(journal)
 	database, err := provenance.Open(*databasePath)
 	if err != nil {
 		return err
 	}
-	defer database.Close()
+	defer closeQuietly(database)
 	if err := database.ProjectAll(events); err != nil {
 		return fmt.Errorf("backfill provenance database: %w", err)
 	}
@@ -104,7 +82,9 @@ func serve(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
-	fmt.Fprintf(os.Stderr, "agent-bridge listening on %s (replayed %d events, provenance %s)\n", *socket, len(events), *databasePath)
+	watchManager := watchsidecar.New(engine)
+	go watchManager.Run(ctx)
+	fmt.Fprintf(os.Stderr, "agent-bridge listening on %s (replayed %d events, provenance %s, watchman %t)\n", *socket, len(events), *databasePath, watchManager.Available())
 	return server.NewWithProvenance(engine, database, *socket, appender).Serve(ctx)
 }
 

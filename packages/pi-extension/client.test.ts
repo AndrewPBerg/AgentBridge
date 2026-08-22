@@ -1,7 +1,7 @@
 import net from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { BridgeClient } from "./client";
+import { BridgeClient, ensureDaemon } from "./client";
 
 const servers: net.Server[] = [];
 
@@ -22,6 +22,11 @@ describe("BridgeClient", () => {
     await new Promise<void>((resolve, reject) => server.listen(path, resolve).once("error", reject));
 
     await expect(new BridgeClient(path).call("ping")).resolves.toEqual({ version: 1 });
+  });
+
+  it("does not spawn a daemon and points operators to systemd", async () => {
+    const path = join("/tmp", `agent-bridge-missing-${process.pid}-${Date.now()}.sock`);
+    await expect(ensureDaemon(new BridgeClient(path, 50))).rejects.toThrow("systemctl --user restart agent-bridge.service");
   });
 
   it("surfaces daemon error codes", async () => {

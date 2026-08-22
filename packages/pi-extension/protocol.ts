@@ -121,14 +121,39 @@ export type TestResult = {
   jj?: JjContext;
 };
 
+export type DirectionState = "draft" | "active" | "paused" | "converging" | "verified" | "completed" | "abandoned";
+export type DirectionTransition = Exclude<DirectionState, "draft">;
+
+/** Directions are project-level and intentionally have no repository/workspace scope. */
+export type Direction = {
+  direction_uuid: string;
+  objective: string;
+  success_criteria?: string;
+  constraints?: string;
+  context?: string;
+  state: DirectionState | string;
+  created_by: string;
+  created_at?: string;
+  updated_at?: string;
+  completed_at?: string;
+};
+
 export type WorkUnit = {
   work_unit_uuid: string;
   repository_uuid: string;
+  repository_root?: string | null;
   workspace_uuid: string;
+  workspace_root?: string | null;
+  workspace_kind?: string | null;
   objective: string;
   state: string;
   participants?: unknown[];
   checkpoints?: unknown[];
+};
+
+export type DirectionStatus = {
+  direction: Direction;
+  work_units: WorkUnit[];
 };
 
 export type CheckpointClaim = {
@@ -183,7 +208,7 @@ export type Collision = {
 
 export type BridgeMessage = {
   id: string;
-  kind: "message" | "collision";
+  kind: "message" | "collision" | "external_change";
   from: string;
   to: ActorRecord["address"];
   body: string;

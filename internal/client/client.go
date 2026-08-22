@@ -12,17 +12,22 @@ import (
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
 )
 
+func ignoreError(error) {}
+
+// Client communicates with an Agent Bridge server over its Unix socket.
 type Client struct {
 	SocketPath string
 	Timeout    time.Duration
 	sequence   atomic.Uint64
 }
 
+// New creates a client for the given Unix socket path.
 func New(socketPath string) *Client {
 	return &Client{SocketPath: socketPath, Timeout: 3 * time.Second}
 }
 
-func (c *Client) Call(ctx context.Context, method string, params any, result any) error {
+// Call invokes method and decodes its result into result when non-nil.
+func (c *Client) Call(ctx context.Context, method string, params, result any) error {
 	data, err := json.Marshal(params)
 	if err != nil {
 		return fmt.Errorf("encode params: %w", err)
@@ -33,9 +38,11 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 	if err != nil {
 		return fmt.Errorf("connect to agent-bridge: %w", err)
 	}
-	defer connection.Close()
+	defer func() { ignoreError(connection.Close()) }()
 	deadline := time.Now().Add(c.Timeout)
-	_ = connection.SetDeadline(deadline)
+	if err := connection.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("set connection deadline: %w", err)
+	}
 	if err := json.NewEncoder(connection).Encode(request); err != nil {
 		return fmt.Errorf("send request: %w", err)
 	}

@@ -1,6 +1,8 @@
+//nolint:cyclop // package average includes out-of-scope production functions.
 package provenance
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -13,7 +15,11 @@ func TestWorkUnitProjectionNormalizesParticipantsAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close db: %v", err)
+		}
+	}()
 	unit := protocol.WorkUnit{UUID: "21234567-89ab-4def-8123-456789abcdef", RepositoryUUID: "01234567-89ab-4def-8123-456789abcdef", WorkspaceUUID: "11234567-89ab-4def-8123-456789abcdef", Objective: "objective", State: protocol.WorkUnitProposed, CreatedBy: "01234567-89ab-4def-8123-456789abcdef", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	if err := db.Project(event(t, 1, "work_unit.created", protocol.WorkUnitCreatedEvent{WorkUnit: unit})); err != nil {
 		t.Fatal(err)
@@ -33,7 +39,7 @@ func TestWorkUnitProjectionNormalizesParticipantsAndReplay(t *testing.T) {
 		t.Fatalf("work unit = %#v", got)
 	}
 	var length int
-	if err := db.db.QueryRow(`SELECT length(work_unit_uuid) FROM work_units`).Scan(&length); err != nil {
+	if err := db.db.QueryRowContext(context.Background(), `SELECT length(work_unit_uuid) FROM work_units`).Scan(&length); err != nil {
 		t.Fatal(err)
 	}
 	if length != 16 {
@@ -46,7 +52,11 @@ func TestWorkUnitProjectionRejectsStaleAndUnauthorizedMutations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close db: %v", err)
+		}
+	}()
 	at := time.Now().UTC()
 	unit := protocol.WorkUnit{UUID: "21234567-89ab-4def-8123-456789abcdef", RepositoryUUID: "01234567-89ab-4def-8123-456789abcdef", WorkspaceUUID: "11234567-89ab-4def-8123-456789abcdef", Objective: "one", State: protocol.WorkUnitProposed, CreatedBy: "01234567-89ab-4def-8123-456789abcdef", CreatedAt: at, UpdatedAt: at}
 	actor := protocol.Actor{Address: unit.CreatedBy, SessionUUID: unit.CreatedBy, Harness: "pi", CWD: "/repo", State: "active", StartedAt: at, HeartbeatAt: at, RepositoryUUID: unit.RepositoryUUID, RepositoryRoot: "/repo", WorkspaceUUID: unit.WorkspaceUUID, WorkspaceRoot: "/repo", WorkspaceKind: "git"}

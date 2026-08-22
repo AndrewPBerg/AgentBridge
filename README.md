@@ -25,7 +25,16 @@ Design references: [roadmap](docs/roadmap.md), [vision](docs/vision.md), [VCS id
 - canonical delivery to known sessions while temporarily stale/reloading
 - concurrent request handling with serialized state transitions
 
-## Build and run
+## Install and run
+
+Agent Bridge is owned by a persistent `systemd --user` service. Pi adapters never spawn daemon processes.
+
+```bash
+./scripts/install-systemd-service.sh
+systemctl --user status agent-bridge.service
+```
+
+For foreground development only:
 
 ```bash
 go build -o agent-bridge ./cmd/agent-bridge
@@ -69,6 +78,16 @@ agent-bridge provenance who-changed /repo/file.ts
 agent-bridge provenance why <mutation-id>
 agent-bridge provenance agent @walkie
 agent-bridge provenance since-compaction @walkie
+# Non-Pi workers set bounded identity context once; worker commands derive generation and scope.
+export AGENT_BRIDGE_ACTOR_UUID=<canonical-session-uuid>
+export AGENT_BRIDGE_WORK_UNIT_UUID=<work-unit-uuid>
+agent-bridge worker status
+agent-bridge worker poll --limit 10
+agent-bridge worker ack <message-id>
+agent-bridge worker send @walkie "Please review the change"
+agent-bridge worker test --id test-1 --command 'go test ./...' --exit-code 0
+agent-bridge worker checkpoint --id cp-1 --kind test --claim "tests pass" --status verified --test-result test-1
+agent-bridge worker transition verified
 ```
 
 The low-level `request` command is primarily for development and harness adapters.
@@ -101,6 +120,18 @@ intent.begin
 intent.end
 collision.transition
 session.event
+test.result
+direction.create
+direction.get
+direction.status
+direction.transition
+work_unit.create
+work_unit.get
+work_unit.update
+work_unit.join
+work_unit.leave
+work_unit.transition
+checkpoint.request
 ```
 
 ## Ordering and durability
@@ -146,6 +177,10 @@ Pi exposes the concise client command:
 /bus list
 /bus name walkie
 /bus status
+/work <objective>                  # create and select a WorkUnit
+/work use <uuid>                  # join and select an existing WorkUnit
+/work status
+/work clear
 ```
 
 `/bridge` remains a deprecated compatibility alias.

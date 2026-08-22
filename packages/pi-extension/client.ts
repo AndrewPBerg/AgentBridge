@@ -1,6 +1,4 @@
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
 import net from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -58,30 +56,8 @@ export class BridgeClient {
 export async function ensureDaemon(client: BridgeClient): Promise<void> {
   try {
     await client.call("ping");
-    return;
-  } catch {
-    // Start the persistent local daemon below.
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Agent Bridge daemon is unavailable (${detail}). Restart it with: systemctl --user restart agent-bridge.service`);
   }
-  const binary = process.env.AGENT_BRIDGE_BIN || "agent-bridge";
-  const child = spawn(binary, ["serve"], {
-    detached: true,
-    stdio: "ignore",
-    env: process.env,
-  });
-  child.on("error", () => undefined);
-  child.unref();
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    try {
-      await client.call("ping");
-      return;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  const binaryExists = binary.includes("/") ? existsSync(binary) : true;
-  throw new Error(
-    `Could not start Agent Bridge daemon with ${binary}${binaryExists ? "" : " (binary not found)"}: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
-  );
 }

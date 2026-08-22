@@ -31,7 +31,14 @@ func execute(args []string) error {
 		}}
 		root.AddCommand(command)
 	}
-	add("serve", "Run the coordination daemon", serve)
+	root.AddCommand(&cobra.Command{
+		Use:                "serve",
+		Short:              "Run the coordination daemon",
+		DisableFlagParsing: true,
+		RunE: func(_ *cobra.Command, args []string) error {
+			return serve(args)
+		},
+	})
 	add("ping", "Check daemon connectivity", func(args []string) error {
 		if len(args) != 0 {
 			return errors.New("usage: agent-bridge ping")
@@ -52,21 +59,41 @@ func execute(args []string) error {
 		return callAndPrint("provenance.scopes", map[string]any{})
 	})
 	add("send", "Send a durable peer message", send)
+	root.AddCommand(&cobra.Command{
+		Use:                "worker",
+		Short:              "Coordinate work from a non-Pi worker",
+		DisableFlagParsing: true,
+		RunE: func(_ *cobra.Command, args []string) error {
+			return worker(args)
+		},
+	})
 	add("request", "Send a raw JSON-RPC request", request)
 	add("provenance", "Query causal provenance", provenanceCommand)
 	add("doctor", "Check deployment integrity", doctor)
+	daemon := &cobra.Command{Use: "daemon", Short: "Manage the coordination daemon"}
+	recoverCommand := &cobra.Command{Use: "recover", Short: "Repair an unreachable daemon", FParseErrWhitelist: cobra.FParseErrWhitelist{UnknownFlags: true}, RunE: func(_ *cobra.Command, args []string) error { return recoverDaemon(args) }}
+	daemon.AddCommand(recoverCommand)
+	root.AddCommand(daemon)
 	add("version", "Print version information", versionCommand)
 
-	if err := root.Execute(); err != nil {
-		if jsonOutput {
-			var failure doctorFailure
-			if !errors.As(err, &failure) {
-				_ = printJSON(map[string]any{"ok": false, "error": map[string]string{"message": err.Error()}})
-			}
-		}
+	err := root.Execute()
+	if err == nil {
+		return nil
+	}
+	return reportExecutionError(err)
+}
+
+func reportExecutionError(err error) error {
+	if !jsonOutput {
 		return err
 	}
-	return nil
+	if failure, ok := errors.AsType[doctorFailure](err); ok && failure.Error() != "" {
+		return err
+	}
+	if printErr := printJSON(map[string]any{"ok": false, "error": map[string]string{"message": err.Error()}}); printErr != nil {
+		return errors.Join(err, printErr)
+	}
+	return err
 }
 
 func versionCommand(args []string) error {

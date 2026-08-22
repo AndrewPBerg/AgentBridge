@@ -9,8 +9,9 @@ import (
 func TestGitWorktreesShareRepositoryButNotWorkspace(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
 	registerGit := func(address, root, branch string) protocol.Actor {
+		address = testActorUUID(address)
 		actor, err := engine.Register(protocol.Actor{
-			Address: address, Harness: "pi", SessionUUID: address[3:], CWD: root, State: "active",
+			Address: address, Harness: "pi", SessionUUID: address, CWD: root, State: "active",
 			Git: &protocol.GitContext{RepoRoot: "/repo", WorktreeRoot: root, CommonDir: "/repo/.git", Branch: branch},
 		})
 		if err != nil {
@@ -31,8 +32,9 @@ func TestGitWorktreesShareRepositoryButNotWorkspace(t *testing.T) {
 func TestAliasResolutionPrefersSenderWorkspaceThenRepository(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
 	actor := func(address, root string) protocol.Actor {
+		address = testActorUUID(address)
 		value, err := engine.Register(protocol.Actor{
-			Address: address, Harness: "pi", SessionUUID: address[3:], CWD: root, State: "active",
+			Address: address, Harness: "pi", SessionUUID: address, CWD: root, State: "active",
 			Git: &protocol.GitContext{RepoRoot: "/repo", WorktreeRoot: root, CommonDir: "/repo/.git"},
 		})
 		if err != nil {
@@ -60,8 +62,9 @@ func TestAliasResolutionPrefersSenderWorkspaceThenRepository(t *testing.T) {
 
 func TestIntentGetsRepositoryRelativePathsAndDirectoryScope(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
+	workerUUID := testActorUUID("worker")
 	actor, err := engine.Register(protocol.Actor{
-		Address: "worker", Harness: "pi", SessionUUID: "worker", CWD: "/repo", State: "active",
+		Address: workerUUID, Harness: "pi", SessionUUID: workerUUID, CWD: "/repo", State: "active",
 		Git: &protocol.GitContext{RepoRoot: "/repo", WorktreeRoot: "/repo", CommonDir: "/repo/.git"},
 	})
 	if err != nil {
