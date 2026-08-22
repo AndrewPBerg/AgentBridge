@@ -4,7 +4,9 @@ Agent Bridge is a local coordination daemon for independently launched coding-ag
 
 The Go daemon owns coordination truth. Harness integrations remain thin adapters.
 
-Design references: [vision](docs/vision.md), [VCS identity](docs/vcs.md), [provenance](docs/provenance.md), and [harness compatibility](docs/harnesses.md).
+This repository is the canonical product source; installed daemon and Pi files are deployment artifacts. The earlier `AgentBridge` watcher/SSH prototype is historical, not a second implementation target. See [canonical direction and first-prototype lessons](docs/retrospective.md).
+
+Design references: [roadmap](docs/roadmap.md), [vision](docs/vision.md), [VCS identity](docs/vcs.md), [provenance](docs/provenance.md), and [harness compatibility](docs/harnesses.md).
 
 ## Current vertical slice
 

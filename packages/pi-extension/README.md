@@ -3,7 +3,7 @@
 This is the thin Pi adapter for the Go Agent Bridge daemon in:
 
 ```text
-/home/andrew/ideas/agent-bridge
+/home/andrew/Desktop/personal/AgentBridge
 ```
 
 The adapter owns only Pi-specific behavior:
@@ -21,7 +21,7 @@ The Go daemon owns actors, aliases, ordered durable queues, collision state, sel
 ## Install daemon
 
 ```bash
-cd /home/andrew/ideas/agent-bridge
+cd /home/andrew/Desktop/personal/AgentBridge
 go install ./cmd/agent-bridge
 ```
 
