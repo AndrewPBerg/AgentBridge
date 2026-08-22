@@ -5,7 +5,7 @@ import { initialTalkTargets, showTalkModal } from "./talk-modal";
 function actor(session: string, options: Partial<ActorRecord> = {}): ActorRecord {
   const now = new Date().toISOString();
   return {
-    address: `pi:${session}`,
+    address: `${session}`,
     harness: "pi",
     session_uuid: session,
     cwd: "/repo",
@@ -69,8 +69,8 @@ describe("Bus talk modal", () => {
         },
       }),
     ];
-    expect(initialTalkTargets(current, peers, "@pi:a,@pi:b")).toEqual(["@pi:a", "@pi:b"]);
-    expect(initialTalkTargets(current, peers, "--repo")).toEqual(["pi:a", "pi:b"]);
+    expect(initialTalkTargets(current, peers, "@a,@b")).toEqual(["@a", "@b"]);
+    expect(initialTalkTargets(current, peers, "--repo")).toEqual(["a", "b"]);
   });
   it("fans out to all active agents in the current repository", async () => {
     const current = actor("current");
@@ -101,7 +101,7 @@ describe("Bus talk modal", () => {
     });
 
     await expect(showTalkModal(ctx, current, peers)).resolves.toEqual({
-      targets: ["pi:a", "pi:b"],
+      targets: ["a", "b"],
       body: "hello repo",
     });
   });
@@ -117,7 +117,7 @@ describe("Bus talk modal", () => {
       component.handleInput("enter");
     });
     await expect(showTalkModal(ctx, current, peers)).resolves.toEqual({
-      targets: ["pi:a"],
+      targets: ["a"],
       body: "jk message",
     });
   });
@@ -131,7 +131,7 @@ describe("Bus talk modal", () => {
       component.handleInput("enter");
     });
     await expect(showTalkModal(ctx, current, [peer, second], ["@walkie", "@talkie"])).resolves.toEqual({
-      targets: ["pi:a", "pi:b"],
+      targets: ["a", "b"],
       body: "direct hello",
     });
   });

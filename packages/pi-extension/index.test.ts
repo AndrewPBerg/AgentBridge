@@ -7,7 +7,7 @@ import { createMockContext, createMockPi } from "./test/mocks/pi-coding-agent";
 function actor(session = "sender"): ActorRecord {
   const now = new Date().toISOString();
   return {
-    address: `pi:${session}`,
+    address: `${session}`,
     harness: "pi",
     session_uuid: session,
     cwd: "/repo",
@@ -68,7 +68,7 @@ describe("Go Agent Bridge adapter", () => {
       "intent.begin",
       expect.objectContaining({
         intent: expect.objectContaining({
-          actor: "pi:sender",
+          actor: "sender",
           turn_id: expect.stringContaining(":turn:2"),
           turn_index: 2,
           tool_call_id: "edit-1",
@@ -186,7 +186,7 @@ describe("Go Agent Bridge adapter", () => {
     const pi = createMockPi();
     const client = mockClient((method) => {
       if (method === "checkpoint.request") {
-        return { id: "checkpoint:test", actor: "pi:sender", checkpoint_kind: "settled" };
+        return { id: "test", actor: "sender", checkpoint_kind: "settled" };
       }
       return undefined;
     });
@@ -197,7 +197,7 @@ describe("Go Agent Bridge adapter", () => {
     expect(client.call).toHaveBeenCalledWith(
       "checkpoint.request",
       expect.objectContaining({
-        request: expect.objectContaining({ actor: "pi:sender", declared_by: "agent", checkpoint_kind: "settled", turn_index: 4 }),
+        request: expect.objectContaining({ actor: "sender", declared_by: "agent", checkpoint_kind: "settled", turn_index: 4 }),
       }),
     );
     await pi.commands.get("checkpoint").handler("handoff", ctx);
@@ -237,8 +237,8 @@ describe("Go Agent Bridge adapter", () => {
     expect(bus.getArgumentCompletions("t")).toEqual([
       expect.objectContaining({ value: "talk", description: expect.stringContaining("Send a message") }),
     ]);
-    await bus.handler("talk pi:receiver hello from bus", ctx);
-    expect(client.call).toHaveBeenCalledWith("message.send", expect.objectContaining({ to: "pi:receiver", body: "hello from bus" }));
+    await bus.handler("talk receiver hello from bus", ctx);
+    expect(client.call).toHaveBeenCalledWith("message.send", expect.objectContaining({ to: "receiver", body: "hello from bus" }));
     await bus.handler("status", ctx);
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("projection 10/10"), "info");
     expect(pi.commands.get("bridge").description).toContain("Deprecated alias");
@@ -254,7 +254,7 @@ describe("Go Agent Bridge adapter", () => {
     const ctx = await start(pi, client);
     await pi.commands.get("bus").handler("talk --repo hello repository", ctx);
     const sends = vi.mocked(client.call).mock.calls.filter(([method]) => method === "message.send");
-    expect(sends.map(([, params]) => (params as any).to)).toEqual(["pi:peer-a", "pi:peer-b"]);
+    expect(sends.map(([, params]) => (params as any).to)).toEqual(["peer-a", "peer-b"]);
     expect(sends.every(([, params]) => (params as any).body === "hello repository")).toBe(true);
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });
@@ -269,8 +269,8 @@ describe("Go Agent Bridge adapter", () => {
       return {
         id: `message-${params.client_sequence}`,
         kind: "message",
-        from: "pi:sender",
-        to: "pi:receiver",
+        from: "sender",
+        to: "receiver",
         body: params.body,
         global_sequence: params.client_sequence,
         sender_sequence: params.client_sequence,
@@ -281,7 +281,7 @@ describe("Go Agent Bridge adapter", () => {
     });
     const ctx = await start(pi, client);
     const tool = pi.tools.get("bridge_message");
-    await Promise.all([tool.execute("one", { to: "pi:receiver", body: "one" }), tool.execute("two", { to: "pi:receiver", body: "two" })]);
+    await Promise.all([tool.execute("one", { to: "receiver", body: "one" }), tool.execute("two", { to: "receiver", body: "two" })]);
     expect(sent).toEqual([1, 2]);
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });
@@ -293,8 +293,8 @@ describe("Go Agent Bridge adapter", () => {
     const message: BridgeMessage = {
       id: "message-1",
       kind: "message",
-      from: "pi:peer",
-      to: "pi:sender",
+      from: "peer",
+      to: "sender",
       body: "hello",
       global_sequence: 1,
       sender_sequence: 1,
@@ -312,7 +312,7 @@ describe("Go Agent Bridge adapter", () => {
     });
     expect(client.call).not.toHaveBeenCalledWith("mailbox.ack", expect.anything());
     await pi.events.get("agent_settled")?.[0]?.({}, ctx);
-    expect(client.call).toHaveBeenCalledWith("mailbox.ack", { actor: "pi:sender", message_ids: ["message-1"] });
+    expect(client.call).toHaveBeenCalledWith("mailbox.ack", { actor: "sender", message_ids: ["message-1"] });
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });
 });

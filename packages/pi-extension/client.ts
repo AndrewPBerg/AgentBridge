@@ -23,7 +23,7 @@ export class BridgeClient {
   ) {}
 
   call<T>(method: string, params: unknown = {}): Promise<T> {
-    const id = `pi:${process.pid}:${++this.requestSequence}:${randomUUID()}`;
+    const id = randomUUID();
     return new Promise<T>((resolve, reject) => {
       const socket = net.createConnection(this.socketPath);
       let buffer = "";

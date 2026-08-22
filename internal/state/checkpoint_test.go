@@ -8,7 +8,7 @@ import (
 
 func TestCheckpointRequestIsIdempotentAndCapturesRange(t *testing.T) {
 	engine, journal, _ := newTestEngine(t)
-	actor := register(t, engine, "pi:checkpoint")
+	actor := register(t, engine, "checkpoint")
 	request := protocol.CheckpointRequest{ID: "checkpoint-request-1", Actor: actor.Address, CheckpointKind: "settled"}
 	first, err := engine.RequestCheckpoint(request)
 	if err != nil {

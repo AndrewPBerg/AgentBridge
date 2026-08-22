@@ -23,12 +23,12 @@ func deterministicUUID(key string) string {
 }
 
 func normalizeActorScope(actor protocol.Actor) protocol.Actor {
-	repositoryKey := "dir:" + actor.CWD
+	repositoryKey := "dir\x00" + actor.CWD
 	repositoryRoot := actor.CWD
 	workspaceRoot := actor.CWD
 	kind := "directory"
 	if actor.Git != nil && actor.Git.CommonDir != "" {
-		repositoryKey = "git:" + actor.Git.CommonDir
+		repositoryKey = "git\x00" + actor.Git.CommonDir
 		repositoryRoot = actor.Git.RepoRoot
 		workspaceRoot = actor.Git.WorktreeRoot
 		kind = "git-worktree"
@@ -36,7 +36,7 @@ func normalizeActorScope(actor protocol.Actor) protocol.Actor {
 			kind = "git-jj-workspace"
 		}
 	} else if actor.JJ != nil && actor.JJ.RepoPath != "" {
-		repositoryKey = "jj:" + actor.JJ.RepoPath
+		repositoryKey = "jj\x00" + actor.JJ.RepoPath
 		repositoryRoot = actor.JJ.WorkspaceRoot
 		workspaceRoot = actor.JJ.WorkspaceRoot
 		kind = "jj-workspace"

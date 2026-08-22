@@ -172,7 +172,7 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
   async function requestCheckpoint(declaredBy: "agent" | "human", kind: string, workUnitUUID?: string): Promise<CheckpointRequest> {
     if (!actor) throw new Error("Agent Bridge is not attached to an active session");
     const boundary = `${actor.address}:${generation}:${kind}:${currentTurnIndex ?? "session"}`;
-    const id = `checkpoint:${createHash("sha256").update(boundary).digest("hex")}`;
+    const id = createHash("sha256").update(boundary).digest("hex");
     return call<CheckpointRequest>("checkpoint.request", {
       request: {
         id,
@@ -237,13 +237,13 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     name: "bridge_message",
     label: "Agent Bridge Message",
     description:
-      "Send an ordered durable coordination message to a peer by @alias, canonical harness:session address, or @change:ID. Canonical addresses remain deliverable while a known session reloads.",
+      "Send an ordered durable coordination message to a peer by @alias, canonical session UUID, or @ID. Canonical addresses remain deliverable while a known session reloads.",
     promptSnippet: "Send ordered durable coordination messages to peer agents.",
     promptGuidelines: [
       "Use bridge_message to coordinate with peers named in Agent Bridge collisions; never revert unfamiliar shared-workspace edits without coordinating first.",
     ],
     parameters: Type.Object({
-      to: Type.String({ description: "Target such as @walkie, @pi:<session UUID>, or @change:<JJ change ID>." }),
+      to: Type.String({ description: "Target such as @walkie, @<session UUID>, or @<JJ change ID>." }),
       body: Type.String({ description: "Coordination message." }),
     }),
     async execute(_toolCallId, params) {

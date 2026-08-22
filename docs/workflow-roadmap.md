@@ -21,12 +21,12 @@ The Pi session that produced the initial research and this roadmap is currently 
 
 ```text
 name / alias: @chronicler
-canonical:    @pi:01a02750-a75e-7a0f-b121-ab1df9786dbd
+canonical:    @01a02750-a75e-7a0f-b121-ab1df9786dbd
 JJ workspace: default
 JJ change:    mospuyszsrtrtzvnlyrrkvspkoyzxyyw
 ```
 
-The canonical `harness:session` address remains unambiguous while the session is known to Agent Bridge. The alias is workspace-scoped and useful while this actor is active. Future agents should prefer the canonical address when recording durable references.
+The canonical session UUID address remains unambiguous while the session is known to Agent Bridge. The alias is workspace-scoped and useful while this actor is active. Future agents should prefer the canonical address when recording durable references.
 
 Research artifacts are retained locally under:
 

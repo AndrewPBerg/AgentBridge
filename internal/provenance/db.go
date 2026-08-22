@@ -752,7 +752,7 @@ func deriveScope(cwd string, git *protocol.GitContext, jj *protocol.JJContext) (
 	workspaceRoot := cwd
 	kind := "directory"
 	if git != nil && git.CommonDir != "" {
-		repositoryKey = "git:" + git.CommonDir
+		repositoryKey = "git\x00" + git.CommonDir
 		repositoryRoot = git.RepoRoot
 		workspaceRoot = git.WorktreeRoot
 		kind = "git-worktree"
@@ -1180,8 +1180,10 @@ func checkpointWorkUnitUUID(value string) (any, error) {
 func uuidBlob(value string) []byte {
 	value = strings.TrimSpace(value)
 	candidate := value
+	// Legacy journal/API input may still carry a namespace marker. Strip it at
+	// the database boundary; no newly generated or returned identifier uses one.
 	for _, prefix := range []string{"pi:", "col:", "repo:", "workspace:"} {
-		if strings.HasPrefix(candidate, prefix) && len(strings.ReplaceAll(candidate[len(prefix):], "-", "")) == 32 {
+		if strings.HasPrefix(candidate, prefix) {
 			candidate = candidate[len(prefix):]
 			break
 		}

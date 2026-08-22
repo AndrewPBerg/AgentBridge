@@ -28,7 +28,7 @@ Meanings:
 - `common_dir`: shared metadata directory across linked worktrees
 - `branch` / `head`: current branch and commit identity
 
-Selectors can address active actors by `@git:<HEAD prefix>`. A selector must resolve to exactly one active actor.
+Selectors can address active actors by a direct Git HEAD prefix. A selector must resolve to exactly one active actor.
 
 ## JJ identity
 
@@ -50,7 +50,7 @@ Git repository/worktree → baseline workspace identity
 JJ workspace/change     → change ownership and dependency identity
 ```
 
-Selectors can address active actors by `@change:<JJ change ID prefix>`.
+Selectors can address active actors by a direct JJ change ID prefix.
 
 ## Authority scopes
 
@@ -72,7 +72,7 @@ Routing and alias authority narrow in this order:
 same workspace → same repository → global
 ```
 
-The same alias can exist in separate workspaces. A sender resolves its workspace-local peer first, then repository-local, and only then a globally unique actor. Canonical `harness:session` addresses always bypass scope ambiguity.
+The same alias can exist in separate workspaces. A sender resolves its workspace-local peer first, then repository-local, and only then a globally unique actor. Canonical session UUID addresses always bypass scope ambiguity.
 
 Discovery supports:
 

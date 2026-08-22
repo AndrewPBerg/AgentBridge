@@ -33,11 +33,11 @@ func TestUnixSocketRoundTrip(t *testing.T) {
 	bridge := client.New(path)
 	var registered protocol.Actor
 	if err := bridge.Call(context.Background(), "actor.register", protocol.RegisterParams{Actor: protocol.Actor{
-		Address: "pi:test", Harness: "pi", SessionUUID: "test", CWD: "/repo",
+		Address: "test", Harness: "pi", SessionUUID: "test", CWD: "/repo",
 	}}, &registered); err != nil {
 		t.Fatal(err)
 	}
-	if registered.Address != "pi:test" {
+	if registered.Address != "test" {
 		t.Fatalf("registered = %#v", registered)
 	}
 	var sessions struct {
@@ -46,7 +46,7 @@ func TestUnixSocketRoundTrip(t *testing.T) {
 	if err := bridge.Call(context.Background(), "sessions.list", map[string]any{}, &sessions); err != nil {
 		t.Fatal(err)
 	}
-	if len(sessions.Actors) != 1 || sessions.Actors[0].Address != "pi:test" {
+	if len(sessions.Actors) != 1 || sessions.Actors[0].Address != "test" {
 		t.Fatalf("sessions = %#v", sessions.Actors)
 	}
 

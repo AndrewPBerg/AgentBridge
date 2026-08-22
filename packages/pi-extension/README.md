@@ -55,7 +55,7 @@ AGENT_BRIDGE_STATE_DIR  state directory override (default: ~/.agent-bridge)
 
 ## Prototype boundary
 
-Git repositories are first-class: the adapter reports repository/worktree roots, git/common directories, branch or detached HEAD, and supports `@git:<HEAD prefix>` selectors. Co-located JJ metadata is layered on top when available.
+Git repositories are first-class: the adapter reports repository/worktree roots, git/common directories, branch or detached HEAD, and supports direct `<HEAD prefix>` selectors. Co-located JJ metadata is layered on top when available.
 
 Mutation provenance records before/after metadata and SHA-256 hashes (not file contents), plus turn boundaries and compaction summaries, in the daemon's local Turso read model.
 

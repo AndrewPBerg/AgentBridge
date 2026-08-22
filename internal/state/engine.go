@@ -405,11 +405,13 @@ func (e *Engine) resolve(selector, senderAddress string) (protocol.Actor, error)
 	var matches []protocol.Actor
 	for _, actor := range e.actors {
 		matched := actor.SessionUUID == normalized
-		if strings.HasPrefix(normalized, "change:") && actor.JJ != nil {
-			matched = strings.HasPrefix(actor.JJ.ChangeID, strings.TrimPrefix(normalized, "change:"))
-		} else if strings.HasPrefix(normalized, "git:") && actor.Git != nil {
-			matched = strings.HasPrefix(actor.Git.Head, strings.TrimPrefix(normalized, "git:"))
-		} else if actor.Alias == normalized {
+		if !matched && actor.JJ != nil {
+			matched = strings.HasPrefix(actor.JJ.ChangeID, normalized)
+		}
+		if !matched && actor.Git != nil {
+			matched = strings.HasPrefix(actor.Git.Head, normalized)
+		}
+		if !matched && actor.Alias == normalized {
 			matched = true
 		}
 		if matched && e.active(actor) {
@@ -452,7 +454,7 @@ func (e *Engine) nextMessage(from, to, kind, body string, params protocol.SendPa
 	e.recipientSequences[to]++
 	id := params.ID
 	if id == "" {
-		id = randomID("msg")
+		id = randomUUID()
 	}
 	return protocol.Message{
 		ID:                id,
@@ -933,14 +935,6 @@ func uniqueCollisions(values []protocol.Collision) []protocol.Collision {
 func collisionKey(actors [2]string, path string) string {
 	sum := sha256.Sum256([]byte(actors[0] + "\x00" + actors[1] + "\x00" + path))
 	return hex.EncodeToString(sum[:])
-}
-
-func randomID(prefix string) string {
-	var value [16]byte
-	if _, err := rand.Read(value[:]); err != nil {
-		panic(err)
-	}
-	return prefix + ":" + hex.EncodeToString(value[:])
 }
 
 func randomUUID() string {

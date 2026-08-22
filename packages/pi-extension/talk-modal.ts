@@ -35,11 +35,11 @@ export function initialTalkTargets(current: ActorRecord, actors: ActorRecord[], 
 function recipient(current: ActorRecord, candidate: ActorRecord): Recipient {
   const label = candidate.alias ? `@${candidate.alias}` : `@${candidate.address}`;
   const vcs = candidate.jj
-    ? `jj:${candidate.jj.change_id.slice(0, 8)}`
+    ? candidate.jj.change_id.slice(0, 8)
     : candidate.git?.branch
-      ? `git:${candidate.git.branch}`
+      ? candidate.git.branch
       : candidate.git?.head
-        ? `git:${candidate.git.head.slice(0, 8)}`
+        ? candidate.git.head.slice(0, 8)
         : "no-vcs";
   return {
     address: candidate.address,

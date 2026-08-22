@@ -73,7 +73,7 @@ Almost the entire first implementation remained untracked while only its roadmap
 
 The current system makes the Go daemon the sole coordination authority and keeps harness code as an adapter. It adds:
 
-- canonical `harness:session` identity and scoped aliases;
+- canonical session-UUID identity and scoped aliases;
 - Git repository/worktree identity with optional JJ workspace/change identity;
 - an fsynced append-only journal with replay and crash-tail recovery;
 - durable mailboxes, explicit acknowledgement, retry idempotency, and deterministic ordering;

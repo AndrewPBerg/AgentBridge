@@ -18,8 +18,8 @@ func TestGitWorktreesShareRepositoryButNotWorkspace(t *testing.T) {
 		}
 		return actor
 	}
-	main := registerGit("pi:main", "/repo", "main")
-	feature := registerGit("pi:feature", "/repo-feature", "feature")
+	main := registerGit("main", "/repo", "main")
+	feature := registerGit("feature", "/repo-feature", "feature")
 	if main.RepositoryUUID != feature.RepositoryUUID {
 		t.Fatalf("same Git common dir produced different repositories: %s != %s", main.RepositoryUUID, feature.RepositoryUUID)
 	}
@@ -40,9 +40,9 @@ func TestAliasResolutionPrefersSenderWorkspaceThenRepository(t *testing.T) {
 		}
 		return value
 	}
-	sender := actor("pi:sender", "/repo")
-	local := actor("pi:local", "/repo")
-	remote := actor("pi:remote", "/repo-feature")
+	sender := actor("sender", "/repo")
+	local := actor("local", "/repo")
+	remote := actor("remote", "/repo-feature")
 	if _, err := engine.SetAlias(local.Address, "builder"); err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestAliasResolutionPrefersSenderWorkspaceThenRepository(t *testing.T) {
 func TestIntentGetsRepositoryRelativePathsAndDirectoryScope(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
 	actor, err := engine.Register(protocol.Actor{
-		Address: "pi:worker", Harness: "pi", SessionUUID: "worker", CWD: "/repo", State: "active",
+		Address: "worker", Harness: "pi", SessionUUID: "worker", CWD: "/repo", State: "active",
 		Git: &protocol.GitContext{RepoRoot: "/repo", WorktreeRoot: "/repo", CommonDir: "/repo/.git"},
 	})
 	if err != nil {

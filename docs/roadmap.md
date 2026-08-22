@@ -13,7 +13,7 @@ These roadmap foundations are implemented in the current daemon and Pi adapter:
 - [x] Local Go daemon with Unix-socket JSON RPC as coordination authority (`internal/server`, `internal/state`, `internal/protocol`).
 - [x] Append-only, fsynced journal with replay and crash-tail recovery (`internal/store`).
 - [x] Durable ordered mailboxes with explicit acknowledgement and idempotent sends.
-- [x] Actor registration, heartbeat leases, canonical `harness:session` identities, aliases, capabilities, and Git/JJ context.
+- [x] Actor registration, heartbeat leases, canonical session-UUID identities, aliases, capabilities, and Git/JJ context.
 - [x] Repository/workspace/directory authority scopes.
 - [x] Automatic Pi tool-intent reporting and exact-path collision detection.
 - [x] Collision lifecycle: `open -> negotiating -> yielded -> resolved`.

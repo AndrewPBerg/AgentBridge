@@ -7,7 +7,7 @@ import (
 )
 
 func TestCheckpointIDIsStableAndIndependentOfExtractor(t *testing.T) {
-	request := protocol.CheckpointRequest{Actor: "pi:a", RepositoryUUID: "repo:a", WorkspaceUUID: "workspace:a", SessionGeneration: 2, JournalStart: 4, JournalEnd: 9, CheckpointKind: "settled"}
+	request := protocol.CheckpointRequest{Actor: "a", RepositoryUUID: "a", WorkspaceUUID: "a", SessionGeneration: 2, JournalStart: 4, JournalEnd: 9, CheckpointKind: "settled"}
 	left, err := CheckpointID(request, []any{"evidence", 1})
 	if err != nil {
 		t.Fatal(err)

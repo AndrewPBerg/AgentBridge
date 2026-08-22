@@ -13,7 +13,7 @@ func TestCheckpointProjectionRejectsInvalidWorkUnitUUID(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	checkpoint := protocol.CheckpointRequest{ID: "checkpoint:invalid", Actor: "actor", RepositoryUUID: "repo", WorkspaceUUID: "workspace", WorkUnitUUID: "not-a-uuid", CheckpointKind: "settled"}
+	checkpoint := protocol.CheckpointRequest{ID: "invalid", Actor: "actor", RepositoryUUID: "repo", WorkspaceUUID: "workspace", WorkUnitUUID: "not-a-uuid", CheckpointKind: "settled"}
 	if err := database.Project(event(t, 1, "checkpoint.requested", checkpoint)); err == nil {
 		t.Fatal("invalid work unit UUID was accepted")
 	}
@@ -27,7 +27,7 @@ func TestCheckpointProjectionStoresDeclarationAndSupportsWorkUnitQueries(t *test
 	defer database.Close()
 
 	checkpoint := protocol.CheckpointRequest{
-		ID: "checkpoint:one", Actor: "01234567-89ab-cdef-0123-456789abcdef", DeclaredBy: "human",
+		ID: "one", Actor: "01234567-89ab-cdef-0123-456789abcdef", DeclaredBy: "human",
 		SessionGeneration: 4, RepositoryUUID: "11111111-1111-5111-8111-111111111111", WorkspaceUUID: "22222222-2222-5222-8222-222222222222",
 		WorkUnitUUID: "33333333-3333-5333-8333-333333333333", CheckpointKind: "settled", JournalStart: 10, JournalEnd: 12,
 	}

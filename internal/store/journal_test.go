@@ -43,7 +43,7 @@ func TestJournalReplaysAndTruncatesPartialCrashTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, _ := json.Marshal(map[string]string{"address": "pi:a"})
+	data, _ := json.Marshal(map[string]string{"address": "a"})
 	event := protocol.Event{Version: 1, Sequence: 1, Type: "actor.upserted", At: time.Now(), Data: data}
 	if err := journal.Append(event); err != nil {
 		t.Fatal(err)

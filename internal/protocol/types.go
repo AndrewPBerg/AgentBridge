@@ -15,12 +15,6 @@ const Version = 1
 // version and RFC 4122 variant.
 func ValidateUUID(value string) error {
 	candidate := strings.TrimSpace(value)
-	for _, prefix := range []string{"pi:", "col:", "repo:", "workspace:"} {
-		if strings.HasPrefix(candidate, prefix) {
-			candidate = candidate[len(prefix):]
-			break
-		}
-	}
 	compact := strings.ReplaceAll(candidate, "-", "")
 	decoded, err := hex.DecodeString(compact)
 	if err != nil || len(decoded) != 16 {

@@ -48,7 +48,7 @@ func register(t *testing.T, engine *Engine, address string) protocol.Actor {
 	actor, err := engine.Register(protocol.Actor{
 		Address:     address,
 		Harness:     "pi",
-		SessionUUID: address[3:],
+		SessionUUID: address,
 		CWD:         "/repo",
 		State:       "active",
 	})
@@ -60,13 +60,13 @@ func register(t *testing.T, engine *Engine, address string) protocol.Actor {
 
 func TestMailboxOrdersSenderAssignedBurstSequences(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
-	register(t, engine, "pi:sender")
-	register(t, engine, "pi:recipient")
+	register(t, engine, "sender")
+	register(t, engine, "recipient")
 
 	for _, sequence := range []uint64{4, 5, 1, 2, 3} {
 		_, err := engine.Send(protocol.SendParams{
-			From:           "pi:sender",
-			To:             "pi:recipient",
+			From:           "sender",
+			To:             "recipient",
 			Body:           fmt.Sprintf("K%d", sequence),
 			ClientSequence: sequence,
 		})
@@ -74,7 +74,7 @@ func TestMailboxOrdersSenderAssignedBurstSequences(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	messages, err := engine.Poll("pi:recipient", 0)
+	messages, err := engine.Poll("recipient", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,25 +88,25 @@ func TestMailboxOrdersSenderAssignedBurstSequences(t *testing.T) {
 
 func TestMailboxPreservesSenderOrderAcrossInterleavedSenders(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
-	register(t, engine, "pi:a")
-	register(t, engine, "pi:b")
-	register(t, engine, "pi:recipient")
+	register(t, engine, "a")
+	register(t, engine, "b")
+	register(t, engine, "recipient")
 	for _, value := range []struct {
 		from     string
 		sequence uint64
 		body     string
 	}{
-		{from: "pi:a", sequence: 2, body: "A2"},
-		{from: "pi:b", sequence: 1, body: "B1"},
-		{from: "pi:a", sequence: 1, body: "A1"},
+		{from: "a", sequence: 2, body: "A2"},
+		{from: "b", sequence: 1, body: "B1"},
+		{from: "a", sequence: 1, body: "A1"},
 	} {
 		if _, err := engine.Send(protocol.SendParams{
-			From: value.from, To: "pi:recipient", Body: value.body, ClientSequence: value.sequence, SessionGeneration: 100,
+			From: value.from, To: "recipient", Body: value.body, ClientSequence: value.sequence, SessionGeneration: 100,
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	messages, err := engine.Poll("pi:recipient", 0)
+	messages, err := engine.Poll("recipient", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,8 +121,8 @@ func TestMailboxPreservesSenderOrderAcrossInterleavedSenders(t *testing.T) {
 
 func TestMailboxOrdersGenerationsBeforeResetClientSequence(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
-	register(t, engine, "pi:sender")
-	register(t, engine, "pi:recipient")
+	register(t, engine, "sender")
+	register(t, engine, "recipient")
 	for _, value := range []struct {
 		generation uint64
 		sequence   uint64
@@ -132,8 +132,8 @@ func TestMailboxOrdersGenerationsBeforeResetClientSequence(t *testing.T) {
 		{generation: 200, sequence: 1, body: "after-reload"},
 	} {
 		if _, err := engine.Send(protocol.SendParams{
-			From:              "pi:sender",
-			To:                "pi:recipient",
+			From:              "sender",
+			To:                "recipient",
 			Body:              value.body,
 			ClientSequence:    value.sequence,
 			SessionGeneration: value.generation,
@@ -141,7 +141,7 @@ func TestMailboxOrdersGenerationsBeforeResetClientSequence(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	messages, err := engine.Poll("pi:recipient", 0)
+	messages, err := engine.Poll("recipient", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,9 +152,9 @@ func TestMailboxOrdersGenerationsBeforeResetClientSequence(t *testing.T) {
 
 func TestSendIdempotencyKeyPreventsDuplicateRetry(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
-	register(t, engine, "pi:sender")
-	register(t, engine, "pi:recipient")
-	params := protocol.SendParams{ID: "pi:sender:1:1", From: "pi:sender", To: "pi:recipient", Body: "once"}
+	register(t, engine, "sender")
+	register(t, engine, "recipient")
+	params := protocol.SendParams{ID: "sender:1:1", From: "sender", To: "recipient", Body: "once"}
 	first, err := engine.Send(params)
 	if err != nil {
 		t.Fatal(err)
@@ -166,7 +166,7 @@ func TestSendIdempotencyKeyPreventsDuplicateRetry(t *testing.T) {
 	if first.ID != second.ID || first.GlobalSequence != second.GlobalSequence {
 		t.Fatalf("retry created a new message: first=%#v second=%#v", first, second)
 	}
-	messages, _ := engine.Poll("pi:recipient", 0)
+	messages, _ := engine.Poll("recipient", 0)
 	if len(messages) != 1 {
 		t.Fatalf("idempotent retry produced %d messages", len(messages))
 	}
@@ -179,30 +179,30 @@ func TestSendIdempotencyKeyPreventsDuplicateRetry(t *testing.T) {
 
 func TestGitHeadSelectorAddressesActiveActor(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
-	register(t, engine, "pi:sender")
-	actor := register(t, engine, "pi:git-worker")
+	register(t, engine, "sender")
+	actor := register(t, engine, "git-worker")
 	actor.Git = &protocol.GitContext{RepoRoot: "/repo", WorktreeRoot: "/repo", Head: "abcdef123456"}
 	if _, err := engine.Register(actor); err != nil {
 		t.Fatal(err)
 	}
-	message, err := engine.Send(protocol.SendParams{From: "pi:sender", To: "@git:abcdef", Body: "git-aware"})
+	message, err := engine.Send(protocol.SendParams{From: "sender", To: "@abcdef", Body: "git-aware"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if message.To != "pi:git-worker" {
+	if message.To != "git-worker" {
 		t.Fatalf("git selector resolved to %s", message.To)
 	}
 }
 
 func TestCanonicalAddressAcceptsMailWhileActorIsStale(t *testing.T) {
 	engine, _, now := newTestEngine(t)
-	register(t, engine, "pi:sender")
-	register(t, engine, "pi:offline")
+	register(t, engine, "sender")
+	register(t, engine, "offline")
 	*now = now.Add(time.Minute)
-	if _, err := engine.Send(protocol.SendParams{From: "pi:sender", To: "@pi:offline", Body: "durable"}); err != nil {
+	if _, err := engine.Send(protocol.SendParams{From: "sender", To: "@offline", Body: "durable"}); err != nil {
 		t.Fatalf("canonical stale delivery failed: %v", err)
 	}
-	messages, err := engine.Poll("pi:offline", 0)
+	messages, err := engine.Poll("offline", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,8 +213,8 @@ func TestCanonicalAddressAcceptsMailWhileActorIsStale(t *testing.T) {
 
 func TestCollisionLifecycleDeduplicatesAndCanResolve(t *testing.T) {
 	engine, journal, now := newTestEngine(t)
-	register(t, engine, "pi:a")
-	register(t, engine, "pi:b")
+	register(t, engine, "a")
+	register(t, engine, "b")
 	base := func(id, actor string) protocol.Intent {
 		return protocol.Intent{
 			ID:         id,
@@ -226,10 +226,10 @@ func TestCollisionLifecycleDeduplicatesAndCanResolve(t *testing.T) {
 			CWD:        "/repo",
 		}
 	}
-	if collisions, err := engine.BeginIntent(base("a-1", "pi:a")); err != nil || len(collisions) != 0 {
+	if collisions, err := engine.BeginIntent(base("a-1", "a")); err != nil || len(collisions) != 0 {
 		t.Fatalf("first intent: collisions=%v err=%v", collisions, err)
 	}
-	collisions, err := engine.BeginIntent(base("b-1", "pi:b"))
+	collisions, err := engine.BeginIntent(base("b-1", "b"))
 	if err != nil || len(collisions) != 1 {
 		t.Fatalf("second intent: collisions=%v err=%v", collisions, err)
 	}
@@ -237,15 +237,15 @@ func TestCollisionLifecycleDeduplicatesAndCanResolve(t *testing.T) {
 	if collision.State != protocol.CollisionOpen {
 		t.Fatalf("state = %s", collision.State)
 	}
-	if messages, _ := engine.Poll("pi:a", 0); len(messages) != 1 || messages[0].CollisionID != collision.ID {
+	if messages, _ := engine.Poll("a", 0); len(messages) != 1 || messages[0].CollisionID != collision.ID {
 		t.Fatalf("missing collision signal for a: %#v", messages)
 	}
-	if messages, _ := engine.Poll("pi:b", 0); len(messages) != 1 || messages[0].CollisionID != collision.ID {
+	if messages, _ := engine.Poll("b", 0); len(messages) != 1 || messages[0].CollisionID != collision.ID {
 		t.Fatalf("missing collision signal for b: %#v", messages)
 	}
 
 	*now = now.Add(time.Second)
-	if _, err := engine.Send(protocol.SendParams{From: "pi:a", To: "pi:b", Body: "I will yield"}); err != nil {
+	if _, err := engine.Send(protocol.SendParams{From: "a", To: "b", Body: "I will yield"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := engine.collisions[collision.ID].State; got != protocol.CollisionNegotiating {
@@ -253,15 +253,15 @@ func TestCollisionLifecycleDeduplicatesAndCanResolve(t *testing.T) {
 	}
 	if _, err := engine.Transition(protocol.TransitionParams{
 		CollisionID: collision.ID,
-		Actor:       "pi:a",
+		Actor:       "a",
 		State:       protocol.CollisionYielded,
-		Owner:       "pi:b",
+		Owner:       "b",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := engine.Transition(protocol.TransitionParams{
 		CollisionID: collision.ID,
-		Actor:       "pi:b",
+		Actor:       "b",
 		State:       protocol.CollisionResolved,
 		Resolution:  "b owns shared.go",
 	}); err != nil {
@@ -286,12 +286,12 @@ func TestCollisionLifecycleDeduplicatesAndCanResolve(t *testing.T) {
 		t.Fatal(err)
 	}
 	replayedCollision := replayed.collisions[collision.ID]
-	if replayedCollision.State != protocol.CollisionResolved || replayedCollision.ResolvedBy != "pi:b" || replayedCollision.Resolution != "b owns shared.go" {
+	if replayedCollision.State != protocol.CollisionResolved || replayedCollision.ResolvedBy != "b" || replayedCollision.Resolution != "b owns shared.go" {
 		t.Fatalf("replayed collision = %#v", replayedCollision)
 	}
 
 	*now = now.Add(time.Second)
-	newCollisions, err := engine.BeginIntent(base("a-2", "pi:a"))
+	newCollisions, err := engine.BeginIntent(base("a-2", "a"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,25 +302,25 @@ func TestCollisionLifecycleDeduplicatesAndCanResolve(t *testing.T) {
 
 func TestIntentRetryRepairsPartiallyPublishedCollisionSignals(t *testing.T) {
 	engine, journal, _ := newTestEngine(t)
-	register(t, engine, "pi:a")
-	register(t, engine, "pi:b")
+	register(t, engine, "a")
+	register(t, engine, "b")
 	intent := func(id, actor string) protocol.Intent {
 		return protocol.Intent{ID: id, Actor: actor, ToolCallID: id, Tool: "edit", Operation: "edit", Paths: []string{"/repo/x"}, CWD: "/repo"}
 	}
-	if _, err := engine.BeginIntent(intent("a", "pi:a")); err != nil {
+	if _, err := engine.BeginIntent(intent("a", "a")); err != nil {
 		t.Fatal(err)
 	}
 	// intent.started, collision.upserted, and the first signal succeed; the
 	// second recipient's signal fails.
 	journal.failAt = journal.calls + 4
-	if _, err := engine.BeginIntent(intent("b", "pi:b")); err == nil {
+	if _, err := engine.BeginIntent(intent("b", "b")); err == nil {
 		t.Fatal("partially published collision unexpectedly succeeded")
 	}
 	journal.failAt = 0
-	if _, err := engine.BeginIntent(intent("b", "pi:b")); err != nil {
+	if _, err := engine.BeginIntent(intent("b", "b")); err != nil {
 		t.Fatalf("retry did not repair collision delivery: %v", err)
 	}
-	for _, actor := range []string{"pi:a", "pi:b"} {
+	for _, actor := range []string{"a", "b"} {
 		messages, err := engine.Poll(actor, 0)
 		if err != nil {
 			t.Fatal(err)
@@ -339,38 +339,38 @@ func TestIntentRetryRepairsPartiallyPublishedCollisionSignals(t *testing.T) {
 
 func TestInvalidCollisionTransitionsAreRejected(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
-	register(t, engine, "pi:a")
-	register(t, engine, "pi:b")
+	register(t, engine, "a")
+	register(t, engine, "b")
 	intent := func(id, actor string) protocol.Intent {
 		return protocol.Intent{ID: id, Actor: actor, ToolCallID: id, Tool: "edit", Operation: "edit", Paths: []string{"/repo/x"}, CWD: "/repo"}
 	}
-	_, _ = engine.BeginIntent(intent("a", "pi:a"))
-	collisions, err := engine.BeginIntent(intent("b", "pi:b"))
+	_, _ = engine.BeginIntent(intent("a", "a"))
+	collisions, err := engine.BeginIntent(intent("b", "b"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := collisions[0].ID
 	for _, transition := range []protocol.TransitionParams{
-		{CollisionID: id, Actor: "pi:a", State: protocol.CollisionYielded},
-		{CollisionID: id, Actor: "pi:a", State: protocol.CollisionYielded, Owner: "pi:a"},
-		{CollisionID: id, Actor: "pi:a", State: protocol.CollisionResolved, Resolution: "too early"},
+		{CollisionID: id, Actor: "a", State: protocol.CollisionYielded},
+		{CollisionID: id, Actor: "a", State: protocol.CollisionYielded, Owner: "a"},
+		{CollisionID: id, Actor: "a", State: protocol.CollisionResolved, Resolution: "too early"},
 	} {
 		if _, err := engine.Transition(transition); err == nil {
 			t.Fatalf("invalid transition unexpectedly succeeded: %#v", transition)
 		}
 	}
 	if _, err := engine.Transition(protocol.TransitionParams{
-		CollisionID: id, Actor: "pi:a", State: protocol.CollisionYielded, Owner: "pi:b",
+		CollisionID: id, Actor: "a", State: protocol.CollisionYielded, Owner: "b",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := engine.Transition(protocol.TransitionParams{
-		CollisionID: id, Actor: "pi:a", State: protocol.CollisionResolved, Resolution: "wrong actor",
+		CollisionID: id, Actor: "a", State: protocol.CollisionResolved, Resolution: "wrong actor",
 	}); err == nil {
 		t.Fatal("non-owner resolved yielded collision")
 	}
 	if _, err := engine.Transition(protocol.TransitionParams{
-		CollisionID: id, Actor: "pi:b", State: protocol.CollisionResolved,
+		CollisionID: id, Actor: "b", State: protocol.CollisionResolved,
 	}); err == nil {
 		t.Fatal("empty resolution unexpectedly succeeded")
 	}
@@ -378,20 +378,20 @@ func TestInvalidCollisionTransitionsAreRejected(t *testing.T) {
 
 func TestSendFailureNeverLeavesDurablyEnqueuedMessage(t *testing.T) {
 	engine, journal, _ := newTestEngine(t)
-	register(t, engine, "pi:a")
-	register(t, engine, "pi:b")
+	register(t, engine, "a")
+	register(t, engine, "b")
 	intent := func(id, actor string) protocol.Intent {
 		return protocol.Intent{ID: id, Actor: actor, ToolCallID: id, Tool: "edit", Operation: "edit", Paths: []string{"/repo/x"}, CWD: "/repo"}
 	}
-	_, _ = engine.BeginIntent(intent("a", "pi:a"))
-	_, _ = engine.BeginIntent(intent("b", "pi:b"))
-	before, _ := engine.Poll("pi:b", 0)
+	_, _ = engine.BeginIntent(intent("a", "a"))
+	_, _ = engine.BeginIntent(intent("b", "b"))
+	before, _ := engine.Poll("b", 0)
 	journal.fail = true
-	if _, err := engine.Send(protocol.SendParams{From: "pi:a", To: "pi:b", Body: "coordinate"}); err == nil {
+	if _, err := engine.Send(protocol.SendParams{From: "a", To: "b", Body: "coordinate"}); err == nil {
 		t.Fatal("send unexpectedly succeeded during journal failure")
 	}
 	journal.fail = false
-	after, _ := engine.Poll("pi:b", 0)
+	after, _ := engine.Poll("b", 0)
 	if len(after) != len(before) {
 		t.Fatalf("failed send changed durable mailbox: before=%d after=%d", len(before), len(after))
 	}
@@ -399,13 +399,13 @@ func TestSendFailureNeverLeavesDurablyEnqueuedMessage(t *testing.T) {
 
 func TestAckSurvivesReplay(t *testing.T) {
 	engine, journal, _ := newTestEngine(t)
-	register(t, engine, "pi:a")
-	register(t, engine, "pi:b")
-	message, err := engine.Send(protocol.SendParams{From: "pi:a", To: "pi:b", Body: "hello"})
+	register(t, engine, "a")
+	register(t, engine, "b")
+	message, err := engine.Send(protocol.SendParams{From: "a", To: "b", Body: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.Ack(protocol.AckParams{Actor: "pi:b", MessageIDs: []string{message.ID}}); err != nil {
+	if err := engine.Ack(protocol.AckParams{Actor: "b", MessageIDs: []string{message.ID}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -413,7 +413,7 @@ func TestAckSurvivesReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	messages, err := replayed.Poll("pi:b", 0)
+	messages, err := replayed.Poll("b", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -424,21 +424,21 @@ func TestAckSurvivesReplay(t *testing.T) {
 
 func TestConcurrentSendsAreRaceSafeAndUnique(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
-	register(t, engine, "pi:a")
-	register(t, engine, "pi:b")
+	register(t, engine, "a")
+	register(t, engine, "b")
 	const count = 100
 	var wg sync.WaitGroup
 	for index := range count {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := engine.Send(protocol.SendParams{From: "pi:a", To: "pi:b", Body: fmt.Sprintf("%d", index)}); err != nil {
+			if _, err := engine.Send(protocol.SendParams{From: "a", To: "b", Body: fmt.Sprintf("%d", index)}); err != nil {
 				t.Errorf("send: %v", err)
 			}
 		}()
 	}
 	wg.Wait()
-	messages, err := engine.Poll("pi:b", 0)
+	messages, err := engine.Poll("b", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -456,23 +456,23 @@ func TestConcurrentSendsAreRaceSafeAndUnique(t *testing.T) {
 
 func TestDeadCollisionNotifiesSurvivorAndReplays(t *testing.T) {
 	engine, journal, _ := newTestEngine(t)
-	register(t, engine, "pi:a")
-	register(t, engine, "pi:b")
+	register(t, engine, "a")
+	register(t, engine, "b")
 	intent := func(id, actor string) protocol.Intent {
 		return protocol.Intent{ID: id, Actor: actor, ToolCallID: id, Tool: "edit", Operation: "write", Paths: []string{"/repo/shared.go"}, CWD: "/repo"}
 	}
-	if _, err := engine.BeginIntent(intent("a", "pi:a")); err != nil {
+	if _, err := engine.BeginIntent(intent("a", "a")); err != nil {
 		t.Fatal(err)
 	}
-	collisions, err := engine.BeginIntent(intent("b", "pi:b"))
+	collisions, err := engine.BeginIntent(intent("b", "b"))
 	if err != nil || len(collisions) != 1 {
 		t.Fatalf("collision = %#v, err = %v", collisions, err)
 	}
 	collision := collisions[0]
-	if _, err := engine.Heartbeat(protocol.HeartbeatParams{Address: "pi:b", State: "dead"}); err != nil {
+	if _, err := engine.Heartbeat(protocol.HeartbeatParams{Address: "b", State: "dead"}); err != nil {
 		t.Fatal(err)
 	}
-	messages, err := engine.Poll("pi:a", 0)
+	messages, err := engine.Poll("a", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,14 +492,14 @@ func TestDeadCollisionNotifiesSurvivorAndReplays(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := replayed.collisions[collision.ID].DeadActor; got != "pi:b" {
+	if got := replayed.collisions[collision.ID].DeadActor; got != "b" {
 		t.Fatalf("replayed dead actor = %q", got)
 	}
 }
 
 func TestSessionsMarksExpiredActorsDead(t *testing.T) {
 	engine, journal, now := newTestEngine(t)
-	register(t, engine, "pi:waiting")
+	register(t, engine, "waiting")
 	*now = now.Add(defaultActorTTL + time.Second)
 
 	actors := engine.Sessions(true)

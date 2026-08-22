@@ -16,7 +16,7 @@ Design references: [roadmap](docs/roadmap.md), [vision](docs/vision.md), [VCS id
 - actor registration, aliases, heartbeat leases, capabilities, and session generations
 - first-class Git repository/worktree/branch/HEAD identity, with optional JJ repository/workspace/change identity layered on top
 - normalized global, repository, workspace, and directory authority scopes
-- canonical `harness:session` addressing plus `@alias`, `@git:<HEAD>`, and `@change:<JJ ID>` selectors
+- canonical session-UUID addressing plus `@alias`, `@<HEAD>`, and `@<JJ ID>` selectors
 - durable mailbox polling and explicit acknowledgement
 - global, sender, recipient, and adapter-assigned sequence metadata
 - client-assigned idempotency keys for retry-safe sends
@@ -61,8 +61,8 @@ agent-bridge stop
 agent-bridge sessions --all
 agent-bridge scopes
 agent-bridge sessions --workspace <workspace-id>
-agent-bridge send --from pi:01K... --id pi:01K:1:1 --sequence 1 @walkie "Can you yield schema.ts?"
-agent-bridge request mailbox.poll '{"actor":"pi:01K..."}'
+agent-bridge send --from 01K... --id 01K:1:1 --sequence 1 @walkie "Can you yield schema.ts?"
+agent-bridge request mailbox.poll '{"actor":"01K..."}'
 agent-bridge provenance checkpoints --limit 20
 agent-bridge provenance checkpoint <checkpoint-id>
 agent-bridge provenance who-changed /repo/file.ts
@@ -78,11 +78,11 @@ The low-level `request` command is primarily for development and harness adapter
 Requests and responses are newline-delimited JSON over the Unix socket:
 
 ```json
-{"id":"1","method":"message.send","params":{"id":"pi:abc:2:4","from":"pi:abc","to":"@walkie","body":"hello","client_sequence":4,"session_generation":2}}
+{"id":"1","method":"message.send","params":{"id":"abc:2:4","from":"abc","to":"@walkie","body":"hello","client_sequence":4,"session_generation":2}}
 ```
 
 ```json
-{"id":"1","result":{"id":"msg:...","global_sequence":42,"sender_sequence":7,"recipient_sequence":9}}
+{"id":"1","result":{"id":"...","global_sequence":42,"sender_sequence":7,"recipient_sequence":9}}
 ```
 
 Implemented methods:

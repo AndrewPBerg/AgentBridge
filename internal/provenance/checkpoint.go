@@ -45,7 +45,7 @@ func CheckpointID(request protocol.CheckpointRequest, evidence any) (string, err
 		return "", fmt.Errorf("encode checkpoint identity: %w", err)
 	}
 	sum := sha256.Sum256(canonical)
-	return "checkpoint:" + hex.EncodeToString(sum[:]), nil
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func ExtractionRunID(checkpointID, model, promptVersion, schemaVersion string) string {
@@ -57,5 +57,5 @@ func ExtractionRunID(checkpointID, model, promptVersion, schemaVersion string) s
 	}{checkpointID, model, promptVersion, schemaVersion}
 	encoded, _ := json.Marshal(identity)
 	sum := sha256.Sum256(encoded)
-	return "extraction:" + hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:])
 }
