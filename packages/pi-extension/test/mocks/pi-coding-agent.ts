@@ -1,9 +1,27 @@
 import { resolve } from "node:path";
 
 export type ExtensionAPI = MockPi;
-export type ExtensionContext = any;
-export type ExtensionCommandContext = any;
-export type Theme = any;
+export type MockTheme = { fg: (name: string, value: string) => string; bold: (value: string) => string };
+export type MockTui = { requestRender: () => void };
+export type ExtensionContext = {
+  mode: string;
+  cwd: string;
+  isIdle: () => boolean;
+  ui: {
+    notify: (message: string, type?: string) => void;
+    custom: <T>(
+      factory: (tui: MockTui, theme: MockTheme, keybindings: unknown, done: (value: T) => void) => unknown,
+      options?: unknown,
+    ) => Promise<T>;
+  };
+};
+export type ExtensionCommandContext = ExtensionContext;
+export type Theme = MockTheme;
+export type ToolDefinition = {
+  name: string;
+  execute: (toolCallId: string, params: Record<string, any>, ...rest: any[]) => any;
+  [key: string]: any;
+};
 
 export function isToolCallEventType(toolName: string, event: { toolName?: string }) {
   return event.toolName === toolName;
@@ -154,7 +172,7 @@ export class MockPi {
     this.commands.set(name, definition);
   }
 
-  registerTool(definition: any) {
+  registerTool(definition: ToolDefinition) {
     this.tools.set(definition.name, definition);
     if (!this.allTools.some((tool) => tool.name === definition.name)) this.allTools.push({ name: definition.name });
   }
@@ -230,6 +248,7 @@ export function createMockContext(overrides: Partial<any> = {}) {
       getHeader: vi.fn(() => ({ id: "session-id" })),
     },
     cwd: process.cwd(),
+    isIdle: () => true,
     mode: "tui",
     hasUI: true,
     ...overrides,

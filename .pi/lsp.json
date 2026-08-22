@@ -1,0 +1,28 @@
+{
+  "servers": {
+    "typescript": {
+      "disabled": false
+    },
+    "biome": {
+      "command": ["pnpm", "exec", "biome", "lsp-proxy"],
+      "extensions": [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"],
+      "rootMarkers": ["biome.json", "package.json"]
+    },
+    "gopls": {
+      "initializationOptions": {
+        "gofumpt": true,
+        "staticcheck": true,
+        "analyses": {
+          "nilness": true,
+          "unusedwrite": true,
+          "unusedvariable": true,
+          "shadow": true,
+          "fieldalignment": true,
+          "ST1000": true,
+          "ST1003": true,
+          "ST1005": true
+        }
+      }
+    }
+  }
+}

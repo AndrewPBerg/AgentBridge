@@ -1,0 +1,17 @@
+[tools]
+go = "1.27"
+gofumpt = "0.11.0"
+golangci-lint = "2.13.1"
+"go:golang.org/x/vuln/cmd/govulncheck" = "v1.7.0"
+task = "3.53.1"
+
+[env]
+_.path = ["{{config_root}}/bin"]
+
+[tasks.quality]
+description = "Run the complete quality gate"
+run = "task quality"
+
+[tasks.lsp-quality]
+description = "Run fast editor/agent checks"
+run = "task lsp-quality"

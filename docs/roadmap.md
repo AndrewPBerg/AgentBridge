@@ -6,18 +6,34 @@ Agent Bridge is a local coordination control plane for independently launched co
 
 The next major capability is **contention-activated semantic indexing**: cheap, fast Codex Spark jobs turn bounded session and provenance slices into evidence-linked structured claims while two or more agents are active in the same repository.
 
+## Landed foundation
+
+These roadmap foundations are implemented in the current daemon and Pi adapter:
+
+- [x] Local Go daemon with Unix-socket JSON RPC as coordination authority (`internal/server`, `internal/state`, `internal/protocol`).
+- [x] Append-only, fsynced journal with replay and crash-tail recovery (`internal/store`).
+- [x] Durable ordered mailboxes with explicit acknowledgement and idempotent sends.
+- [x] Actor registration, heartbeat leases, canonical `harness:session` identities, aliases, capabilities, and Git/JJ context.
+- [x] Repository/workspace/directory authority scopes.
+- [x] Automatic Pi tool-intent reporting and exact-path collision detection.
+- [x] Collision lifecycle: `open -> negotiating -> yielded -> resolved`.
+- [x] Turso provenance projection with mutation snapshots, session events, turn/compaction context, and deterministic queries.
+- [x] Pi provenance tools, mailbox delivery, collision UI, and reconnect/re-register behavior.
+- [x] Deployment integrity checks through `agent-bridge doctor` and `agent-bridge version`.
+- [x] Strict local/CI quality workflow with mise, Taskfile, gofumpt, golangci-lint, race tests, shuffled tests, and govulncheck.
+
 ## Phase 0 — Cleanup and canonicalization
 
 This is the immediate prerequisite and may be performed independently from semantic-index work.
 
 Goals:
 
-- keep `/home/andrew/Desktop/personal/AgentBridge` as the only product source;
-- remove stale terminology, compatibility residue, and undocumented prototype assumptions;
-- make source, installed adapter, installed skill, binary, and runtime versions inspectable;
-- add a deployment/version or `doctor` workflow that detects drift;
-- keep the daemon, Pi adapter, and skill tests green; and
-- preserve the product boundary documented in [the retrospective](retrospective.md).
+- [x] Keep `/home/andrew/Desktop/personal/AgentBridge` as the only product source.
+- [x] Remove stale terminology, compatibility residue, and undocumented prototype assumptions.
+- [x] Make source, installed adapter, installed skill, binary, and runtime versions inspectable.
+- [x] Add a deployment/version or `doctor` workflow that detects drift.
+- [ ] Keep the daemon, Pi adapter, and skill tests green under the strict quality gate.
+- [x] Preserve the product boundary documented in [the retrospective](retrospective.md).
 
 Exit condition: a contributor can identify, test, install, and verify the canonical daemon and Pi adapter without guessing which copy is authoritative.
 
@@ -29,26 +45,26 @@ Build semantic indexing as an asynchronous read model. The coordination journal 
 
 Every checkpoint should be tied to deterministic evidence:
 
-- repository and workspace IDs;
-- actor address and session generation;
-- journal start/end sequence;
-- Pi turn or compaction boundary when available;
-- Git HEAD and optional JJ change/commit identity;
-- mutation, message, collision, and test-result references; and
-- extractor model, prompt, and schema versions.
+- [ ] repository and workspace IDs;
+- [ ] actor address and session generation;
+- [ ] journal start/end sequence;
+- [ ] Pi turn or compaction boundary when available;
+- [ ] Git HEAD and optional JJ change/commit identity;
+- [ ] mutation, message, collision, and test-result references; and
+- [ ] extractor model, prompt, and schema versions.
 
 ### Structured output
 
 Spark should propose bounded semantic claims such as:
 
-- objective;
-- decisions and rationale;
-- constraints;
-- completed work;
-- affected modules;
-- abandoned approaches;
-- unresolved questions; and
-- handoff context.
+- [ ] objective;
+- [ ] decisions and rationale;
+- [ ] constraints;
+- [ ] completed work;
+- [ ] affected modules;
+- [ ] abandoned approaches;
+- [ ] unresolved questions; and
+- [ ] handoff context.
 
 Each claim should cite deterministic evidence and carry confidence. It must never overwrite observed provenance or be presented as ground truth.
 
@@ -66,13 +82,13 @@ repository_id
 
 Requirements:
 
-- idempotent enqueue and completion;
-- bounded payloads rather than full transcripts;
-- incremental indexing from the prior checkpoint;
-- retry/error visibility;
-- concurrency and budget limits;
-- no coordination-path dependency on model availability; and
-- a model-runner boundary so Codex Spark is the first worker, not daemon infrastructure.
+- [ ] idempotent enqueue and completion;
+- [ ] bounded payloads rather than full transcripts;
+- [ ] incremental indexing from the prior checkpoint;
+- [ ] retry/error visibility;
+- [ ] concurrency and budget limits;
+- [ ] no coordination-path dependency on model availability; and
+- [ ] a model-runner boundary so Codex Spark is the first worker, not daemon infrastructure.
 
 Exit condition: a fixture session can be checkpointed, processed asynchronously by a fake or Spark worker, stored with evidence links, and deterministically queried.
 

@@ -6,7 +6,7 @@ The Go daemon owns coordination truth. Harness integrations remain thin adapters
 
 This repository is the canonical product source; installed daemon and Pi files are deployment artifacts. The earlier `AgentBridge` watcher/SSH prototype is historical, not a second implementation target. See [canonical direction and first-prototype lessons](docs/retrospective.md).
 
-Design references: [roadmap](docs/roadmap.md), [vision](docs/vision.md), [VCS identity](docs/vcs.md), [provenance](docs/provenance.md), and [harness compatibility](docs/harnesses.md).
+Design references: [roadmap](docs/roadmap.md), [vision](docs/vision.md), [VCS identity](docs/vcs.md), [provenance](docs/provenance.md), [quality gates](docs/quality.md), and [harness compatibility](docs/harnesses.md).
 
 ## Current vertical slice
 
@@ -43,6 +43,17 @@ provenance: ~/.agent-bridge/agent-bridge.db
 Override with `AGENT_BRIDGE_STATE_DIR` or `AGENT_BRIDGE_SOCKET`.
 
 ## CLI
+
+All commands support standard Cobra help and machine-readable output:
+
+```bash
+agent-bridge --help
+agent-bridge doctor --help
+agent-bridge --json doctor
+agent-bridge doctor --json
+```
+
+JSON failures use a non-zero exit status and an `{\"ok\":false,\"error\":...}` envelope.
 
 ```bash
 agent-bridge ping

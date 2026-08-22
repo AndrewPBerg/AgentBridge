@@ -1,0 +1,75 @@
+version: '3'
+
+vars:
+  GO: '{{default "go" .GO}}'
+  GOFUMPT: '{{default "gofumpt" .GOFUMPT}}'
+  GOLANGCI_LINT: '{{default "golangci-lint" .GOLANGCI_LINT}}'
+  GOVULNCHECK: '{{default "govulncheck" .GOVULNCHECK}}'
+
+tasks:
+  default:
+    desc: Run the complete quality gate
+    cmds:
+      - task: quality
+
+  format:
+    desc: Format Go sources with gofmt and gofumpt
+    cmds:
+      - '{{.GO}} fmt ./...'
+      - '{{.GOFUMPT}} -w .'
+
+  format-check:
+    desc: Verify gofmt and gofumpt formatting
+    cmds:
+      - cmd: >-
+          test -z "$(gofmt -l .)" || { echo 'gofmt: files need formatting' >&2; gofmt -l .; exit 1; }
+      - cmd: >-
+          test -z "$({{.GOFUMPT}} -l .)" || { echo 'gofumpt: files need formatting' >&2; {{.GOFUMPT}} -l .; exit 1; }
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - '{{.GO}} vet ./...'
+
+  lint:
+    desc: Run the strict golangci-lint profile
+    cmds:
+      - '{{.GOLANGCI_LINT}} run ./...'
+
+  test:
+    desc: Run unit and integration tests
+    cmds:
+      - '{{.GO}} test ./...'
+
+  test-race:
+    desc: Run tests with the race detector
+    cmds:
+      - '{{.GO}} test -race ./...'
+
+  test-shuffle:
+    desc: Run tests in randomized order
+    cmds:
+      - '{{.GO}} test -shuffle=on ./...'
+
+  vuln:
+    desc: Run Go vulnerability analysis
+    cmds:
+      - '{{.GOVULNCHECK}} ./...'
+
+  lsp-quality:
+    desc: Fast editor/agent quality feedback
+    cmds:
+      - task: format-check
+      - task: vet
+      - task: lint
+
+  quality:
+    desc: Full merge/CI quality gate
+    cmds:
+      - task: format-check
+      - task: vet
+      - task: lint
+      - task: test
+      - task: test-race
+      - task: test-shuffle
+      - task: vuln

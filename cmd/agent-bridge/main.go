@@ -23,8 +23,10 @@ import (
 func main() {
 	// Provenance, journals, WAL files, and sockets are private by default.
 	syscall.Umask(0o077)
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "agent-bridge:", err)
+	if err := execute(os.Args[1:]); err != nil {
+		if !jsonOutput {
+			fmt.Fprintln(os.Stderr, "agent-bridge:", err)
+		}
 		os.Exit(1)
 	}
 }
@@ -50,6 +52,8 @@ func run(args []string) error {
 		return request(args[1:])
 	case "provenance":
 		return provenanceCommand(args[1:])
+	case "doctor":
+		return doctor(args[1:])
 	case "version", "--version", "-v":
 		fmt.Println("agent-bridge dev")
 		return nil
@@ -59,7 +63,7 @@ func run(args []string) error {
 }
 
 func usageError() error {
-	return errors.New("usage: agent-bridge <serve|stop|ping|sessions|scopes|send|request|provenance|version>")
+	return errors.New("usage: agent-bridge <serve|stop|ping|sessions|scopes|send|request|provenance|doctor|version>")
 }
 
 func serve(args []string) error {
@@ -156,6 +160,9 @@ func callAndPrint(method string, params any) error {
 	var result any
 	if err := client.New(defaultSocket()).Call(context.Background(), method, params, &result); err != nil {
 		return err
+	}
+	if jsonOutput {
+		return printJSON(map[string]any{"ok": true, "data": result})
 	}
 	encoded, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {

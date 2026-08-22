@@ -1,11 +1,18 @@
 export type AutocompleteItem = any;
 export type Component = any;
-export type EditorTheme = any;
+export type EditorTheme = {
+  borderColor: (value: string) => string;
+  selectList: Record<string, (value: string) => string>;
+};
 
 export class Editor {
   text = "";
   focused = false;
   onSubmit?: (value: string) => void;
+
+  constructor(...args: any[]) {
+    void args;
+  }
 
   setText(value: string) {
     this.text = value;
@@ -15,7 +22,7 @@ export class Editor {
     else if (matchesKey(data, "backspace")) this.text = this.text.slice(0, -1);
     else if (data.length === 1 && data.charCodeAt(0) >= 32) this.text += data;
   }
-  render() {
+  render(_width?: number) {
     return [this.text];
   }
   invalidate() {}
@@ -92,7 +99,7 @@ export function isKeyRelease(data: string) {
   return data.includes(":3u") || data.includes(":3~") || data.includes(":3;");
 }
 
-export function truncateToWidth(value: string, width: number) {
+export function truncateToWidth(value: string, width: number, _ellipsis?: string) {
   return value.length > width ? value.slice(0, width) : value;
 }
 

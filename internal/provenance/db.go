@@ -179,10 +179,16 @@ func (d *DB) initialize() error {
 		return err
 	}
 	for _, column := range []struct{ table, name, definition string }{
-		{"actors", "repository_id", "TEXT"}, {"actors", "repository_root", "TEXT"},
-		{"actors", "workspace_id", "TEXT"}, {"actors", "workspace_root", "TEXT"}, {"actors", "workspace_kind", "TEXT"},
-		{"mutations", "repository_id", "TEXT"}, {"mutations", "repository_root", "TEXT"},
-		{"mutations", "workspace_id", "TEXT"}, {"mutations", "workspace_root", "TEXT"}, {"mutations", "workspace_kind", "TEXT"},
+		{"actors", "repository_id", "TEXT"},
+		{"actors", "repository_root", "TEXT"},
+		{"actors", "workspace_id", "TEXT"},
+		{"actors", "workspace_root", "TEXT"},
+		{"actors", "workspace_kind", "TEXT"},
+		{"mutations", "repository_id", "TEXT"},
+		{"mutations", "repository_root", "TEXT"},
+		{"mutations", "workspace_id", "TEXT"},
+		{"mutations", "workspace_root", "TEXT"},
+		{"mutations", "workspace_kind", "TEXT"},
 		{"mutations", "relative_paths_json", "TEXT NOT NULL DEFAULT '[]'"},
 	} {
 		if err := d.ensureColumn(column.table, column.name, column.definition); err != nil {

@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "@earendil-works/pi-coding-agent": ["./test/mocks/pi-coding-agent.ts"],
+      "@earendil-works/pi-tui": ["./test/mocks/pi-tui.ts"],
+      "typebox": ["./test/mocks/typebox.ts"]
+    }
+  },
+  "include": ["*.ts", "*.mts", "test/**/*.ts"],
+  "exclude": ["node_modules"]
+}

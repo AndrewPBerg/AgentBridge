@@ -1,0 +1,99 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    # Correctness and resource safety.
+    - govet
+    - staticcheck
+    - errcheck
+    - unused
+    - ineffassign
+    - nilerr
+    - errorlint
+    - contextcheck
+    - durationcheck
+    - bodyclose
+    - rowserrcheck
+    - sqlclosecheck
+    - noctx
+    - copyloopvar
+    # Security and reliability.
+    - gosec
+    - bidichk
+    - misspell
+    - revive
+    - gocritic
+    # Maintainability.
+    - cyclop
+    - nestif
+    - funlen
+    - gocognit
+    - maintidx
+    - unparam
+    - prealloc
+    # Modern Go and performance.
+    - modernize
+    - perfsprint
+    - usestdlibvars
+    - intrange
+    - makezero
+  settings:
+    cyclop:
+      max-complexity: 12
+      package-average: 8
+    funlen:
+      lines: 120
+      statements: 60
+    gocognit:
+      min-complexity: 20
+    maintidx:
+      under: 20
+    nestif:
+      min-complexity: 5
+    gosec:
+      # Start with high-confidence/high-severity findings. Review lower
+      # confidence findings explicitly before adding them to this gate.
+      confidence: high
+      severity: high
+    revive:
+      severity: warning
+      rules:
+        - name: exported
+        - name: error-strings
+        - name: error-naming
+        - name: var-naming
+        - name: indent-error-flow
+        - name: early-return
+        - name: superfluous-else
+        - name: unused-parameter
+    unparam:
+      check-exported: true
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+    misspell:
+      locale: US
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  new: false
+
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+  exclusions:
+    generated: lax
+    warn-unused: true
