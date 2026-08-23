@@ -197,8 +197,13 @@ var requestHandlers = map[string]requestHandler{
 	"activities.list":             (*Server).handleLegacyActivitiesList,
 	"session.event":               (*Server).handleSessionEvent,
 	"test.result":                 (*Server).handleTestResult,
+	"launch.create":               (*Server).handleLaunchCreate,
+	"launch.attach_child":         (*Server).handleLaunchAttachChild,
+	"launch.attach_work_unit":     (*Server).handleLaunchAttachWorkUnit,
+	"launch.get":                  (*Server).handleLaunchGet,
 	"direction.create":            (*Server).handleDirectionCreate,
 	"direction.get":               (*Server).handleDirectionGet,
+	"direction.update":            (*Server).handleDirectionUpdate,
 	"direction.status":            (*Server).handleDirectionStatus,
 	"direction.transition":        (*Server).handleDirectionTransition,
 	"work_unit.get":               (*Server).handleWorkUnitGet,
@@ -253,6 +258,11 @@ func (s *Server) handleActorRegister(_ context.Context, request protocol.Request
 	actor, err := s.engine.Register(value.Actor)
 	if err != nil {
 		return failure(request.ID, "register_failed", err)
+	}
+	if value.LaunchUUID != "" {
+		if _, err := s.engine.AttachLaunchChild(protocol.LaunchChildAttachParams{LaunchUUID: value.LaunchUUID, ChildActor: actor.Address}); err != nil {
+			return failure(request.ID, "launch_attach_child_failed", err)
+		}
 	}
 	return success(request.ID, actor)
 }
@@ -407,6 +417,18 @@ func (s *Server) handleDirectionCreate(_ context.Context, request protocol.Reque
 	return success(request.ID, direction)
 }
 
+func (s *Server) handleDirectionUpdate(_ context.Context, request protocol.Request) protocol.Response {
+	value, err := params[protocol.DirectionUpdateParams](request)
+	if err != nil {
+		return failure(request.ID, "invalid_params", err)
+	}
+	direction, err := s.engine.UpdateDirection(value)
+	if err != nil {
+		return failure(request.ID, "direction_update_failed", err)
+	}
+	return success(request.ID, direction)
+}
+
 func (s *Server) handleDirectionGet(_ context.Context, request protocol.Request) protocol.Response {
 	value, err := params[struct {
 		UUID string `json:"direction_uuid"`
@@ -440,6 +462,56 @@ func (s *Server) handleDirectionStatus(ctx context.Context, request protocol.Req
 		return failure(request.ID, "direction_status_failed", err)
 	}
 	return success(request.ID, status)
+}
+
+func (s *Server) handleLaunchCreate(_ context.Context, request protocol.Request) protocol.Response {
+	value, err := params[protocol.LaunchCreateParams](request)
+	if err != nil {
+		return failure(request.ID, "invalid_params", err)
+	}
+	launch, err := s.engine.CreateLaunch(value)
+	if err != nil {
+		return failure(request.ID, "launch_create_failed", err)
+	}
+	return success(request.ID, launch)
+}
+
+func (s *Server) handleLaunchAttachChild(_ context.Context, request protocol.Request) protocol.Response {
+	value, err := params[protocol.LaunchChildAttachParams](request)
+	if err != nil {
+		return failure(request.ID, "invalid_params", err)
+	}
+	launch, err := s.engine.AttachLaunchChild(value)
+	if err != nil {
+		return failure(request.ID, "launch_attach_child_failed", err)
+	}
+	return success(request.ID, launch)
+}
+
+func (s *Server) handleLaunchAttachWorkUnit(_ context.Context, request protocol.Request) protocol.Response {
+	value, err := params[protocol.LaunchWorkUnitAttachParams](request)
+	if err != nil {
+		return failure(request.ID, "invalid_params", err)
+	}
+	launch, err := s.engine.AttachLaunchWorkUnit(value)
+	if err != nil {
+		return failure(request.ID, "launch_attach_work_unit_failed", err)
+	}
+	return success(request.ID, launch)
+}
+
+func (s *Server) handleLaunchGet(_ context.Context, request protocol.Request) protocol.Response {
+	value, err := params[struct {
+		UUID string `json:"launch_uuid"`
+	}](request)
+	if err != nil {
+		return failure(request.ID, "invalid_params", err)
+	}
+	launch, err := s.engine.Launch(value.UUID)
+	if err != nil {
+		return failure(request.ID, "launch_get_failed", err)
+	}
+	return success(request.ID, launch)
 }
 
 func (s *Server) handleDirectionTransition(_ context.Context, request protocol.Request) protocol.Response {

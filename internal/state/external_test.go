@@ -50,6 +50,47 @@ func TestExternalChangeUsesDeterministicUnknownActorAndWorkspaceScope(t *testing
 	}
 }
 
+func TestExternalChangeNotifiesOnlyActorsWithExactActivePathIntent(t *testing.T) {
+	engine, _, now := newTestEngine(t)
+	first := register(t, engine, "external-first")
+	second := register(t, engine, "external-second")
+	unrelated := register(t, engine, "external-unrelated")
+	path := "/repo/target.txt"
+	mustBeginIntent(t, engine, &protocol.Intent{ID: "external-first-intent", Actor: first.Address, ToolCallID: "first-call", Tool: "edit", Operation: "edit", Paths: []string{path}, CWD: "/repo"})
+	mustBeginIntent(t, engine, &protocol.Intent{ID: "external-second-intent", Actor: second.Address, ToolCallID: "second-call", Tool: "edit", Operation: "edit", Paths: []string{path}, CWD: "/repo"})
+	mustBeginIntent(t, engine, &protocol.Intent{ID: "external-unrelated-intent", Actor: unrelated.Address, ToolCallID: "unrelated-call", Tool: "edit", Operation: "edit", Paths: []string{"/repo/other.txt"}, CWD: "/repo"})
+
+	change, err := engine.ObserveExternalChange(protocol.ExternalChange{
+		ID: "55555555-5555-4555-8555-555555555555", RepositoryUUID: first.RepositoryUUID, WorkspaceUUID: first.WorkspaceUUID,
+		IntervalStartedAt: *now, IntervalEndedAt: *now, ContinuityState: "current", ChangeKind: "modified", Path: path,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.ExternalChange(change.ID); err != nil {
+		t.Fatalf("durable external observation missing: %v", err)
+	}
+	if err := engine.NotifyExternalChange(change); err != nil {
+		t.Fatal(err)
+	}
+	for _, actor := range []protocol.Actor{first, second} {
+		var externalMessages []protocol.Message
+		for _, message := range mustPoll(t, engine, actor.Address) {
+			if message.Kind == "external_change" {
+				externalMessages = append(externalMessages, message)
+			}
+		}
+		if len(externalMessages) != 1 || externalMessages[0].From != change.UnknownActor {
+			t.Fatalf("target actor %s external messages = %#v", actor.Address, externalMessages)
+		}
+	}
+	for _, message := range mustPoll(t, engine, unrelated.Address) {
+		if message.Kind == "external_change" {
+			t.Fatalf("unrelated actor received external message %#v", message)
+		}
+	}
+}
+
 func TestWatchContinuityRequiresKnownWorkspace(t *testing.T) {
 	engine, _, now := newTestEngine(t)
 	actor := register(t, engine, "continuity")

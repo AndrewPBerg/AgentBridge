@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +22,7 @@ import (
 	_ "turso.tech/database/tursogo"
 )
 
-const projectionSchemaVersion = 16
+const projectionSchemaVersion = 18
 
 // DB stores and projects provenance events.
 type DB struct {
@@ -320,6 +321,11 @@ func initializeSchemaGroup2() []string {
 			actor_uuid BLOB NOT NULL, joined_at TEXT NOT NULL, left_at TEXT, participation_state TEXT NOT NULL,
 			PRIMARY KEY(work_unit_uuid, actor_uuid)
 		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS launches (launch_uuid BLOB PRIMARY KEY, child_actor_uuid BLOB, work_unit_uuid BLOB REFERENCES work_units(work_unit_uuid), created_at TEXT NOT NULL, child_attached_at TEXT, work_unit_attached_at TEXT, created_sequence INTEGER NOT NULL, updated_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE IF NOT EXISTS launch_parent_actors (launch_uuid BLOB NOT NULL REFERENCES launches(launch_uuid) ON DELETE CASCADE, ordinal INTEGER NOT NULL, actor_uuid BLOB NOT NULL, PRIMARY KEY(launch_uuid, ordinal), UNIQUE(launch_uuid, actor_uuid)) STRICT`,
+		`CREATE INDEX IF NOT EXISTS launch_parent_actors_actor ON launch_parent_actors(actor_uuid, launch_uuid)`,
+		`CREATE INDEX IF NOT EXISTS launches_child_actor ON launches(child_actor_uuid)`,
+		`CREATE INDEX IF NOT EXISTS launches_work_unit ON launches(work_unit_uuid)`,
 		`CREATE TABLE IF NOT EXISTS external_changes (external_change_uuid BLOB PRIMARY KEY, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, unknown_actor_uuid BLOB NOT NULL, interval_started_at TEXT NOT NULL, interval_ended_at TEXT NOT NULL, continuity_state TEXT NOT NULL, change_kind TEXT NOT NULL, watchman_clock TEXT NOT NULL, before_json TEXT, after_json TEXT, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE IF NOT EXISTS external_change_paths (external_change_uuid BLOB NOT NULL REFERENCES external_changes(external_change_uuid) ON DELETE CASCADE, path TEXT NOT NULL, PRIMARY KEY(external_change_uuid, path)) STRICT`,
 		`CREATE TABLE IF NOT EXISTS external_change_intents (external_change_uuid BLOB NOT NULL REFERENCES external_changes(external_change_uuid) ON DELETE CASCADE, intent_id TEXT NOT NULL, PRIMARY KEY(external_change_uuid, intent_id)) STRICT`,
@@ -359,6 +365,9 @@ func (d *DB) initialize() error {
 		{"collisions", "dead_actor", "BLOB"},
 		{"checkpoint_requests", "declared_by", "TEXT NOT NULL DEFAULT 'agent'"},
 		{"checkpoint_requests", "work_unit_uuid", "BLOB"},
+		{"checkpoint_requests", "tickets_json", "TEXT NOT NULL DEFAULT '[]'"},
+		{"directions", "tickets_json", "TEXT NOT NULL DEFAULT '[]'"},
+		{"work_units", "tickets_json", "TEXT NOT NULL DEFAULT '[]'"},
 		{"test_results", "outcome", "TEXT NOT NULL DEFAULT 'blocked'"},
 	} {
 		if err := d.ensureColumn(column.table, column.name, column.definition); err != nil {
@@ -425,7 +434,7 @@ func resetProjection(transaction *sql.Tx, version int) error {
 			return err
 		}
 	}
-	tables := []string{"external_change_intents", "external_change_paths", "external_changes", "workspace_continuity", "checkpoint_claim_evidence", "checkpoint_claims", "checkpoint_metadata", "checkpoint_evidence", "checkpoint_requests", "work_unit_actors", "work_units", "directions", "mutation_paths", "mutations", "session_events", "messages", "test_results", "workspaces", "repositories", "events"}
+	tables := []string{"launch_parent_actors", "launches", "external_change_intents", "external_change_paths", "external_changes", "workspace_continuity", "checkpoint_claim_evidence", "checkpoint_claims", "checkpoint_metadata", "checkpoint_evidence", "checkpoint_requests", "work_unit_actors", "work_units", "directions", "mutation_paths", "mutations", "session_events", "messages", "test_results", "workspaces", "repositories", "events"}
 	if version == 0 || version >= 7 {
 		tables = append(tables, "collision_actors", "collisions")
 	}
@@ -447,7 +456,7 @@ func recreateBinaryProjectionTables(transaction *sql.Tx) error {
 	// Projection state is disposable: the journal is the migration source. Drop
 	// every UUID-bearing table together so old TEXT schemas cannot reject the
 	// binary projection during backfill.
-	for _, table := range []string{"external_change_intents", "external_change_paths", "external_changes", "workspace_continuity", "checkpoint_claim_evidence", "checkpoint_claims", "checkpoint_metadata", "checkpoint_evidence", "checkpoint_requests", "work_unit_actors", "work_units", "directions", "test_results", "messages", "collision_actors", "collisions", "session_events", "mutation_paths", "mutations", "actors", "workspaces", "repositories"} {
+	for _, table := range []string{"launch_parent_actors", "launches", "external_change_intents", "external_change_paths", "external_changes", "workspace_continuity", "checkpoint_claim_evidence", "checkpoint_claims", "checkpoint_metadata", "checkpoint_evidence", "checkpoint_requests", "work_unit_actors", "work_units", "directions", "test_results", "messages", "collision_actors", "collisions", "session_events", "mutation_paths", "mutations", "actors", "workspaces", "repositories"} {
 		if _, err := transaction.ExecContext(context.Background(), `DROP TABLE IF EXISTS `+table); err != nil {
 			return fmt.Errorf("drop legacy projection table %s: %w", table, err)
 		}
@@ -474,17 +483,22 @@ func recreateBinaryProjectionTables(transaction *sql.Tx) error {
 		`CREATE INDEX collision_actors_actor ON collision_actors(session_uuid, collision_id)`,
 		`CREATE TABLE test_results (id TEXT PRIMARY KEY, actor BLOB NOT NULL, session_generation INTEGER NOT NULL, turn_id TEXT, turn_index INTEGER, tool_call_id TEXT, command TEXT NOT NULL, cwd TEXT NOT NULL, exit_code INTEGER, outcome TEXT NOT NULL DEFAULT 'blocked' CHECK(outcome IN ('passed','failed','blocked')), started_at TEXT NOT NULL, completed_at TEXT NOT NULL, duration_ms INTEGER, output_excerpt TEXT, output_sha256 TEXT, output_bytes INTEGER, output_truncated INTEGER NOT NULL, repository_uuid BLOB, workspace_uuid BLOB, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE INDEX test_results_sequence_id ON test_results(event_sequence, id)`,
-		`CREATE TABLE checkpoint_requests (id TEXT PRIMARY KEY, actor BLOB NOT NULL, declared_by TEXT NOT NULL, session_generation INTEGER NOT NULL, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, work_unit_uuid BLOB REFERENCES work_units(work_unit_uuid), checkpoint_kind TEXT NOT NULL, journal_start_sequence INTEGER NOT NULL, journal_end_sequence INTEGER NOT NULL, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE checkpoint_requests (id TEXT PRIMARY KEY, actor BLOB NOT NULL, declared_by TEXT NOT NULL, session_generation INTEGER NOT NULL, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, work_unit_uuid BLOB REFERENCES work_units(work_unit_uuid), checkpoint_kind TEXT NOT NULL, journal_start_sequence INTEGER NOT NULL, journal_end_sequence INTEGER NOT NULL, tickets_json TEXT NOT NULL DEFAULT '[]', data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE checkpoint_evidence (checkpoint_id TEXT NOT NULL REFERENCES checkpoint_requests(id) ON DELETE CASCADE, kind TEXT NOT NULL, ordinal INTEGER NOT NULL, ref_text TEXT, ref_uuid BLOB, PRIMARY KEY(checkpoint_id, kind, ordinal), CHECK ((ref_text IS NOT NULL) != (ref_uuid IS NOT NULL))) STRICT`,
 		`CREATE TABLE checkpoint_metadata (checkpoint_id TEXT NOT NULL REFERENCES checkpoint_requests(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(checkpoint_id, key)) STRICT`,
 		`CREATE TABLE checkpoint_claims (checkpoint_id TEXT NOT NULL REFERENCES checkpoint_requests(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, kind TEXT NOT NULL, statement TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('asserted','verified','failed','blocked')), PRIMARY KEY(checkpoint_id, ordinal)) STRICT`,
 		`CREATE TABLE checkpoint_claim_evidence (checkpoint_id TEXT NOT NULL, claim_ordinal INTEGER NOT NULL, evidence_kind TEXT NOT NULL, evidence_ordinal INTEGER NOT NULL, PRIMARY KEY(checkpoint_id, claim_ordinal, evidence_kind, evidence_ordinal), FOREIGN KEY(checkpoint_id, claim_ordinal) REFERENCES checkpoint_claims(checkpoint_id, ordinal) ON DELETE CASCADE, FOREIGN KEY(checkpoint_id, evidence_kind, evidence_ordinal) REFERENCES checkpoint_evidence(checkpoint_id, kind, ordinal) ON DELETE CASCADE) STRICT`,
-		`CREATE TABLE work_units (work_unit_uuid BLOB PRIMARY KEY, direction_uuid BLOB REFERENCES directions(direction_uuid), repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, objective TEXT NOT NULL, acceptance_criteria TEXT, context TEXT, state TEXT NOT NULL, created_by BLOB NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, updated_sequence INTEGER NOT NULL) STRICT`,
-		`CREATE TABLE directions (direction_uuid BLOB PRIMARY KEY, objective TEXT NOT NULL, success_criteria TEXT, constraints TEXT, context TEXT, state TEXT NOT NULL, created_by BLOB NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, updated_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE work_units (work_unit_uuid BLOB PRIMARY KEY, direction_uuid BLOB REFERENCES directions(direction_uuid), repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, objective TEXT NOT NULL, acceptance_criteria TEXT, context TEXT, state TEXT NOT NULL, created_by BLOB NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, tickets_json TEXT NOT NULL DEFAULT '[]', updated_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE directions (direction_uuid BLOB PRIMARY KEY, objective TEXT NOT NULL, success_criteria TEXT, constraints TEXT, context TEXT, state TEXT NOT NULL, created_by BLOB NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, tickets_json TEXT NOT NULL DEFAULT '[]', updated_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE work_unit_actors (work_unit_uuid BLOB NOT NULL REFERENCES work_units(work_unit_uuid) ON DELETE CASCADE, actor_uuid BLOB NOT NULL, joined_at TEXT NOT NULL, left_at TEXT, participation_state TEXT NOT NULL, PRIMARY KEY(work_unit_uuid, actor_uuid)) STRICT`,
 		`CREATE TABLE external_changes (external_change_uuid BLOB PRIMARY KEY, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, unknown_actor_uuid BLOB NOT NULL, interval_started_at TEXT NOT NULL, interval_ended_at TEXT NOT NULL, continuity_state TEXT NOT NULL, change_kind TEXT NOT NULL, watchman_clock TEXT NOT NULL, before_json TEXT, after_json TEXT, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE external_change_paths (external_change_uuid BLOB NOT NULL REFERENCES external_changes(external_change_uuid) ON DELETE CASCADE, path TEXT NOT NULL, PRIMARY KEY(external_change_uuid, path)) STRICT`,
 		`CREATE TABLE external_change_intents (external_change_uuid BLOB NOT NULL REFERENCES external_changes(external_change_uuid) ON DELETE CASCADE, intent_id TEXT NOT NULL, PRIMARY KEY(external_change_uuid, intent_id)) STRICT`,
+		`CREATE TABLE launches (launch_uuid BLOB PRIMARY KEY, child_actor_uuid BLOB, work_unit_uuid BLOB REFERENCES work_units(work_unit_uuid), created_at TEXT NOT NULL, child_attached_at TEXT, work_unit_attached_at TEXT, created_sequence INTEGER NOT NULL, updated_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE launch_parent_actors (launch_uuid BLOB NOT NULL REFERENCES launches(launch_uuid) ON DELETE CASCADE, ordinal INTEGER NOT NULL, actor_uuid BLOB NOT NULL, PRIMARY KEY(launch_uuid, ordinal), UNIQUE(launch_uuid, actor_uuid)) STRICT`,
+		`CREATE INDEX launch_parent_actors_actor ON launch_parent_actors(actor_uuid, launch_uuid)`,
+		`CREATE INDEX launches_child_actor ON launches(child_actor_uuid)`,
+		`CREATE INDEX launches_work_unit ON launches(work_unit_uuid)`,
 		`CREATE TABLE workspace_continuity (workspace_uuid BLOB PRIMARY KEY, repository_uuid BLOB NOT NULL, state TEXT NOT NULL, at TEXT NOT NULL, watchman_clock TEXT, event_sequence INTEGER NOT NULL) STRICT`,
 	}
 	for _, statement := range statements {
@@ -647,7 +661,10 @@ func (d *DB) projectDomain(transaction *sql.Tx, event *protocol.Event) error {
 		"actor.upserted": projectActorUpserted, "intent.started": projectIntentStarted,
 		"intent.completed": projectIntentStarted, "message.enqueued": projectMessageEnqueued,
 		"message.acked": projectMessageAcked, "session.event": projectSessionEvent,
-		"test.result": projectTestResult, "direction.created": projectDirectionCreated,
+		"test.result": projectTestResult, "launch.created": projectLaunchCreated,
+		"launch.child_attached": projectLaunchChildAttached, "launch.work_unit_attached": projectLaunchWorkUnitAttached,
+		"direction.created":      projectDirectionCreated,
+		"direction.updated":      projectDirectionUpdated,
 		"direction.transitioned": projectDirectionTransitioned,
 		"work_unit.created":      projectWorkUnitCreated, "work_unit.updated": projectWorkUnitUpdated,
 		"work_unit.transitioned": projectWorkUnitTransitioned, "work_unit.actor_joined": projectWorkUnitActorJoined,
@@ -807,6 +824,83 @@ func projectTestResult(transaction *sql.Tx, event *protocol.Event) error {
 	return err
 }
 
+//nolint:cyclop // Creation validates every normalized UUID relation before persistence.
+func projectLaunchCreated(transaction *sql.Tx, event *protocol.Event) error {
+	var created protocol.LaunchCreatedEvent
+	if err := json.Unmarshal(event.Data, &created); err != nil {
+		return err
+	}
+	launch := created.Launch
+	if err := protocol.ValidateUUID(launch.UUID); err != nil || launch.ChildActor != "" || launch.WorkUnitUUID != "" || launch.ChildAttachedAt != nil || launch.WorkUnitAttachedAt != nil {
+		return errors.New("invalid launch creation")
+	}
+	parents := append([]string(nil), launch.ParentActors...)
+	sort.Strings(parents)
+	if !reflect.DeepEqual(parents, launch.ParentActors) {
+		return errors.New("launch parents are not normalized")
+	}
+	for index, parent := range parents {
+		if err := protocol.ValidateUUID(parent); err != nil || index > 0 && parent == parents[index-1] {
+			return errors.New("invalid launch parent")
+		}
+	}
+	if _, err := transaction.ExecContext(context.Background(), `INSERT INTO launches(launch_uuid, created_at, created_sequence, updated_sequence) VALUES (?, ?, ?, ?)`, uuidBlob(launch.UUID), launch.CreatedAt.UTC().Format(time.RFC3339Nano), event.Sequence, event.Sequence); err != nil {
+		return err
+	}
+	for ordinal, parent := range parents {
+		if _, err := transaction.ExecContext(context.Background(), `INSERT INTO launch_parent_actors(launch_uuid, ordinal, actor_uuid) VALUES (?, ?, ?)`, uuidBlob(launch.UUID), ordinal, uuidBlob(parent)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func projectLaunchChildAttached(transaction *sql.Tx, event *protocol.Event) error {
+	var attached protocol.LaunchChildAttachedEvent
+	if err := json.Unmarshal(event.Data, &attached); err != nil {
+		return err
+	}
+	if protocol.ValidateUUID(attached.LaunchUUID) != nil || protocol.ValidateUUID(attached.ChildActor) != nil || attached.At.IsZero() {
+		return errors.New("invalid launch child attachment")
+	}
+	result, err := transaction.ExecContext(context.Background(), `UPDATE launches SET child_actor_uuid=?, child_attached_at=?, updated_sequence=? WHERE launch_uuid=? AND child_actor_uuid IS NULL`, uuidBlob(attached.ChildActor), attached.At.UTC().Format(time.RFC3339Nano), event.Sequence, uuidBlob(attached.LaunchUUID))
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil || count != 1 {
+		return errors.New("launch child attachment references unknown or attached launch")
+	}
+	return nil
+}
+
+func projectLaunchWorkUnitAttached(transaction *sql.Tx, event *protocol.Event) error {
+	var attached protocol.LaunchWorkUnitAttachedEvent
+	if err := json.Unmarshal(event.Data, &attached); err != nil {
+		return err
+	}
+	if protocol.ValidateUUID(attached.LaunchUUID) != nil || protocol.ValidateUUID(attached.WorkUnitUUID) != nil || attached.At.IsZero() {
+		return errors.New("invalid launch work unit attachment")
+	}
+	result, err := transaction.ExecContext(context.Background(), `UPDATE launches SET work_unit_uuid=?, work_unit_attached_at=?, updated_sequence=? WHERE launch_uuid=? AND work_unit_uuid IS NULL`, uuidBlob(attached.WorkUnitUUID), attached.At.UTC().Format(time.RFC3339Nano), event.Sequence, uuidBlob(attached.LaunchUUID))
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil || count != 1 {
+		return errors.New("launch work unit attachment references unknown or attached launch")
+	}
+	return nil
+}
+
+func ticketJSON(tickets protocol.Tickets) string {
+	data, err := json.Marshal(tickets)
+	if err != nil {
+		return "[]"
+	}
+	return string(data)
+}
+
 func projectDirectionCreated(transaction *sql.Tx, event *protocol.Event) error {
 	var created protocol.DirectionCreatedEvent
 	if err := json.Unmarshal(event.Data, &created); err != nil {
@@ -820,11 +914,11 @@ func projectDirectionCreated(transaction *sql.Tx, event *protocol.Event) error {
 	}
 	result, err := transaction.ExecContext(context.Background(), `INSERT OR IGNORE INTO directions(
 		direction_uuid, objective, success_criteria, constraints, context, state, created_by,
-		created_at, updated_at, completed_at, updated_sequence
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, uuidBlob(direction.UUID), direction.Objective,
+		created_at, updated_at, completed_at, tickets_json, updated_sequence
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, uuidBlob(direction.UUID), direction.Objective,
 		nullable(direction.SuccessCriteria), nullable(direction.Constraints), nullable(direction.Context), direction.State,
 		uuidBlob(direction.CreatedBy), direction.CreatedAt.UTC().Format(time.RFC3339Nano), direction.UpdatedAt.UTC().Format(time.RFC3339Nano),
-		nullableTime(direction.CompletedAt), event.Sequence)
+		nullableTime(direction.CompletedAt), ticketJSON(direction.Tickets), event.Sequence)
 	if err != nil {
 		return err
 	}
@@ -851,6 +945,43 @@ func projectDirectionCreated(transaction *sql.Tx, event *protocol.Event) error {
 		}
 	}
 	return nil
+}
+
+func projectDirectionUpdated(transaction *sql.Tx, event *protocol.Event) error {
+	var updated protocol.DirectionUpdatedEvent
+	if err := json.Unmarshal(event.Data, &updated); err != nil {
+		return err
+	}
+	current, err := loadProjectedDirection(transaction, updated.UUID)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(current, updated.Previous) || updated.Result.UUID != updated.UUID || updated.Result.State != current.State {
+		return errors.New("invalid direction update projection")
+	}
+	_, err = transaction.ExecContext(context.Background(), `UPDATE directions SET objective=?, success_criteria=?, constraints=?, context=?, updated_at=?, tickets_json=?, updated_sequence=? WHERE direction_uuid=?`, updated.Result.Objective, nullable(updated.Result.SuccessCriteria), nullable(updated.Result.Constraints), nullable(updated.Result.Context), updated.Result.UpdatedAt.UTC().Format(time.RFC3339Nano), ticketJSON(updated.Result.Tickets), event.Sequence, uuidBlob(updated.UUID))
+	return err
+}
+func loadProjectedDirection(transaction *sql.Tx, uuid string) (protocol.Direction, error) {
+	var result protocol.Direction
+	var id, creator []byte
+	var created, updated string
+	var completed sql.NullString
+	var tickets string
+	err := transaction.QueryRowContext(context.Background(), `SELECT direction_uuid, objective, COALESCE(success_criteria,''), COALESCE(constraints,''), COALESCE(context,''), state, created_by, created_at, updated_at, completed_at, tickets_json FROM directions WHERE direction_uuid=?`, uuidBlob(uuid)).Scan(&id, &result.Objective, &result.SuccessCriteria, &result.Constraints, &result.Context, &result.State, &creator, &created, &updated, &completed, &tickets)
+	if err != nil {
+		return result, err
+	}
+	result.UUID, result.CreatedBy = uuidString(id), uuidString(creator)
+	result.CreatedAt, result.UpdatedAt = parseProjectionTime(created), parseProjectionTime(updated)
+	if completed.Valid {
+		at := parseProjectionTime(completed.String)
+		result.CompletedAt = &at
+	}
+	if err := json.Unmarshal([]byte(tickets), &result.Tickets); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 func projectDirectionTransitioned(transaction *sql.Tx, event *protocol.Event) error {
@@ -908,6 +1039,11 @@ func projectWorkUnitCreated(transaction *sql.Tx, event *protocol.Event) error {
 		return err
 	}
 	unit := created.WorkUnit
+	var ticketErr error
+	unit.Tickets, ticketErr = protocol.NormalizeTickets(unit.Tickets)
+	if ticketErr != nil {
+		return ticketErr
+	}
 	for name, value := range map[string]string{"work_unit_uuid": unit.UUID, "repository_uuid": unit.RepositoryUUID, "workspace_uuid": unit.WorkspaceUUID, "created_by": unit.CreatedBy} {
 		if err := protocol.ValidateUUID(value); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
@@ -918,7 +1054,7 @@ func projectWorkUnitCreated(transaction *sql.Tx, event *protocol.Event) error {
 			return fmt.Errorf("direction_uuid: %w", err)
 		}
 	}
-	result, err := transaction.ExecContext(context.Background(), `INSERT INTO work_units(work_unit_uuid, direction_uuid, repository_uuid, workspace_uuid, objective, acceptance_criteria, context, state, created_by, created_at, updated_at, updated_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, uuidBlob(unit.UUID), nullableUUID(unit.DirectionUUID), uuidBlob(unit.RepositoryUUID), uuidBlob(unit.WorkspaceUUID), unit.Objective, nullable(unit.AcceptanceCriteria), nullable(unit.Context), unit.State, uuidBlob(unit.CreatedBy), unit.CreatedAt.UTC().Format(time.RFC3339Nano), unit.UpdatedAt.UTC().Format(time.RFC3339Nano), event.Sequence)
+	result, err := transaction.ExecContext(context.Background(), `INSERT INTO work_units(work_unit_uuid, direction_uuid, repository_uuid, workspace_uuid, objective, acceptance_criteria, context, state, created_by, created_at, updated_at, tickets_json, updated_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, uuidBlob(unit.UUID), nullableUUID(unit.DirectionUUID), uuidBlob(unit.RepositoryUUID), uuidBlob(unit.WorkspaceUUID), unit.Objective, nullable(unit.AcceptanceCriteria), nullable(unit.Context), unit.State, uuidBlob(unit.CreatedBy), unit.CreatedAt.UTC().Format(time.RFC3339Nano), unit.UpdatedAt.UTC().Format(time.RFC3339Nano), ticketJSON(unit.Tickets), event.Sequence)
 	if err != nil {
 		return err
 	}
@@ -933,6 +1069,15 @@ func projectWorkUnitUpdated(transaction *sql.Tx, event *protocol.Event) error {
 	var updated protocol.WorkUnitUpdatedEvent
 	if err := json.Unmarshal(event.Data, &updated); err != nil {
 		return err
+	}
+	var ticketErr error
+	updated.Previous.Tickets, ticketErr = protocol.NormalizeTickets(updated.Previous.Tickets)
+	if ticketErr != nil {
+		return ticketErr
+	}
+	updated.Result.Tickets, ticketErr = protocol.NormalizeTickets(updated.Result.Tickets)
+	if ticketErr != nil {
+		return ticketErr
 	}
 	if err := validateWorkUnitUpdate(transaction, &updated); err != nil {
 		return err
@@ -969,7 +1114,7 @@ func validWorkUnitUpdateProvenance(transaction *sql.Tx, updated *protocol.WorkUn
 }
 
 func updateProjectedWorkUnit(transaction *sql.Tx, sequence uint64, unit *protocol.WorkUnit) error {
-	result, err := transaction.ExecContext(context.Background(), `UPDATE work_units SET objective=?, acceptance_criteria=?, context=?, state=?, updated_at=?, updated_sequence=? WHERE work_unit_uuid=?`, unit.Objective, nullable(unit.AcceptanceCriteria), nullable(unit.Context), unit.State, unit.UpdatedAt.UTC().Format(time.RFC3339Nano), sequence, uuidBlob(unit.UUID))
+	result, err := transaction.ExecContext(context.Background(), `UPDATE work_units SET objective=?, acceptance_criteria=?, context=?, state=?, updated_at=?, tickets_json=?, updated_sequence=? WHERE work_unit_uuid=?`, unit.Objective, nullable(unit.AcceptanceCriteria), nullable(unit.Context), unit.State, unit.UpdatedAt.UTC().Format(time.RFC3339Nano), ticketJSON(unit.Tickets), sequence, uuidBlob(unit.UUID))
 	if err != nil {
 		return err
 	}
@@ -1172,10 +1317,10 @@ func projectedCheckpointExists(transaction *sql.Tx, checkpoint *protocol.Checkpo
 func insertProjectedCheckpoint(transaction *sql.Tx, checkpoint *protocol.CheckpointRequest, workUnitUUID any, event *protocol.Event) error {
 	_, err := transaction.ExecContext(context.Background(), `INSERT INTO checkpoint_requests(
 		id, actor, declared_by, session_generation, repository_uuid, workspace_uuid, work_unit_uuid, checkpoint_kind,
-		journal_start_sequence, journal_end_sequence, data, event_sequence
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, checkpoint.ID, uuidBlob(checkpoint.Actor), checkpoint.DeclaredBy, checkpoint.SessionGeneration,
+		journal_start_sequence, journal_end_sequence, tickets_json, data, event_sequence
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, checkpoint.ID, uuidBlob(checkpoint.Actor), checkpoint.DeclaredBy, checkpoint.SessionGeneration,
 		uuidBlob(checkpoint.RepositoryUUID), uuidBlob(checkpoint.WorkspaceUUID), workUnitUUID, checkpoint.CheckpointKind, checkpoint.JournalStart,
-		checkpoint.JournalEnd, string(event.Data), event.Sequence)
+		checkpoint.JournalEnd, ticketJSON(checkpoint.Tickets), string(event.Data), event.Sequence)
 	return err
 }
 
@@ -1289,7 +1434,8 @@ func loadProjectedWorkUnit(transaction *sql.Tx, uuid string) (protocol.WorkUnit,
 	var id, direction, repo, workspace, creator []byte
 	var created, updated string
 	var completed sql.NullString
-	err := transaction.QueryRowContext(context.Background(), `SELECT work_unit_uuid, direction_uuid, repository_uuid, workspace_uuid, objective, COALESCE(acceptance_criteria,''), COALESCE(context,''), state, created_by, created_at, updated_at, completed_at FROM work_units WHERE work_unit_uuid = ?`, uuidBlob(uuid)).Scan(&id, &direction, &repo, &workspace, &unit.Objective, &unit.AcceptanceCriteria, &unit.Context, &unit.State, &creator, &created, &updated, &completed)
+	var tickets string
+	err := transaction.QueryRowContext(context.Background(), `SELECT work_unit_uuid, direction_uuid, repository_uuid, workspace_uuid, objective, COALESCE(acceptance_criteria,''), COALESCE(context,''), state, created_by, created_at, updated_at, completed_at, tickets_json FROM work_units WHERE work_unit_uuid = ?`, uuidBlob(uuid)).Scan(&id, &direction, &repo, &workspace, &unit.Objective, &unit.AcceptanceCriteria, &unit.Context, &unit.State, &creator, &created, &updated, &completed, &tickets)
 	if errors.Is(err, sql.ErrNoRows) {
 		return unit, errors.New("work unit event references unknown unit")
 	}
@@ -1302,6 +1448,9 @@ func loadProjectedWorkUnit(transaction *sql.Tx, uuid string) (protocol.WorkUnit,
 	if completed.Valid {
 		at := parseProjectionTime(completed.String)
 		unit.CompletedAt = &at
+	}
+	if err := json.Unmarshal([]byte(tickets), &unit.Tickets); err != nil {
+		return unit, err
 	}
 	return unit, nil
 }

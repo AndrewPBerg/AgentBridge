@@ -79,6 +79,55 @@ describe("Go Agent Bridge adapter", () => {
     checkpoints: [],
   });
 
+  it("toggles explicit stealth mode and restores ordinary presence", async () => {
+    const pi = createMockPi();
+    const states: string[] = [];
+    const client = mockClient((method, params) => {
+      if (method !== "actor.heartbeat") return undefined;
+      states.push(params.state);
+      return { ...actor(), state: params.state };
+    });
+    const ctx = await start(pi, client);
+    const tool = pi.tools.get("bridge_stealth");
+
+    const enabled = await tool.execute("stealth-on", { enabled: true });
+    expect(enabled.details).toEqual({ enabled: true, state: "stealth" });
+    expect(states).toEqual(["stealth"]);
+
+    await tool.execute("stealth-off", { enabled: false });
+    expect(states).toEqual(["stealth", "active"]);
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("supports compact /stealth on, off, status, and usage validation", async () => {
+    const pi = createMockPi();
+    const states: string[] = [];
+    const client = mockClient((method, params) => {
+      if (method !== "actor.heartbeat") return undefined;
+      states.push(params.state);
+      return { ...actor(), state: params.state };
+    });
+    const ctx = await start(pi, client);
+    const stealth = pi.commands.get("stealth");
+
+    await stealth.handler("on", ctx);
+    await stealth.handler("status", ctx);
+    expect(states).toEqual(["stealth"]);
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Agent Bridge stealth mode enabled.", "info");
+
+    await stealth.handler("off", ctx);
+    await stealth.handler("status", ctx);
+    expect(states).toEqual(["stealth", "active"]);
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Agent Bridge stealth mode disabled.", "info");
+
+    await stealth.handler("", ctx);
+    await stealth.handler("maybe", ctx);
+    await stealth.handler("on extra", ctx);
+    expect(states).toEqual(["stealth", "active"]);
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Usage: /stealth on | /stealth off | /stealth status", "warning");
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
   it("automatically reports ordinary edit intent to the daemon", async () => {
     const pi = createMockPi();
     const client = mockClient();
@@ -741,6 +790,31 @@ describe("Go Agent Bridge adapter", () => {
     await pi.commands.get("work").handler("objective", ctx);
     await expect(pi.tools.get("bridge_checkpoint").execute("stale", { kind: "test" })).rejects.toThrow("not found");
     expect(client.call).not.toHaveBeenCalledWith("checkpoint.request", expect.anything());
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("lists ticket context through a read and replaces or clears it through updates", async () => {
+    const pi = createMockPi();
+    const directionUUID = "44444444-4444-5444-8444-444444444444";
+    const stored = [{ key: "AB-1", title: "ticket" }];
+    const direction = { direction_uuid: directionUUID, objective: "ship", state: "active", tickets: stored };
+    const client = mockClient((method, params) => {
+      if (method === "direction.get") return direction;
+      if (method === "direction.update") return { ...direction, tickets: (params as any).tickets };
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.commands.get("direction").handler(`use ${directionUUID}`, ctx);
+
+    const listed = await pi.tools.get("bridge_ticket").execute("list", { action: "list", target: "direction" });
+    expect(listed.content[0].text).toBe(JSON.stringify(stored));
+    expect(client.call).toHaveBeenCalledWith("direction.get", { direction_uuid: directionUUID });
+    expect(client.call).not.toHaveBeenCalledWith("direction.update", expect.anything());
+
+    await pi.tools.get("bridge_ticket").execute("replace", { action: "replace", target: "direction", tickets: stored });
+    await pi.tools.get("bridge_ticket").execute("clear", { action: "clear", target: "direction" });
+    expect(client.call).toHaveBeenCalledWith("direction.update", expect.objectContaining({ tickets: stored }));
+    expect(client.call).toHaveBeenCalledWith("direction.update", expect.objectContaining({ tickets: [] }));
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });
 

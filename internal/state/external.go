@@ -206,17 +206,34 @@ func (e *Engine) MatchIntentTransition(workspaceUUID, path string, before, after
 	return result
 }
 
-// NotifyExternalChange delivers one non-addressable observation to every
-// active actor in the affected workspace. The unknown actor is the source
-// label; only the daemon can enqueue this notification.
+// activeIntentActorsForPathLocked returns the live actors whose in-progress
+// exact-path mutations conflict with an external observation.
+func (e *Engine) activeIntentActorsForPathLocked(workspaceUUID, path string) []string {
+	actors := make(map[string]struct{})
+	for _, intent := range e.intents {
+		if intent.WorkspaceUUID == workspaceUUID && intent.CompletedAt == nil && slices.Contains(intent.Paths, path) {
+			actors[intent.Actor] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(actors))
+	for actor := range actors {
+		result = append(result, actor)
+	}
+	slices.Sort(result)
+	return result
+}
+
+// NotifyExternalChange delivers an observation only to live actors with an
+// active exact-path intent. The unknown actor is the source label; only the
+// daemon can enqueue this notification.
 //
 //nolint:gocritic // public API captures an immutable external-change value.
 func (e *Engine) NotifyExternalChange(change protocol.ExternalChange) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for address := range e.actors {
-		actor := e.actors[address]
-		if actor.WorkspaceUUID != change.WorkspaceUUID || !e.active(actor) || isUnknownActor(actor) {
+	for _, address := range e.activeIntentActorsForPathLocked(change.WorkspaceUUID, change.Path) {
+		actor, ok := e.actors[address]
+		if !ok || !e.active(actor) || isUnknownActor(actor) {
 			continue
 		}
 		body := fmt.Sprintf("UNATTRIBUTED EXTERNAL CHANGE observed on %s (%s). Source %s is unknown and non-addressable. Re-read before writing.", change.Path, change.ChangeKind, change.UnknownActor)

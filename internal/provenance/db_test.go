@@ -125,6 +125,28 @@ func TestQueryWaitCannotMissConcurrentDurableAppendTail(t *testing.T) {
 	}
 }
 
+func TestProjectedSequenceTracksOnlyDurableProjectionEvents(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "agent-bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
+	if sequence, err := database.ProjectedSequence(); err != nil || sequence != 0 {
+		t.Fatalf("empty projected sequence = %d, %v", sequence, err)
+	}
+	actor := protocol.Actor{Address: actorUUID("sequence"), Harness: "pi", SessionUUID: actorUUID("sequence"), CWD: "/repo", State: "active", StartedAt: time.Now(), HeartbeatAt: time.Now()}
+	if err := database.Project(event(t, 1, "actor.upserted", actor)); err != nil {
+		t.Fatal(err)
+	}
+	if sequence, err := database.ProjectedSequence(); err != nil || sequence != 1 {
+		t.Fatalf("projected sequence = %d, %v", sequence, err)
+	}
+}
+
 func TestAsyncProjectorBackpressuresWithoutSequenceGaps(t *testing.T) {
 	database, err := Open(filepath.Join(t.TempDir(), "agent-bridge.db"))
 	if err != nil {

@@ -1,4 +1,5 @@
 # Roadmap
+testing watchman
 
 ## Product direction
 
@@ -435,255 +436,58 @@ Deferred after the immediate operability slice:
 
 Exit condition for the local slice: several agents can coordinate one project-shaped Direction containing issues and sub-issues, inspect deterministic readiness and blockers, and verify the integrated outcome from descendant checkpoint evidence without confusing project state, executable work, VCS state, or provenance boundaries.
 
-## Phase 4 — Linear cloud projection and shared agent memory
+## Phase 4 — Generic ticket context
 
-This phase follows local Direction orchestration. It projects selected Agent Bridge Directions, WorkUnits, checkpoints, and evidence-backed claims into Linear so teammates and Linear Agent can share durable project memory without requiring each coding agent to call Linear MCP directly.
+Agent Bridge needs a low-friction local place to retain the ticket context a human or agent already has, without choosing Linear, GitHub, Jira, or any other tracker as its model. This phase is deliberately **local only**: tracker connectivity, OAuth, webhooks, remote mutation, synchronization, and cloud projection are deferred.
 
-Linear is an external collaboration projection, not the coordination authority. Agent Bridge's local journal, normalized provenance, checkpoint identity, and lifecycle remain canonical. Linear unavailability, authentication expiry, rate limits, or content divergence must never block local checkpoint creation or WorkUnit progress.
+### Simple local contract
 
-### Why Linear fits
+Directions, WorkUnits, and checkpoints each optionally carry `tickets`: an ordered JSON array of zero or more JSON object maps. A map has **no required keys**. It may be as small as:
 
-The useful mapping is:
+```json
+[{"reference": "https://tracker.example/items/42", "label": "capture foundation"}]
+```
+
+or use an entirely different shape:
+
+```json
+[{"source": "a human handoff", "work_item": 42, "repository": "owner/repo"}]
+```
+
+The daemon stores and replays the canonical JSON exactly as local ticket context; it does not infer provider, ticket kind, identity, lifecycle, ownership, or remote authority from map keys. Empty or absent is normal. The initial implementation validates only that the value is bounded JSON containing an array of object maps and canonicalizes object-key order for deterministic idempotency/replay.
+
+This payload is local annotation, not a remote-identity store. If a future adapter needs a canonical remote UUID for lookup, reconciliation, or mutation, that adapter must put it in its own normalized 16-byte-BLOB mapping table rather than treating an arbitrary JSON value as authoritative identity. Do not put credentials, raw API responses, transcripts, or secrets in ticket maps.
+
+### Pi interaction
+
+Expose one generic `bridge_ticket` tool and compact selected Direction/WorkUnit commands. The tool accepts a target plus a JSON array and does not require users or models to name a provider. Its description should tell the model: when a user supplies ticket context, offer to record it; report it as stored only after the daemon succeeds. Checkpoint tickets are supplied with the immutable checkpoint declaration.
+
+Example interaction:
 
 ```text
-Agent Bridge          Linear
-Direction             project
-WorkUnit               issue or sub-issue
-current Direction      project document and project status
-current WorkUnit       one managed issue rollup comment
-checkpoint             immutable issue/project comment or project status update
-checkpoint claim       structured Markdown claim row
-checkpoint evidence    bounded references, outcomes, hashes, and external links
+User: Track this against the capture-foundation ticket.
+Agent: I can record that ticket context on the current WorkUnit. [bridge_ticket succeeds]
+Agent: Stored the ticket context on WorkUnit <uuid>.
 ```
 
-Linear's current MCP server technically supports finding, creating, and updating projects, issues, comments, and documents over authenticated remote MCP. Agent Bridge deliberately uses only the bounded lookup/link and projection capabilities described here; it never invokes project or issue creation. The available comment contract can create or update comments on issues, projects, initiatives, documents, milestones, and status updates. Project documents provide Markdown project memory, while project and initiative status updates provide a visible project-level progress stream with health.
+The extension must never silently fetch from or mutate a tracker. An agent may preserve a URL, key, title, or arbitrary user-provided fields, but remote access remains outside this phase.
 
-This also makes the projection useful inside Linear itself: Linear Agent reasons over issues, projects, comments, activity history, and documents. A standardized Agent Bridge projection therefore becomes shared human and agent memory rather than an opaque integration side channel.
+### Durable model and events
 
-### Background shim, not prompt-visible MCP
+Use `tickets_json TEXT NOT NULL DEFAULT '[]'` on the `directions` and `work_units` projections, and add canonical `tickets` to the immutable checkpoint request/event and `checkpoint_requests` projection. Direction and WorkUnit ticket replacement is an explicit journaled update containing before/result values; checkpoint tickets cannot be edited after declaration. Projection rebuild must reconstruct the same canonical JSON.
 
-Individual agents should not receive Linear MCP tools or schemas in their normal prompt. The daemon owns a background `LinearProjection` adapter with a small Agent Bridge-specific control surface:
-
-```text
-linear.link
-linear.status
-linear.retry
-linear.pause
-linear.reconcile
-```
-
-The adapter owns MCP connection management, authentication state, retries, formatting, deduplication, and remote identifier mapping. Pi surfaces only compact projection health and explicit human controls. No model call is required to format routine checkpoint exports.
-
-The remote MCP transport is currently authenticated Streamable HTTP. OAuth 2.1 is the normal interactive path; bearer tokens and permission-scoped Linear API keys are also supported. Credentials must remain in OS credential storage or the MCP client's protected auth store, never in the Agent Bridge journal, provenance database, checkpoint metadata, or prompts. Each Linear workspace requires an explicit authentication context.
-
-Projection is opt-in per Direction. Read-only and disabled modes should remain available. Agent Bridge must not infer consent from generic environment variables or silently upload local provenance.
-
-A permanent product invariant is that Linear projects and issues are created manually outside Agent Bridge. The integration is projection-only onto explicitly linked existing Linear structure: a human links a Direction to an existing Linear project and each WorkUnit to an existing issue or sub-issue. Agent Bridge may create its managed comments and Direction memory document under those linked resources, but it never creates Linear projects, issues, or sub-issues. Missing links pause projection and surface a setup action rather than guessing or creating work.
-
-### Dual representation: immutable history plus mutable rollup
-
-A single constantly edited comment is insufficient because it destroys checkpoint history. A comment per checkpoint without a rollup is also inconvenient for humans. Use both:
-
-1. **Immutable checkpoint entry.** Export each selected checkpoint once as a new issue or project comment. Never rewrite it after successful reconciliation. Corrections create a new comment that references the prior checkpoint/comment.
-2. **Mutable rollup.** Maintain one managed comment on every linked WorkUnit issue containing current objective, lifecycle, participants, latest verified checkpoint, blockers, and next step.
-3. **Direction memory document.** Maintain one project document containing the Direction objective, success criteria, constraints, WorkUnit graph/rollup, integration decisions, and the Agent Bridge projection format version.
-4. **Direction status stream.** Export meaningful Direction convergence/verification boundaries as new project status updates rather than continuously rewriting one status message.
-
-The immutable checkpoint comment preserves causality. The managed rollup and project document make the latest state readable without reconstructing the entire thread.
-
-### Standard checkpoint comment format
-
-Use deterministic Markdown generated from relational data, not model-authored prose:
-
-```markdown
-<!-- agent-bridge:v1 checkpoint:<checkpoint-id> -->
-## Agent Bridge checkpoint · verified
-
-**WorkUnit:** `<work-unit-uuid>`
-
-**Boundary:** journal `120..146` · checkpoint `<checkpoint-id>`
-
-**Declared by:** agent · 2026-08-22T18:08:20Z
-
-### Claims
-| Status | Kind | Statement |
-| --- | --- | --- |
-| verified | test | API and frontend suites pass |
-| failed | test | strict repository lint baseline is not clean |
-
-### Evidence
-- test result `…` · passed · `go test ./...`
-- test result `…` · failed · `./scripts/quality.sh`
-- JJ change/commit and Git HEAD when available
-
-_Projected by Agent Bridge. Local journal identity remains authoritative._
-```
-
-Default exports include claims, outcomes, bounded command labels, content hashes, VCS identities, and safe external links. They must not include raw transcripts, complete command output, absolute local paths, secrets, private mailbox bodies, or full mutation snapshots. Uploading richer evidence is a separate explicit policy.
-
-### Exact identity and deduplication
-
-Do not use semantic similarity or SimHash. Every exported object carries a machine-readable marker containing the format version and canonical Agent Bridge identity. Exact reconciliation uses that marker plus the local mapping table.
-
-A lost MCP response is resolved by listing comments and searching for the exact marker before retrying creation. Once a checkpoint comment is reconciled, Agent Bridge stores its Linear comment UUID and content SHA-256. Similar prose under a different checkpoint identity remains a distinct event.
-
-Linear issue identifiers such as `CAS-123` are convenient aliases, not canonical identity. Linear entity UUIDs cross the MCP boundary as strings and are persisted locally as 16-byte `BLOB` values under the repository UUID rules.
-
-### Local projection model
-
-```text
-linear_connections
-  connection_uuid BLOB PRIMARY KEY
-  linear_workspace_uuid BLOB NOT NULL
-  mode TEXT NOT NULL
-  created_at DATETIME NOT NULL
-  paused_at DATETIME
-
-linear_direction_links
-  direction_uuid BLOB PRIMARY KEY
-  connection_uuid BLOB NOT NULL
-  project_uuid BLOB NOT NULL
-  document_uuid BLOB
-  rollup_comment_uuid BLOB
-
-linear_work_unit_links
-  work_unit_uuid BLOB PRIMARY KEY
-  direction_uuid BLOB NOT NULL
-  issue_uuid BLOB NOT NULL
-  rollup_comment_uuid BLOB
-
-linear_checkpoint_exports
-  checkpoint_id TEXT PRIMARY KEY
-  target_kind TEXT NOT NULL
-  target_uuid BLOB NOT NULL
-  comment_uuid BLOB
-  content_sha256 TEXT NOT NULL
-  state TEXT NOT NULL
-  attempts INTEGER NOT NULL
-  last_attempt_at DATETIME
-  exported_at DATETIME
-  last_error TEXT
-
-linear_projection_outbox
-  operation_uuid BLOB PRIMARY KEY
-  aggregate_kind TEXT NOT NULL
-  direction_uuid BLOB
-  work_unit_uuid BLOB
-  checkpoint_id TEXT
-  operation_kind TEXT NOT NULL
-  state TEXT NOT NULL
-  attempts INTEGER NOT NULL
-  available_at DATETIME NOT NULL
-  created_at DATETIME NOT NULL
-```
-
-Keep foreign identifiers relational. Do not store Linear project, issue, comment, document, or status-update UUIDs inside JSON payloads when columns can represent them.
-
-### Durable export flow
-
-```text
-local journal append
-  -> local state/provenance apply
-  -> relational projection outbox row
-  -> background MCP worker
-  -> exact remote-marker reconciliation
-  -> Linear create/update operation
-  -> local export mapping + content hash
-  -> projection success event
-```
-
-Requirements:
-
-- enqueue in the same local transaction/projection boundary as the source event;
-- retry with bounded exponential backoff and jitter;
-- serialize updates per remote project/issue/comment target;
-- make create operations recoverable after a lost response through marker lookup;
-- keep immutable checkpoint exports append-only;
-- use exact-text patch/update operations for managed documents where supported;
-- expose queue depth, oldest age, last success, last error, auth state, and paused/degraded state;
-- allow explicit retry and pause without deleting local evidence; and
-- journal projection results without turning Linear responses into coordination authority.
-
-### Initial direction of synchronization
-
-Start one-way: Agent Bridge to Linear.
-
-Linear comments written by teammates are valuable shared memory, but should initially be observed rather than automatically mutating local Direction or WorkUnit state. A later inbound event can record:
-
-```text
-external.linear_observed
-external.linear_comment_observed
-external.linear_issue_changed
-external.linear_project_changed
-```
-
-Inbound observations may generate a proposal, mailbox notification, or explicit reconciliation task. They must not silently transition a WorkUnit, alter acceptance criteria, replace checkpoint claims, or resolve collisions.
-
-For the first inbound slice, bounded polling through MCP is sufficient. Linear's public API also supports webhooks for issues, comments, documents, projects, and project updates; webhook ingestion can replace polling when multi-machine deployment and authenticated public ingress are justified.
-
-### Managed-content divergence
-
-Before updating a rollup comment or project document, compare the last exported content hash with the current Linear content.
-
-- unchanged managed content: update normally;
-- teammate edited managed content: stop automatic overwrite and surface a reconciliation task;
-- checkpoint comment edited or deleted remotely: preserve local truth, record divergence, and do not silently recreate or overwrite without policy;
-- issue moved between projects/teams: retain identity by Linear UUID and refresh its observed placement;
-- remote object inaccessible: mark projection degraded without deleting the local link.
-
-Human-authored Linear discussion remains human-authored. Agent Bridge should own only clearly marked generated regions or comments.
-
-### Permissions and privacy
-
-Linear permissions apply to MCP operations. Private teams and projects can expose sensitive data through API credentials, webhooks, and integrations, so each Direction link needs an explicit target workspace/project and export policy.
-
-Recommended defaults:
-
-- projection disabled until explicitly linked;
-- least-privilege MCP/API authorization, without Linear's `Create issues` permission where API-key scopes permit;
-- an adapter-level method allowlist that forbids project/issue/sub-issue creation even when the credential is more powerful;
-- no mutation of issue/project core fields beyond Agent Bridge-owned comments, documents, and status projections;
-- no transcript or raw-output upload;
-- no private mailbox-body upload;
-- no automatic export from repositories marked local-only;
-- clear per-Direction indicator of what is projected;
-- human-visible identity for the integration/app user where Linear supports it; and
-- audit events for link, unlink, pause, retry, divergence, and remote deletion.
-
-A future Agent Bridge Linear app user could provide clearer authorship than a personal user token. Linear agents/app users can participate in comments and projects under scoped workspace permissions, but app installation, delegation, RBAC, and teammate identity mapping are later product/security work.
-
-### Linear Agent and Loops opportunities
-
-Once the projection format is stable, Linear Agent can summarize or reason over the managed project document and checkpoint comments using normal Linear context. Team guidance or shared skills can teach the standardized marker and claim vocabulary.
-
-Linear Loops could later react to project or issue conditions and use MCP connectors, but Loops are not required for Agent Bridge projection. They are plan/credit/permission dependent and should remain optional automation above the deterministic export layer.
-
-A reverse integration is also possible later: expose a read-only Agent Bridge MCP server to Linear Agent so Linear can request bounded local provenance packets. That path requires explicit machine reachability, authorization, redaction, and user presence policy; it is not part of the initial cloud projection.
+All normal Agent Bridge UUID relationships remain validated at protocol boundaries and stored as 16-byte BLOB values. The ticket JSON is intentionally opaque annotation and does not replace any relational UUID identity.
 
 ### Implementation slices
 
-1. define and fixture-test the Markdown projection format and exact marker parser;
-2. add Linear connection/link/outbox/export mapping tables;
-3. build a capability-bounded MCP client adapter with protected credentials and projection health;
-4. link one local Direction to one existing Linear project explicitly;
-5. explicitly link each WorkUnit to an existing Linear issue/sub-issue and maintain its managed rollup comment;
-6. export immutable evidence-backed checkpoint comments with exact reconciliation;
-7. maintain a Direction project document and export Direction status updates;
-8. add degraded/offline/auth-expired UX, retries, pause, and divergence handling;
-9. dogfood with one non-sensitive project and compare local replay against Linear reconstruction; and
-10. add inbound observations through bounded polling, with webhooks deferred until public ingress is warranted.
+1. **Local substrate:** protocol validation/canonicalization; Direction and WorkUnit ticket update events; immutable checkpoint ticket payload; projections, replay, idempotency, and BLOB-regression tests.
+2. **Pi vertical slice:** `bridge_ticket` create/list/replace/clear behavior plus minimal tool guidance and compact status display.
+3. **Dogfood:** record a ticket from two different tracker-shaped inputs, restart/replay, and demonstrate that no network access is required.
+4. **Later adapters:** only after local dogfood identifies a real need, add optional provider-specific import/projection adapters behind this generic local field. Their remote UUID mappings, credentials, retry queues, and privacy policy remain separate from ticket context.
 
 ### Exit condition
 
-A linked local Direction can project multiple WorkUnits and evidence-backed checkpoints into one Linear project without exposing raw sensitive provenance. Teammates and Linear Agent can inspect current rollups and immutable checkpoint history. Replaying the local journal reconstructs the same export outbox and remote mappings; duplicate exports, lost responses, expired auth, remote edits, and Linear downtime do not corrupt or block local coordination.
-
-### Research basis
-
-- [Linear MCP server](https://linear.app/docs/mcp): hosted Streamable HTTP MCP, OAuth 2.1/bearer/API-key authentication, read-only option, and issue/project/comment tooling.
-- [Linear API and Webhooks](https://linear.app/docs/api-and-webhooks): GraphQL mutations and webhooks for issues, comments, documents, projects, and project updates.
-- [Linear project overview](https://linear.app/docs/project-overview): project descriptions, resources, documents, milestones, and inline comments.
-- [Linear Agent](https://linear.app/docs/linear-agent): workspace reasoning over projects, issues, comments, activity history, and documents; comments and project documents are useful shared agent context.
-- Current Linear MCP tool contracts additionally confirm updateable comments across issues/projects/initiatives/documents/status updates, project documents with atomic exact-text patches, and project/initiative status updates with health.
+A human can mention any ticket-shaped context naturally; an agent can store it on the intended Direction, WorkUnit, or checkpoint without requiring a provider-specific key or remote access; and replay returns the same local ticket maps. Agent Bridge remains authoritative for local coordination regardless of external tracker availability.
 
 ## Phase 5 — External-change provenance and safety work carried forward
 

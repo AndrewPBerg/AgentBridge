@@ -1,9 +1,11 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -85,6 +87,7 @@ const (
 	ActorKindAgent        = "agent"
 	ActorKindUnknown      = "unknown"
 	PresenceKindLease     = "lease"
+	ActorStateStealth     = "stealth"
 	PresenceKindSynthetic = "synthetic"
 )
 
@@ -322,7 +325,8 @@ type Event struct {
 
 // RegisterParams is a protocol value.
 type RegisterParams struct {
-	Actor Actor `json:"actor"`
+	Actor      Actor  `json:"actor"`
+	LaunchUUID string `json:"launch_uuid,omitempty"`
 }
 
 // ScopeFilter is a protocol value.
@@ -512,6 +516,118 @@ func ValidCheckpointClaimKind(kind string) bool {
 	}
 }
 
+// Tickets is bounded, opaque local ticket context. It stores canonical JSON so
+// protocol value snapshots remain comparable and replay-safe.
+type Tickets string
+
+const MaxTicketsJSONBytes = 64 * 1024
+
+func (tickets Tickets) MarshalJSON() ([]byte, error) {
+	if tickets == "" {
+		return []byte("[]"), nil
+	}
+	return []byte(tickets), nil
+}
+func (tickets *Tickets) UnmarshalJSON(data []byte) error {
+	canonical, err := canonicalTicketsJSON(data)
+	if err != nil {
+		return err
+	}
+	*tickets = Tickets(canonical)
+	return nil
+}
+func NormalizeTickets(tickets Tickets) (Tickets, error) {
+	if tickets == "" {
+		return Tickets("[]"), nil
+	}
+	canonical, err := canonicalTicketsJSON([]byte(tickets))
+	if err != nil {
+		return "", err
+	}
+	return Tickets(canonical), nil
+}
+func canonicalTicketsJSON(data []byte) ([]byte, error) {
+	if len(data) > MaxTicketsJSONBytes {
+		return nil, fmt.Errorf("tickets JSON exceeds %d bytes", MaxTicketsJSONBytes)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	value, err := decodeTicketValue(decoder)
+	if err != nil {
+		return nil, fmt.Errorf("invalid tickets JSON: %w", err)
+	}
+	if err := ensureTicketEOF(decoder); err != nil {
+		return nil, err
+	}
+	array, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("tickets must be a JSON array")
+	}
+	for i, item := range array {
+		if _, ok := item.(map[string]any); !ok {
+			return nil, fmt.Errorf("ticket %d must be a JSON object", i)
+		}
+	}
+	canonical, err := json.Marshal(array)
+	if err != nil {
+		return nil, err
+	}
+	if len(canonical) > MaxTicketsJSONBytes {
+		return nil, fmt.Errorf("tickets JSON exceeds %d bytes", MaxTicketsJSONBytes)
+	}
+	return canonical, nil
+}
+func decodeTicketValue(decoder *json.Decoder) (any, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	switch token {
+	case json.Delim('{'):
+		object := map[string]any{}
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return nil, err
+			}
+			key := keyToken.(string)
+			if _, exists := object[key]; exists {
+				return nil, fmt.Errorf("duplicate JSON key %q", key)
+			}
+			value, err := decodeTicketValue(decoder)
+			if err != nil {
+				return nil, err
+			}
+			object[key] = value
+		}
+		_, err := decoder.Token()
+		return object, err
+	case json.Delim('['):
+		array := []any{}
+		for decoder.More() {
+			value, err := decodeTicketValue(decoder)
+			if err != nil {
+				return nil, err
+			}
+			array = append(array, value)
+		}
+		_, err := decoder.Token()
+		return array, err
+	default:
+		return token, nil
+	}
+}
+func ensureTicketEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("tickets must contain one JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
 // CheckpointRequest is a protocol value.
 type CheckpointRequest struct {
 	ID                string            `json:"id"`
@@ -534,6 +650,7 @@ type CheckpointRequest struct {
 	CollisionIDs      []string          `json:"collision_ids,omitempty"`
 	TestResultIDs     []string          `json:"test_result_ids,omitempty"`
 	Claims            []CheckpointClaim `json:"claims,omitempty"`
+	Tickets           Tickets           `json:"tickets,omitempty"`
 	Metadata          map[string]string `json:"metadata,omitempty"`
 	Git               *GitContext       `json:"git,omitempty"`
 	JJ                *JJContext        `json:"jj,omitempty"`
@@ -572,6 +689,7 @@ type Direction struct {
 	CreatedAt       time.Time      `json:"created_at"`
 	UpdatedAt       time.Time      `json:"updated_at"`
 	CompletedAt     *time.Time     `json:"completed_at,omitempty"`
+	Tickets         Tickets        `json:"tickets,omitempty"`
 }
 
 // DirectionActor is a protocol value.
@@ -621,12 +739,13 @@ type DirectionCreateParams struct {
 
 // DirectionUpdateParams is a protocol value.
 type DirectionUpdateParams struct {
-	DirectionUUID   string  `json:"direction_uuid"`
-	Actor           string  `json:"actor"`
-	Objective       *string `json:"objective,omitempty"`
-	SuccessCriteria *string `json:"success_criteria,omitempty"`
-	Constraints     *string `json:"constraints,omitempty"`
-	Context         *string `json:"context,omitempty"`
+	DirectionUUID   string   `json:"direction_uuid"`
+	Actor           string   `json:"actor"`
+	Objective       *string  `json:"objective,omitempty"`
+	SuccessCriteria *string  `json:"success_criteria,omitempty"`
+	Constraints     *string  `json:"constraints,omitempty"`
+	Context         *string  `json:"context,omitempty"`
+	Tickets         *Tickets `json:"tickets,omitempty"`
 }
 
 // DirectionActorParams is a protocol value.
@@ -669,6 +788,7 @@ type WorkUnit struct {
 	CreatedAt          time.Time     `json:"created_at"`
 	UpdatedAt          time.Time     `json:"updated_at"`
 	CompletedAt        *time.Time    `json:"completed_at,omitempty"`
+	Tickets            Tickets       `json:"tickets,omitempty"`
 }
 
 // WorkUnitActor is a protocol value.
@@ -718,11 +838,12 @@ type WorkUnitCreateParams struct {
 
 // WorkUnitUpdateParams is a protocol value.
 type WorkUnitUpdateParams struct {
-	WorkUnitUUID       string  `json:"work_unit_uuid"`
-	Actor              string  `json:"actor"`
-	Objective          *string `json:"objective,omitempty"`
-	AcceptanceCriteria *string `json:"acceptance_criteria,omitempty"`
-	Context            *string `json:"context,omitempty"`
+	WorkUnitUUID       string   `json:"work_unit_uuid"`
+	Actor              string   `json:"actor"`
+	Objective          *string  `json:"objective,omitempty"`
+	AcceptanceCriteria *string  `json:"acceptance_criteria,omitempty"`
+	Context            *string  `json:"context,omitempty"`
+	Tickets            *Tickets `json:"tickets,omitempty"`
 }
 
 // WorkUnitActorParams is a protocol value.
@@ -736,6 +857,55 @@ type WorkUnitTransitionParams struct {
 	WorkUnitUUID string        `json:"work_unit_uuid"`
 	Actor        string        `json:"actor"`
 	State        WorkUnitState `json:"state"`
+}
+
+// Launch records explicit harness launch provenance. It is independent from
+// actor identity and WorkUnit membership.
+type Launch struct {
+	UUID               string     `json:"launch_uuid"`
+	ParentActors       []string   `json:"parent_actor_uuids"`
+	ChildActor         string     `json:"child_actor_uuid,omitempty"`
+	WorkUnitUUID       string     `json:"work_unit_uuid,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	ChildAttachedAt    *time.Time `json:"child_attached_at,omitempty"`
+	WorkUnitAttachedAt *time.Time `json:"work_unit_attached_at,omitempty"`
+}
+
+// LaunchCreatedEvent is an immutable launch declaration.
+type LaunchCreatedEvent struct {
+	Launch Launch `json:"launch"`
+}
+
+// LaunchChildAttachedEvent associates a registered child actor once.
+type LaunchChildAttachedEvent struct {
+	LaunchUUID string    `json:"launch_uuid"`
+	ChildActor string    `json:"child_actor_uuid"`
+	At         time.Time `json:"at"`
+}
+
+// LaunchWorkUnitAttachedEvent associates a WorkUnit once.
+type LaunchWorkUnitAttachedEvent struct {
+	LaunchUUID   string    `json:"launch_uuid"`
+	WorkUnitUUID string    `json:"work_unit_uuid"`
+	At           time.Time `json:"at"`
+}
+
+// LaunchCreateParams creates a launch with its complete explicit parent set.
+type LaunchCreateParams struct {
+	LaunchUUID   string   `json:"launch_uuid"`
+	ParentActors []string `json:"parent_actor_uuids,omitempty"`
+}
+
+// LaunchChildAttachParams attaches a child actor to a launch.
+type LaunchChildAttachParams struct {
+	LaunchUUID string `json:"launch_uuid"`
+	ChildActor string `json:"child_actor_uuid"`
+}
+
+// LaunchWorkUnitAttachParams attaches a WorkUnit to a launch.
+type LaunchWorkUnitAttachParams struct {
+	LaunchUUID   string `json:"launch_uuid"`
+	WorkUnitUUID string `json:"work_unit_uuid"`
 }
 
 // TransitionParams is a protocol value.

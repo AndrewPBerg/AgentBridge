@@ -72,6 +72,10 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     return /ENOENT|ECONNREFUSED|EPIPE|closed before replying|unknown actor/i.test(message);
   }
 
+  function ordinaryPresenceState(): ActorRecord["state"] {
+    return sessionCtx?.isIdle?.() === false ? "active" : "waiting";
+  }
+
   async function recoverConnection() {
     if (recoveryPromise) return recoveryPromise;
     recoveryPromise = (async () => {
@@ -81,7 +85,7 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
         actor = await client.call<ActorRecord>("actor.register", {
           actor: {
             ...actor,
-            state: sessionCtx?.isIdle?.() === false ? "active" : "waiting",
+            state: actor.state === "stealth" ? "stealth" : ordinaryPresenceState(),
             heartbeat_at: now,
             generation,
           },
@@ -109,7 +113,7 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     try {
       actor = await call<ActorRecord>("actor.heartbeat", {
         address: actor.address,
-        state: state ?? (sessionCtx?.isIdle?.() === false ? "active" : "waiting"),
+        state: state ?? (actor.state === "stealth" ? "stealth" : ordinaryPresenceState()),
         cwd: sessionCtx?.cwd,
         generation,
       });
@@ -126,7 +130,7 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     const [git, jj] = await Promise.all([inspectGit(pi, sessionCtx.cwd), inspectJj(pi, sessionCtx.cwd)]);
     actor = await call<ActorRecord>("actor.heartbeat", {
       address: actor.address,
-      state: sessionCtx.isIdle?.() === false ? "active" : "waiting",
+      state: actor.state === "stealth" ? "stealth" : ordinaryPresenceState(),
       cwd: sessionCtx.cwd,
       git,
       jj,
@@ -373,6 +377,7 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     metadata?: Record<string, string>,
     statement?: string,
     declarationId?: string,
+    tickets?: Array<Record<string, unknown>>,
   ): Promise<CheckpointRequest> {
     if (!actor) throw new Error("Agent Bridge is not attached to an active session");
     // An explicit UUID is authoritative. An implicit selection is re-read so stale
@@ -417,6 +422,7 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
         repository_uuid: actor.repository_uuid,
         workspace_uuid: actor.workspace_uuid,
         work_unit_uuid: linkedWorkUnit,
+        tickets,
         checkpoint_kind: kind,
         claims: claimFor(kind, statement, checkpointEvidence),
         test_result_ids: evidenceIds,
@@ -473,6 +479,53 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     }
     return lines.sort();
   }
+
+  pi.registerTool({
+    name: "bridge_stealth",
+    label: "Agent Bridge Stealth",
+    description: "Temporarily stop receiving mailbox messages while keeping this actor registered and its messages queued.",
+    promptSnippet: "Enable or disable Agent Bridge stealth mode.",
+    parameters: Type.Object({
+      enabled: Type.Boolean({ description: "Whether to suppress mailbox delivery." }),
+    }),
+    async execute(_toolCallId, params) {
+      if (!actor) throw new Error("Agent Bridge is not attached to an active session");
+      await heartbeat(params.enabled ? "stealth" : ordinaryPresenceState());
+      return {
+        content: [{ type: "text", text: params.enabled ? "Agent Bridge stealth mode enabled." : "Agent Bridge stealth mode disabled." }],
+        details: { enabled: params.enabled, state: actor.state },
+      };
+    },
+  });
+
+  const stealthUsage = "Usage: /stealth on | /stealth off | /stealth status";
+  pi.registerCommand("stealth", {
+    description: "Enable, disable, or inspect Agent Bridge stealth mode",
+    getArgumentCompletions: (prefix: string) => {
+      if (prefix.trim().includes(" ")) return null;
+      const normalized = prefix.trim();
+      return ["on", "off", "status"].filter((value) => value.startsWith(normalized)).map((value) => ({ value, label: value }));
+    },
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const input = String(args ?? "").trim();
+      const parts = input ? input.split(/\s+/) : [];
+      if (parts.length !== 1 || !["on", "off", "status"].includes(parts[0] ?? "")) {
+        ctx.ui.notify(stealthUsage, "warning");
+        return;
+      }
+      try {
+        if (!actor) throw new Error("Agent Bridge is not attached");
+        if (parts[0] === "status") {
+          ctx.ui.notify(`Agent Bridge stealth mode ${actor.state === "stealth" ? "enabled" : "disabled"}.`, "info");
+          return;
+        }
+        await heartbeat(parts[0] === "on" ? "stealth" : ordinaryPresenceState());
+        ctx.ui.notify(`Agent Bridge stealth mode ${parts[0] === "on" ? "enabled" : "disabled"}.`, "info");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+      }
+    },
+  });
 
   pi.registerTool({
     name: "bridge_message",
@@ -604,6 +657,48 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
   });
 
   pi.registerTool({
+    name: "bridge_ticket",
+    label: "Agent Bridge Ticket Context",
+    description:
+      "Store, list, replace, or clear arbitrary local ticket context on the selected Direction or WorkUnit. No provider is inferred and no remote tracker is contacted. Offer to record user-supplied ticket context; say stored only after daemon success.",
+    promptSnippet:
+      "When the user supplies ticket context, offer to record it on the selected Direction or WorkUnit. Report it stored only after the daemon confirms success.",
+    parameters: Type.Object({
+      action: Type.Optional(Type.Union([Type.Literal("replace"), Type.Literal("clear"), Type.Literal("list")])),
+      target: Type.Optional(Type.Union([Type.Literal("direction"), Type.Literal("work_unit")])),
+      tickets: Type.Optional(Type.Array(Type.Record(Type.String(), Type.Any()))),
+    }),
+    async execute(_toolCallId, params) {
+      const action = String(params.action ?? "replace");
+      const target = String(params.target ?? (selectedWorkUnit ? "work_unit" : "direction"));
+      if (action !== "replace" && action !== "clear" && action !== "list") throw new Error(`Unsupported ticket action: ${action}`);
+      const tickets = action === "clear" ? [] : (params.tickets as Array<Record<string, unknown>> | undefined);
+      if (action === "replace" && !tickets) throw new Error("tickets is required for replace");
+      // Listing is deliberately a read: never send an update with undefined tickets.
+      if (action === "list") {
+        const direction = target === "direction" ? await fetchSelectedDirection() : undefined;
+        const unit =
+          target === "work_unit" ? (selectedWorkUnit ? await fetchWorkUnit(selectedWorkUnit.work_unit_uuid) : undefined) : undefined;
+        if (!direction && !unit) throw new Error(`No selected ${target} is available`);
+        const current = target === "direction" ? direction!.tickets : unit!.tickets;
+        return { content: [{ type: "text", text: JSON.stringify(current ?? []) }], details: { tickets: current ?? [] } };
+      }
+      const direction = target === "direction" ? await fetchSelectedDirection() : undefined;
+      const unit =
+        target === "work_unit" ? (selectedWorkUnit ? await fetchWorkUnit(selectedWorkUnit.work_unit_uuid) : undefined) : undefined;
+      if (!direction && !unit) throw new Error(`No selected ${target} is available`);
+      const result =
+        target === "direction"
+          ? await call("direction.update", { direction_uuid: direction!.direction_uuid, actor: actor?.address, tickets })
+          : await call("work_unit.update", { work_unit_uuid: unit!.work_unit_uuid, actor: actor?.address, tickets });
+      return {
+        content: [{ type: "text", text: `Ticket context ${action === "clear" ? "cleared" : "stored"} on ${target}.` }],
+        details: { result },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "bridge_checkpoint",
     label: "Agent Bridge Checkpoint",
     description:
@@ -619,6 +714,9 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
       workUnitUUID: Type.Optional(Type.String({ description: "Optional WorkUnit UUID to link this checkpoint to." })),
       metadata: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Optional authored metadata for this boundary." })),
       statement: Type.Optional(Type.String({ description: "Optional concise claim statement." })),
+      tickets: Type.Optional(
+        Type.Array(Type.Record(Type.String(), Type.Any(), { description: "Optional local ticket context object maps." })),
+      ),
     }),
     async execute(_toolCallId, params) {
       const kind = String(params.kind ?? "").trim();
@@ -630,6 +728,7 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
         params.metadata,
         params.statement ? String(params.statement) : undefined,
         `bridge:${actor?.address ?? "unknown"}:${generation}:${String(_toolCallId)}`,
+        params.tickets as Array<Record<string, unknown>> | undefined,
       );
       const unverified = isVerificationKind(kind) && !checkpoint.test_result_ids?.length;
       return {
@@ -968,7 +1067,10 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     const sessionId = randomUUID();
     const now = new Date().toISOString();
     const [git, jj] = await Promise.all([inspectGit(pi, ctx.cwd), inspectJj(pi, ctx.cwd)]);
+    const launchUUID = process.env.AGENT_BRIDGE_LAUNCH_UUID;
+    if (launchUUID !== undefined) canonicalUUID(launchUUID, "Agent Bridge launch UUID");
     actor = await call<ActorRecord>("actor.register", {
+      launch_uuid: launchUUID,
       actor: {
         address: sessionId,
         harness: "pi",

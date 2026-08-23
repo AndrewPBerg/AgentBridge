@@ -67,7 +67,14 @@ func serve(args []string) error {
 		return err
 	}
 	defer closeQuietly(database)
-	if err := database.ProjectAll(events); err != nil {
+	projectedSequence, err := database.ProjectedSequence()
+	if err != nil {
+		return fmt.Errorf("read provenance projection sequence: %w", err)
+	}
+	if projectedSequence > uint64(len(events)) {
+		return fmt.Errorf("provenance projection sequence %d is ahead of journal sequence %d", projectedSequence, len(events))
+	}
+	if err := database.ProjectAll(events[projectedSequence:]); err != nil {
 		return fmt.Errorf("backfill provenance database: %w", err)
 	}
 	initialSequence := uint64(0)

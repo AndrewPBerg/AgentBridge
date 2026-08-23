@@ -27,7 +27,7 @@ export type ActorRecord = {
   cwd: string;
   pane_id?: string;
   herdr_workspace_id?: string;
-  state: "active" | "waiting" | "dead";
+  state: "active" | "waiting" | "stealth" | "dead";
   repository_uuid?: string;
   repository_root?: string | null;
   workspace_uuid?: string;
@@ -136,6 +136,7 @@ export type Direction = {
   created_at?: string;
   updated_at?: string;
   completed_at?: string;
+  tickets?: Array<Record<string, unknown>>;
 };
 
 export type WorkUnit = {
@@ -149,6 +150,7 @@ export type WorkUnit = {
   state: string;
   participants?: unknown[];
   checkpoints?: unknown[];
+  tickets?: Array<Record<string, unknown>>;
 };
 
 export type DirectionStatus = {
@@ -171,6 +173,7 @@ export type CheckpointRequest = {
   repository_uuid: string;
   workspace_uuid: string;
   work_unit_uuid?: string;
+  tickets?: Array<Record<string, unknown>>;
   checkpoint_kind: string;
   claims?: CheckpointClaim[];
   journal_start_sequence: number;

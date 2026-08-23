@@ -53,6 +53,7 @@ type Engine struct {
 	testResultSequence map[string]uint64
 	workUnits          map[string]protocol.WorkUnit
 	workUnitActors     map[string]map[string]protocol.WorkUnitActor
+	launches           map[string]protocol.Launch
 	directions         map[string]protocol.Direction
 	externalChanges    map[string]protocol.ExternalChange
 	continuity         map[string]protocol.WatchContinuity
@@ -101,6 +102,7 @@ func New(journal Appender, events []protocol.Event, options Options) (*Engine, e
 		testResultSequence: make(map[string]uint64),
 		workUnits:          make(map[string]protocol.WorkUnit),
 		workUnitActors:     make(map[string]map[string]protocol.WorkUnitActor),
+		launches:           make(map[string]protocol.Launch),
 		directions:         make(map[string]protocol.Direction),
 		externalChanges:    make(map[string]protocol.ExternalChange),
 		continuity:         make(map[string]protocol.WatchContinuity),
@@ -328,6 +330,24 @@ func (e *Engine) apply(event protocol.Event) error {
 			return errors.New("conflicting checkpoint replay")
 		}
 		e.checkpoints[request.ID] = request
+	case "launch.created":
+		created, err := decode[protocol.LaunchCreatedEvent](event)
+		if err != nil {
+			return err
+		}
+		return e.applyLaunchCreated(&created)
+	case "launch.child_attached":
+		attached, err := decode[protocol.LaunchChildAttachedEvent](event)
+		if err != nil {
+			return err
+		}
+		return e.applyLaunchChildAttached(attached)
+	case "launch.work_unit_attached":
+		attached, err := decode[protocol.LaunchWorkUnitAttachedEvent](event)
+		if err != nil {
+			return err
+		}
+		return e.applyLaunchWorkUnitAttached(attached)
 	case "direction.created":
 		created, err := decode[protocol.DirectionCreatedEvent](event)
 		if err != nil {
@@ -346,6 +366,22 @@ func (e *Engine) apply(event protocol.Event) error {
 			break
 		}
 		e.directions[created.Direction.UUID] = created.Direction
+	case "direction.updated":
+		updated, err := decode[protocol.DirectionUpdatedEvent](event)
+		if err != nil {
+			return err
+		}
+		current, ok := e.directions[updated.UUID]
+		if !ok {
+			return fmt.Errorf("unknown direction %q", updated.UUID)
+		}
+		if !reflect.DeepEqual(current, updated.Previous) || updated.Result.UUID != updated.UUID || updated.Result.State != current.State || updated.Result.CreatedBy != current.CreatedBy {
+			return errors.New("invalid direction update")
+		}
+		if _, ok := e.actors[updated.Actor]; !ok {
+			return fmt.Errorf("unknown actor %q", updated.Actor)
+		}
+		e.directions[updated.UUID] = updated.Result
 	case "direction.transitioned":
 		transition, err := decode[protocol.DirectionTransitionEvent](event)
 		if err != nil {
@@ -800,6 +836,9 @@ func (e *Engine) Send(params protocol.SendParams) (protocol.Message, error) {
 	if isUnknownActor(target) {
 		return protocol.Message{}, errors.New("unknown actor cannot receive mailbox messages")
 	}
+	if !e.launchFamilyAllows(sender.Address, target.Address) {
+		return protocol.Message{}, errors.New("launch-family communication policy denies this recipient")
+	}
 	body := strings.TrimSpace(params.Body)
 	if body == "" {
 		return protocol.Message{}, errors.New("message body is required")
@@ -1077,6 +1116,11 @@ func (e *Engine) CreateDirection(direction protocol.Direction) (protocol.Directi
 	}
 	direction.UpdatedAt = direction.CreatedAt
 	direction.CompletedAt = nil
+	var ticketErr error
+	direction.Tickets, ticketErr = protocol.NormalizeTickets(direction.Tickets)
+	if ticketErr != nil {
+		return protocol.Direction{}, ticketErr
+	}
 	if existing, ok := e.directions[direction.UUID]; ok {
 		if reflect.DeepEqual(existing, direction) {
 			return existing, nil
@@ -1087,6 +1131,53 @@ func (e *Engine) CreateDirection(direction protocol.Direction) (protocol.Directi
 		return protocol.Direction{}, err
 	}
 	return direction, nil
+}
+
+// UpdateDirection updates mutable direction fields, including ticket context.
+func (e *Engine) UpdateDirection(params protocol.DirectionUpdateParams) (protocol.Direction, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	current, ok := e.directions[params.DirectionUUID]
+	if !ok {
+		return protocol.Direction{}, fmt.Errorf("unknown direction %q", params.DirectionUUID)
+	}
+	if _, ok := e.actors[params.Actor]; !ok {
+		return protocol.Direction{}, fmt.Errorf("unknown actor %q", params.Actor)
+	}
+	if current.State == protocol.DirectionCompleted || current.State == protocol.DirectionAbandoned {
+		return protocol.Direction{}, errors.New("terminal direction is immutable")
+	}
+	result := current
+	if params.Objective != nil {
+		result.Objective = strings.TrimSpace(*params.Objective)
+	}
+	if params.SuccessCriteria != nil {
+		result.SuccessCriteria = *params.SuccessCriteria
+	}
+	if params.Constraints != nil {
+		result.Constraints = *params.Constraints
+	}
+	if params.Context != nil {
+		result.Context = *params.Context
+	}
+	if params.Tickets != nil {
+		var err error
+		result.Tickets, err = protocol.NormalizeTickets(*params.Tickets)
+		if err != nil {
+			return protocol.Direction{}, err
+		}
+	}
+	if result.Objective == "" {
+		return protocol.Direction{}, errors.New("objective is required")
+	}
+	if reflect.DeepEqual(result, current) {
+		return current, nil
+	}
+	result.UpdatedAt = e.now().UTC()
+	if err := e.record("direction.updated", protocol.DirectionUpdatedEvent{UUID: current.UUID, Actor: params.Actor, Previous: current, Result: result}); err != nil {
+		return protocol.Direction{}, err
+	}
+	return result, nil
 }
 
 // Direction returns a direction by UUID.
@@ -1230,6 +1321,11 @@ func (e *Engine) CreateWorkUnit(unit protocol.WorkUnit) (protocol.WorkUnit, erro
 			return protocol.WorkUnit{}, fmt.Errorf("unknown direction %q", unit.DirectionUUID)
 		}
 	}
+	var ticketErr error
+	unit.Tickets, ticketErr = protocol.NormalizeTickets(unit.Tickets)
+	if ticketErr != nil {
+		return protocol.WorkUnit{}, ticketErr
+	}
 	if err := e.record("work_unit.created", protocol.WorkUnitCreatedEvent{WorkUnit: unit}); err != nil {
 		return protocol.WorkUnit{}, err
 	}
@@ -1281,6 +1377,13 @@ func (e *Engine) UpdateWorkUnit(params protocol.WorkUnitUpdateParams) (protocol.
 	}
 	if params.Context != nil {
 		result.Context = *params.Context
+	}
+	if params.Tickets != nil {
+		var err error
+		result.Tickets, err = protocol.NormalizeTickets(*params.Tickets)
+		if err != nil {
+			return protocol.WorkUnit{}, err
+		}
 	}
 	if result.Objective == "" {
 		return protocol.WorkUnit{}, errors.New("objective is required")
@@ -1419,6 +1522,11 @@ func (e *Engine) RequestCheckpoint(request protocol.CheckpointRequest) (protocol
 	if request.ID == "" || request.CheckpointKind == "" {
 		return protocol.CheckpointRequest{}, errors.New("checkpoint id and kind are required")
 	}
+	var ticketErr error
+	request.Tickets, ticketErr = protocol.NormalizeTickets(request.Tickets)
+	if ticketErr != nil {
+		return protocol.CheckpointRequest{}, ticketErr
+	}
 	if request.DeclaredBy == "" {
 		request.DeclaredBy = "agent"
 	}
@@ -1533,7 +1641,7 @@ func (e *Engine) RequestCheckpoint(request protocol.CheckpointRequest) (protocol
 			!reflect.DeepEqual(existing.Git, request.Git) || !reflect.DeepEqual(existing.JJ, request.JJ) ||
 			!reflect.DeepEqual(existing.MutationIDs, request.MutationIDs) || !reflect.DeepEqual(existing.MessageIDs, request.MessageIDs) ||
 			!reflect.DeepEqual(existing.CollisionIDs, request.CollisionIDs) || !reflect.DeepEqual(existing.TestResultIDs, request.TestResultIDs) ||
-			!reflect.DeepEqual(existing.Claims, request.Claims) || !reflect.DeepEqual(existing.Metadata, request.Metadata) ||
+			!reflect.DeepEqual(existing.Claims, request.Claims) || !reflect.DeepEqual(existing.Tickets, request.Tickets) || !reflect.DeepEqual(existing.Metadata, request.Metadata) ||
 			(originalJournalStart != 0 && existing.JournalStart != request.JournalStart) || (originalJournalEnd != 0 && existing.JournalEnd != request.JournalEnd) {
 			return protocol.CheckpointRequest{}, fmt.Errorf("checkpoint ID %q conflicts with an existing checkpoint", request.ID)
 		}
@@ -1718,6 +1826,9 @@ func (e *Engine) Poll(actor string, limit int) ([]protocol.Message, error) {
 		return nil, errors.New("unknown actor cannot poll mailbox")
 	}
 	e.expireStaleLocked()
+	if e.actors[actor].State == protocol.ActorStateStealth {
+		return []protocol.Message{}, nil
+	}
 	messages := make([]protocol.Message, 0)
 	for _, id := range e.mailboxes[actor] {
 		message := e.messages[id]

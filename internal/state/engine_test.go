@@ -104,6 +104,32 @@ func TestRegisterRejectsNonCanonicalActorIdentity(t *testing.T) {
 	}
 }
 
+func TestMailboxSuppressesStealthActorsWithoutDroppingOrder(t *testing.T) {
+	engine, _, _ := newTestEngine(t)
+	sender := testActorUUID("stealth-sender")
+	recipient := testActorUUID("stealth-recipient")
+	register(t, engine, sender)
+	register(t, engine, recipient)
+	if _, err := engine.Heartbeat(protocol.HeartbeatParams{Address: recipient, State: protocol.ActorStateStealth}); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{"first", "second"} {
+		if _, err := engine.Send(protocol.SendParams{From: sender, To: recipient, Body: body}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if messages := mustPoll(t, engine, recipient); len(messages) != 0 {
+		t.Fatalf("stealth actor received messages: %#v", messages)
+	}
+	if _, err := engine.Heartbeat(protocol.HeartbeatParams{Address: recipient, State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	messages := mustPoll(t, engine, recipient)
+	if len(messages) != 2 || messages[0].Body != "first" || messages[1].Body != "second" {
+		t.Fatalf("messages were not retained in order: %#v", messages)
+	}
+}
+
 func TestMailboxOrdersSenderAssignedBurstSequences(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
 	register(t, engine, testActorUUID("sender"))

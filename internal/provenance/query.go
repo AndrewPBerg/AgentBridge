@@ -107,6 +107,7 @@ type WorkUnitRecord struct {
 	CreatedAt          string                   `json:"created_at"`
 	UpdatedAt          string                   `json:"updated_at"`
 	CompletedAt        string                   `json:"completed_at,omitempty"`
+	Tickets            protocol.Tickets         `json:"tickets,omitempty"`
 	Participants       []protocol.WorkUnitActor `json:"participants"`
 	Checkpoints        []CheckpointRecord       `json:"checkpoints"`
 	CheckpointCount    int                      `json:"checkpoint_count"`
@@ -146,9 +147,10 @@ func (d *DB) Direction(uuid string) (protocol.Direction, error) {
 	var id, creator []byte
 	var createdAt, updatedAt string
 	var completed sql.NullString
-	err := d.db.QueryRowContext(context.Background(), `SELECT direction_uuid, objective, COALESCE(success_criteria, ''), COALESCE(constraints, ''), COALESCE(context, ''), state, created_by, created_at, updated_at, completed_at FROM directions WHERE direction_uuid = ?`, uuidBlob(uuid)).Scan(
+	var tickets string
+	err := d.db.QueryRowContext(context.Background(), `SELECT direction_uuid, objective, COALESCE(success_criteria, ''), COALESCE(constraints, ''), COALESCE(context, ''), state, created_by, created_at, updated_at, completed_at, tickets_json FROM directions WHERE direction_uuid = ?`, uuidBlob(uuid)).Scan(
 		&id, &direction.Objective, &direction.SuccessCriteria, &direction.Constraints, &direction.Context,
-		&direction.State, &creator, &createdAt, &updatedAt, &completed)
+		&direction.State, &creator, &createdAt, &updatedAt, &completed, &tickets)
 	if errors.Is(err, sql.ErrNoRows) {
 		return direction, fmt.Errorf("unknown direction %q", uuid)
 	}
@@ -162,6 +164,9 @@ func (d *DB) Direction(uuid string) (protocol.Direction, error) {
 		at := parseTime(completed.String)
 		direction.CompletedAt = &at
 	}
+	if err := json.Unmarshal([]byte(tickets), &direction.Tickets); err != nil {
+		return direction, err
+	}
 	return direction, nil
 }
 
@@ -174,13 +179,13 @@ func (d *DB) WorkUnit(uuid string) (WorkUnitRecord, error) {
 	var repositoryRoot, workspaceRoot, workspaceKind sql.NullString
 	err := d.db.QueryRowContext(context.Background(), `SELECT u.work_unit_uuid, u.direction_uuid, u.repository_uuid, u.workspace_uuid,
 		r.root, w.root, w.kind, u.objective, COALESCE(u.acceptance_criteria,''), COALESCE(u.context,''), u.state,
-		u.created_by, u.created_at, u.updated_at, COALESCE(u.completed_at,'')
+		u.created_by, u.created_at, u.updated_at, COALESCE(u.completed_at,''), u.tickets_json
 		FROM work_units u
 		LEFT JOIN repositories r ON r.id = u.repository_uuid
 		LEFT JOIN workspaces w ON w.id = u.workspace_uuid
 		WHERE u.work_unit_uuid=?`, uuidBlob(uuid)).Scan(&id, &direction, &repo, &workspace,
 		&repositoryRoot, &workspaceRoot, &workspaceKind, &record.Objective, &record.AcceptanceCriteria,
-		&record.Context, &record.State, &creator, &record.CreatedAt, &record.UpdatedAt, &record.CompletedAt)
+		&record.Context, &record.State, &creator, &record.CreatedAt, &record.UpdatedAt, &record.CompletedAt, &record.Tickets)
 	if errors.Is(err, sql.ErrNoRows) {
 		return record, fmt.Errorf("unknown work unit %q", uuid)
 	}
@@ -422,6 +427,7 @@ type CheckpointRecord struct {
 	CollisionIDs      []string                `json:"collision_ids,omitempty"`
 	TestResultIDs     []string                `json:"test_result_ids,omitempty"`
 	Claims            []CheckpointClaimRecord `json:"claims,omitempty"`
+	Tickets           protocol.Tickets        `json:"tickets,omitempty"`
 	Metadata          map[string]string       `json:"metadata,omitempty"`
 	Git               *protocol.GitContext    `json:"git,omitempty"`
 	JJ                *protocol.JJContext     `json:"jj,omitempty"`
@@ -509,6 +515,14 @@ func (d *DB) Scopes() (ScopeRecords, error) {
 		result.Workspaces = append(result.Workspaces, record)
 	}
 	return result, workspaces.Err()
+}
+
+// ProjectedSequence returns the latest journal sequence reflected in this
+// rebuildable projection.
+func (d *DB) ProjectedSequence() (uint64, error) {
+	var sequence uint64
+	err := d.db.QueryRowContext(context.Background(), `SELECT COALESCE(MAX(sequence), 0) FROM events`).Scan(&sequence)
+	return sequence, err
 }
 
 // Status returns projection status and record counts.
@@ -710,6 +724,7 @@ func scanCheckpoint(row scanner) (CheckpointRecord, error) {
 	record.MessageIDs = checkpoint.MessageIDs
 	record.CollisionIDs = checkpoint.CollisionIDs
 	record.TestResultIDs = checkpoint.TestResultIDs
+	record.Tickets = checkpoint.Tickets
 	record.Metadata = checkpoint.Metadata
 	record.Git = checkpoint.Git
 	record.JJ = checkpoint.JJ
