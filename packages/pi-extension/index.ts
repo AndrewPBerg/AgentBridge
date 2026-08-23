@@ -283,7 +283,7 @@ export function createAgentBridge(
     const result = await call<DirectionStatus>("direction.status", { direction_uuid: directionUUID });
     const direction = normalizeDirection(result);
     if (!Array.isArray(result.work_units)) throw new Error("Daemon returned an invalid Direction status");
-    return { direction, work_units: result.work_units as WorkUnit[] };
+    return { ...result, direction, work_units: result.work_units as WorkUnit[] };
   }
 
   function formatDirectionStatus(status: DirectionStatus): string {
@@ -300,7 +300,16 @@ export function createAgentBridge(
         return separator < 0 ? `${label}=${count}` : `${label.slice(0, separator)}=${count}${label.slice(separator)}`;
       })
       .join(" ");
-    return `${status.direction.objective} · ${status.direction.state} · WorkUnits ${summary || "none"}`;
+    const participants = (status.participants ?? [])
+      .map(
+        (participant) =>
+          `${participant.live ? "live" : "dead"}:${participant.alias ? `@${participant.alias}` : participant.actor.slice(0, 8)}`,
+      )
+      .join(",");
+    const collisions = status.open_collisions ? ` · collisions=${status.open_collisions}` : "";
+    const checkpoints = status.latest_checkpoints?.length ? ` · checkpoints=${status.latest_checkpoints.length}` : "";
+    const people = participants ? ` · participants=${participants}` : "";
+    return `${status.direction.objective} · ${status.direction.state} · WorkUnits ${summary || "none"}${people}${collisions}${checkpoints}`;
   }
 
   async function fetchSelectedDirection(): Promise<Direction | undefined> {
@@ -829,6 +838,61 @@ export function createAgentBridge(
         content: [{ type: "text", text: `Ticket context ${action === "clear" ? "cleared" : "stored"} on ${target}.` }],
         details: { result },
       };
+    },
+  });
+
+  const leaseTakeover = {
+    name: "bridge_lease_takeover",
+    label: "Agent Bridge Lease Takeover",
+    description: "Explicitly take over a mutation lease with a new lease UUID and fencing token; the old holder is notified durably.",
+    promptSnippet: "Use only when an explicit audited mutation lease takeover is required.",
+    parameters: Type.Object({
+      predecessorLeaseUUID: Type.String({ description: "Lease UUID being superseded." }),
+      reason: Type.String({ description: "Bounded human-readable reason (1-1000 characters)." }),
+      source: Type.Optional(Type.Union([Type.Literal("agent"), Type.Literal("human")])),
+      workUnitUUID: Type.Optional(Type.String()),
+      collisionID: Type.Optional(Type.String()),
+    }),
+    async execute(_toolCallId: string, params: Record<string, any>) {
+      if (!actor) throw new Error("Agent Bridge is not attached to an active session");
+      const predecessor = canonicalUUID(String(params.predecessorLeaseUUID ?? ""), "Predecessor lease UUID");
+      const reason = String(params.reason ?? "").trim();
+      if (!reason || reason.length > 1000) throw new Error("Takeover reason must contain 1 to 1000 characters");
+      const result = await call("mutation_lease.takeover", {
+        predecessor_lease_uuid: predecessor,
+        lease_uuid: randomUUID(),
+        fencing_token: randomUUID(),
+        requester_actor_uuid: actor.address,
+        requester_generation: generation,
+        acquisition_source: params.source ?? "agent",
+        reason,
+        work_unit_uuid: params.workUnitUUID ? canonicalUUID(String(params.workUnitUUID), "WorkUnit UUID") : undefined,
+        collision_id: params.collisionID ? canonicalUUID(String(params.collisionID), "Collision UUID") : undefined,
+      });
+      return {
+        content: [{ type: "text", text: `Lease takeover recorded; predecessor ${predecessor} was superseded and its holder notified.` }],
+        details: { result },
+      };
+    },
+  };
+  pi.registerTool(leaseTakeover);
+  pi.registerCommand("lease-takeover", {
+    description: "Explicitly take over a mutation lease: /lease-takeover <lease UUID> <reason>",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const [predecessor, ...rest] = String(args ?? "")
+        .trim()
+        .split(/\s+/);
+      if (!predecessor || rest.length === 0) return void ctx.ui.notify("Usage: /lease-takeover <lease UUID> <reason>", "warning");
+      try {
+        const result = await leaseTakeover.execute("/lease-takeover", {
+          predecessorLeaseUUID: predecessor,
+          reason: rest.join(" "),
+          source: "human",
+        });
+        ctx.ui.notify(result.content?.[0]?.text ?? "Lease takeover recorded.", "info");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+      }
     },
   });
 

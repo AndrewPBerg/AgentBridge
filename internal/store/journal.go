@@ -26,10 +26,11 @@ type appendFile interface {
 
 // Journal is an append-only event journal.
 type Journal struct {
-	mu       sync.Mutex
-	file     appendFile
-	path     string
-	poisoned bool
+	mu           sync.Mutex
+	file         appendFile
+	path         string
+	poisoned     bool
+	lastSequence uint64
 }
 
 // Open opens path, replaying valid events and repairing a partial final line.
@@ -79,7 +80,11 @@ func Open(path string) (*Journal, []protocol.Event, error) {
 		ignoreError(file.Close())
 		return nil, nil, fmt.Errorf("seek journal end: %w", err)
 	}
-	return &Journal{file: file, path: path}, events, nil
+	lastSequence := uint64(0)
+	if len(events) > 0 {
+		lastSequence = events[len(events)-1].Sequence
+	}
+	return &Journal{file: file, path: path, lastSequence: lastSequence}, events, nil
 }
 
 func readEvents(file *os.File) ([]protocol.Event, int64, error) {
@@ -136,6 +141,9 @@ func (j *Journal) Append(event protocol.Event) error {
 	if j.poisoned {
 		return ErrJournalPoisoned
 	}
+	if event.Sequence != j.lastSequence+1 {
+		return fmt.Errorf("journal event sequence %d is not contiguous after %d", event.Sequence, j.lastSequence)
+	}
 	line, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("encode journal event: %w", err)
@@ -155,6 +163,7 @@ func (j *Journal) Append(event protocol.Event) error {
 		j.poisoned = true
 		return fmt.Errorf("sync journal event: %w: %w", err, ErrJournalPoisoned)
 	}
+	j.lastSequence = event.Sequence
 	return nil
 }
 

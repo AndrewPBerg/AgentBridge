@@ -19,19 +19,40 @@ import (
 	"time"
 
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
+	"github.com/AndrewPBerg/agent-bridge/internal/store"
 	_ "turso.tech/database/tursogo"
 )
 
-const projectionSchemaVersion = 19
+const projectionSchemaVersion = 21
 
 // DB stores and projects provenance events.
 type DB struct {
 	db   *sql.DB
 	path string
+
+	// leaseAppender is the only authority allowed to publish lease lifecycle
+	// events. Lease SQL tables are projections and are never used to allocate
+	// event sequences.
+	leaseMu         sync.Mutex
+	leaseTakeoverMu sync.Mutex
+	leaseAppender   interface {
+		AppendNext(protocol.Event) (protocol.Event, error)
+	}
+	ownedLeaseAppender interface{ Close() }
+	// projectionMu serializes Turso write transactions. Turso snapshots are
+	// connection-scoped, so concurrent writers can otherwise invalidate each
+	// other even when logical operations are independent.
+	projectionMu sync.Mutex
 }
 
 // Open opens or creates a provenance database at path.
-func Open(path string) (*DB, error) {
+func Open(path string) (*DB, error) { return open(path, true) }
+
+// OpenProjection opens only the SQLite projection. The caller must install the
+// shared journal appender before accepting commands.
+func OpenProjection(path string) (*DB, error) { return open(path, false) }
+
+func open(path string, withLeaseJournal bool) (*DB, error) {
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return nil, fmt.Errorf("create provenance directory: %w", err)
@@ -57,6 +78,24 @@ func Open(path string) (*DB, error) {
 			return nil, fmt.Errorf("secure provenance database: %w (close database: %w)", err, closeErr)
 		}
 		return nil, err
+	}
+	if withLeaseJournal {
+		// Standalone DB users still get an authoritative append-only path. The
+		// daemon uses OpenProjection and supplies its already-open shared journal.
+		journal, events, err := store.Open(path + ".events.jsonl")
+		if err != nil {
+			return nil, errors.Join(err, database.Close())
+		}
+		if err := result.ProjectAll(events); err != nil {
+			return nil, errors.Join(err, journal.Close(), database.Close())
+		}
+		seq := uint64(0)
+		if len(events) > 0 {
+			seq = events[len(events)-1].Sequence
+		}
+		appender := NewProjectingAppender(journal, result, seq)
+		result.ownedLeaseAppender = appender
+		result.SetLeaseAppender(appender, seq)
 	}
 	return result, nil
 }
@@ -232,6 +271,14 @@ func initializeSchemaGroup1() []string {
 
 func initializeSchemaGroup2() []string {
 	return []string{
+		`CREATE TABLE IF NOT EXISTS mutation_leases (lease_uuid BLOB PRIMARY KEY, fencing_token BLOB NOT NULL, actor_uuid BLOB NOT NULL, generation INTEGER NOT NULL, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, intent_id TEXT NOT NULL, tool_call_id TEXT NOT NULL, granted_at TEXT NOT NULL, renewed_at TEXT NOT NULL, expires_at TEXT NOT NULL, hard_deadline TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('active','waiting','released','expired','canceled','superseded','revoked')), predecessor_lease_uuid BLOB REFERENCES mutation_leases(lease_uuid), root_lease_uuid BLOB NOT NULL, takeover_depth INTEGER NOT NULL DEFAULT 0, superseded_by_lease_uuid BLOB, terminal_at TEXT) STRICT`,
+		`CREATE TABLE IF NOT EXISTS mutation_lease_paths (lease_uuid BLOB NOT NULL REFERENCES mutation_leases(lease_uuid) ON DELETE CASCADE, path TEXT NOT NULL, PRIMARY KEY(lease_uuid,path)) STRICT`,
+		`CREATE TABLE IF NOT EXISTS mutation_lease_blockers (waiting_lease_uuid BLOB NOT NULL REFERENCES mutation_leases(lease_uuid) ON DELETE CASCADE, blocking_lease_uuid BLOB NOT NULL REFERENCES mutation_leases(lease_uuid), blocking_root_lease_uuid BLOB NOT NULL, collision_id BLOB, PRIMARY KEY(waiting_lease_uuid,blocking_lease_uuid)) STRICT`,
+		`CREATE INDEX IF NOT EXISTS mutation_lease_blockers_blocking ON mutation_lease_blockers(blocking_lease_uuid)`,
+		`CREATE TABLE IF NOT EXISTS mutation_lease_audit (id INTEGER PRIMARY KEY, predecessor_lease_uuid BLOB NOT NULL REFERENCES mutation_leases(lease_uuid), successor_lease_uuid BLOB NOT NULL REFERENCES mutation_leases(lease_uuid), requester_actor_uuid BLOB NOT NULL, requester_generation INTEGER NOT NULL, acquisition_source TEXT NOT NULL CHECK(acquisition_source IN ('agent','human')), reason TEXT NOT NULL, work_unit_uuid BLOB, collision_id BLOB, requested_at TEXT NOT NULL, notification_body TEXT NOT NULL) STRICT`,
+		`CREATE INDEX IF NOT EXISTS mutation_lease_paths_path ON mutation_lease_paths(path)`,
+		`CREATE INDEX IF NOT EXISTS mutation_lease_audit_predecessor ON mutation_lease_audit(predecessor_lease_uuid, id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS mutation_leases_one_active_leaf ON mutation_leases(root_lease_uuid) WHERE state='active'`,
 		`CREATE INDEX IF NOT EXISTS messages_sequence_id ON messages(event_sequence, id)`,
 		`CREATE INDEX IF NOT EXISTS collision_actors_actor ON collision_actors(session_uuid, collision_id)`,
 		`CREATE TABLE IF NOT EXISTS test_results (
@@ -321,6 +368,12 @@ func initializeSchemaGroup2() []string {
 			actor_uuid BLOB NOT NULL, joined_at TEXT NOT NULL, left_at TEXT, participation_state TEXT NOT NULL,
 			PRIMARY KEY(work_unit_uuid, actor_uuid)
 		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS work_unit_changes (
+			work_unit_uuid BLOB NOT NULL REFERENCES work_units(work_unit_uuid) ON DELETE CASCADE,
+			change_id TEXT NOT NULL, kind TEXT NOT NULL, actor_uuid BLOB NOT NULL, attached_at TEXT NOT NULL,
+			PRIMARY KEY(work_unit_uuid, change_id)
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS work_unit_changes_change ON work_unit_changes(change_id)`,
 		`CREATE TABLE IF NOT EXISTS launches (launch_uuid BLOB PRIMARY KEY, child_actor_uuid BLOB, work_unit_uuid BLOB REFERENCES work_units(work_unit_uuid), created_at TEXT NOT NULL, child_attached_at TEXT, work_unit_attached_at TEXT, terminated_at TEXT, termination_reason TEXT, created_sequence INTEGER NOT NULL, updated_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE IF NOT EXISTS launch_parent_actors (launch_uuid BLOB NOT NULL REFERENCES launches(launch_uuid) ON DELETE CASCADE, ordinal INTEGER NOT NULL, actor_uuid BLOB NOT NULL, PRIMARY KEY(launch_uuid, ordinal), UNIQUE(launch_uuid, actor_uuid)) STRICT`,
 		`CREATE INDEX IF NOT EXISTS launch_parent_actors_actor ON launch_parent_actors(actor_uuid, launch_uuid)`,
@@ -434,7 +487,7 @@ func resetProjection(transaction *sql.Tx, version int) error {
 			return err
 		}
 	}
-	tables := []string{"launch_parent_actors", "launches", "external_change_intents", "external_change_paths", "external_changes", "workspace_continuity", "checkpoint_claim_evidence", "checkpoint_claims", "checkpoint_metadata", "checkpoint_evidence", "checkpoint_requests", "work_unit_actors", "work_units", "directions", "mutation_paths", "mutations", "session_events", "messages", "test_results", "workspaces", "repositories", "events"}
+	tables := []string{"mutation_lease_blockers", "mutation_lease_audit", "mutation_lease_paths", "mutation_leases", "work_unit_changes", "launch_parent_actors", "launches", "external_change_intents", "external_change_paths", "external_changes", "workspace_continuity", "checkpoint_claim_evidence", "checkpoint_claims", "checkpoint_metadata", "checkpoint_evidence", "checkpoint_requests", "work_unit_actors", "work_units", "directions", "mutation_paths", "mutations", "session_events", "messages", "test_results", "workspaces", "repositories", "events"}
 	if version == 0 || version >= 7 {
 		tables = append(tables, "collision_actors", "collisions")
 	}
@@ -456,7 +509,7 @@ func recreateBinaryProjectionTables(transaction *sql.Tx) error {
 	// Projection state is disposable: the journal is the migration source. Drop
 	// every UUID-bearing table together so old TEXT schemas cannot reject the
 	// binary projection during backfill.
-	for _, table := range []string{"launch_parent_actors", "launches", "external_change_intents", "external_change_paths", "external_changes", "workspace_continuity", "checkpoint_claim_evidence", "checkpoint_claims", "checkpoint_metadata", "checkpoint_evidence", "checkpoint_requests", "work_unit_actors", "work_units", "directions", "test_results", "messages", "collision_actors", "collisions", "session_events", "mutation_paths", "mutations", "actors", "workspaces", "repositories"} {
+	for _, table := range []string{"mutation_lease_blockers", "mutation_lease_audit", "mutation_lease_paths", "mutation_leases", "work_unit_changes", "launch_parent_actors", "launches", "external_change_intents", "external_change_paths", "external_changes", "workspace_continuity", "checkpoint_claim_evidence", "checkpoint_claims", "checkpoint_metadata", "checkpoint_evidence", "checkpoint_requests", "work_unit_actors", "work_units", "directions", "test_results", "messages", "collision_actors", "collisions", "session_events", "mutation_paths", "mutations", "actors", "workspaces", "repositories"} {
 		if _, err := transaction.ExecContext(context.Background(), `DROP TABLE IF EXISTS `+table); err != nil {
 			return fmt.Errorf("drop legacy projection table %s: %w", table, err)
 		}
@@ -491,6 +544,16 @@ func recreateBinaryProjectionTables(transaction *sql.Tx) error {
 		`CREATE TABLE work_units (work_unit_uuid BLOB PRIMARY KEY, direction_uuid BLOB REFERENCES directions(direction_uuid), repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, objective TEXT NOT NULL, acceptance_criteria TEXT, context TEXT, state TEXT NOT NULL, created_by BLOB NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, tickets_json TEXT NOT NULL DEFAULT '[]', updated_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE directions (direction_uuid BLOB PRIMARY KEY, objective TEXT NOT NULL, success_criteria TEXT, constraints TEXT, context TEXT, state TEXT NOT NULL, created_by BLOB NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, tickets_json TEXT NOT NULL DEFAULT '[]', updated_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE work_unit_actors (work_unit_uuid BLOB NOT NULL REFERENCES work_units(work_unit_uuid) ON DELETE CASCADE, actor_uuid BLOB NOT NULL, joined_at TEXT NOT NULL, left_at TEXT, participation_state TEXT NOT NULL, PRIMARY KEY(work_unit_uuid, actor_uuid)) STRICT`,
+		`CREATE TABLE work_unit_changes (work_unit_uuid BLOB NOT NULL REFERENCES work_units(work_unit_uuid) ON DELETE CASCADE, change_id TEXT NOT NULL, kind TEXT NOT NULL, actor_uuid BLOB NOT NULL, attached_at TEXT NOT NULL, PRIMARY KEY(work_unit_uuid, change_id)) STRICT`,
+		`CREATE INDEX work_unit_changes_change ON work_unit_changes(change_id)`,
+		`CREATE TABLE mutation_leases (lease_uuid BLOB PRIMARY KEY, fencing_token BLOB NOT NULL, actor_uuid BLOB NOT NULL, generation INTEGER NOT NULL, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, intent_id TEXT NOT NULL, tool_call_id TEXT NOT NULL, granted_at TEXT NOT NULL, renewed_at TEXT NOT NULL, expires_at TEXT NOT NULL, hard_deadline TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('active','waiting','released','expired','canceled','superseded','revoked')), predecessor_lease_uuid BLOB REFERENCES mutation_leases(lease_uuid), root_lease_uuid BLOB NOT NULL, takeover_depth INTEGER NOT NULL DEFAULT 0, superseded_by_lease_uuid BLOB, terminal_at TEXT) STRICT`,
+		`CREATE TABLE mutation_lease_paths (lease_uuid BLOB NOT NULL REFERENCES mutation_leases(lease_uuid) ON DELETE CASCADE, path TEXT NOT NULL CHECK(path <> ''), PRIMARY KEY(lease_uuid,path)) STRICT`,
+		`CREATE TABLE mutation_lease_blockers (waiting_lease_uuid BLOB NOT NULL REFERENCES mutation_leases(lease_uuid) ON DELETE CASCADE, blocking_lease_uuid BLOB NOT NULL REFERENCES mutation_leases(lease_uuid), blocking_root_lease_uuid BLOB NOT NULL, collision_id BLOB, PRIMARY KEY(waiting_lease_uuid,blocking_lease_uuid)) STRICT`,
+		`CREATE INDEX mutation_lease_blockers_blocking ON mutation_lease_blockers(blocking_lease_uuid)`,
+		`CREATE TABLE mutation_lease_audit (id INTEGER PRIMARY KEY, predecessor_lease_uuid BLOB NOT NULL REFERENCES mutation_leases(lease_uuid), successor_lease_uuid BLOB NOT NULL REFERENCES mutation_leases(lease_uuid), requester_actor_uuid BLOB NOT NULL, requester_generation INTEGER NOT NULL, acquisition_source TEXT NOT NULL CHECK(acquisition_source IN ('agent','human')), reason TEXT NOT NULL, work_unit_uuid BLOB, collision_id BLOB, requested_at TEXT NOT NULL, notification_body TEXT NOT NULL) STRICT`,
+		`CREATE INDEX mutation_lease_paths_path ON mutation_lease_paths(path)`,
+		`CREATE INDEX mutation_lease_audit_predecessor ON mutation_lease_audit(predecessor_lease_uuid, id)`,
+		`CREATE UNIQUE INDEX mutation_leases_one_active_leaf ON mutation_leases(root_lease_uuid) WHERE state='active'`,
 		`CREATE TABLE external_changes (external_change_uuid BLOB PRIMARY KEY, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, unknown_actor_uuid BLOB NOT NULL, interval_started_at TEXT NOT NULL, interval_ended_at TEXT NOT NULL, continuity_state TEXT NOT NULL, change_kind TEXT NOT NULL, watchman_clock TEXT NOT NULL, before_json TEXT, after_json TEXT, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE external_change_paths (external_change_uuid BLOB NOT NULL REFERENCES external_changes(external_change_uuid) ON DELETE CASCADE, path TEXT NOT NULL, PRIMARY KEY(external_change_uuid, path)) STRICT`,
 		`CREATE TABLE external_change_intents (external_change_uuid BLOB NOT NULL REFERENCES external_changes(external_change_uuid) ON DELETE CASCADE, intent_id TEXT NOT NULL, PRIMARY KEY(external_change_uuid, intent_id)) STRICT`,
@@ -548,8 +611,24 @@ func secureDatabaseFiles(path string) error {
 	return nil
 }
 
-// Close closes the provenance database.
-func (d *DB) Close() error { return d.db.Close() }
+// SetLeaseAppender installs the authoritative append-only journal path for
+// lease commands. It must be installed before serving lease RPCs.
+func (d *DB) SetLeaseAppender(appender interface {
+	AppendNext(protocol.Event) (protocol.Event, error)
+}, _ uint64,
+) {
+	d.leaseMu.Lock()
+	defer d.leaseMu.Unlock()
+	d.leaseAppender = appender
+}
+
+// Close closes the provenance database and any owned lease appender.
+func (d *DB) Close() error {
+	if d.ownedLeaseAppender != nil {
+		d.ownedLeaseAppender.Close()
+	}
+	return d.db.Close()
+}
 
 // Path returns the provenance database path.
 func (d *DB) Path() string { return d.path }
@@ -567,6 +646,7 @@ func (d *DB) PruneNonUUIDActors() error {
 		`DELETE FROM mutations WHERE (repository_uuid IS NOT NULL AND length(repository_uuid) != 16) OR (workspace_uuid IS NOT NULL AND length(workspace_uuid) != 16)`,
 		`DELETE FROM test_results WHERE (repository_uuid IS NOT NULL AND length(repository_uuid) != 16) OR (workspace_uuid IS NOT NULL AND length(workspace_uuid) != 16)`,
 		`DELETE FROM checkpoint_requests WHERE length(repository_uuid) != 16 OR length(workspace_uuid) != 16 OR (work_unit_uuid IS NOT NULL AND length(work_unit_uuid) != 16)`,
+		`DELETE FROM work_unit_changes WHERE length(work_unit_uuid) != 16 OR length(actor_uuid) != 16`,
 		`DELETE FROM workspaces WHERE length(id) != 16 OR length(repository_uuid) != 16`,
 		`DELETE FROM repositories WHERE length(id) != 16`,
 	}
@@ -612,11 +692,16 @@ func (d *DB) ProjectAll(events []protocol.Event) error {
 	if len(events) == 0 {
 		return nil
 	}
+	d.projectionMu.Lock()
+	defer d.projectionMu.Unlock()
 	transaction, err := d.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
 	}
 	defer rollbackProjection(transaction)
+	if _, err := transaction.ExecContext(context.Background(), `PRAGMA defer_foreign_keys=ON`); err != nil {
+		return err
+	}
 	for index := range events {
 		if _, err := d.projectEvent(transaction, &events[index]); err != nil {
 			return err
@@ -632,11 +717,16 @@ func (d *DB) ProjectAll(events []protocol.Event) error {
 //
 //nolint:gocritic // public Appender-compatible value API
 func (d *DB) Project(event protocol.Event) error {
+	d.projectionMu.Lock()
+	defer d.projectionMu.Unlock()
 	transaction, err := d.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
 	}
 	defer rollbackProjection(transaction)
+	if _, err := transaction.ExecContext(context.Background(), `PRAGMA defer_foreign_keys=ON`); err != nil {
+		return err
+	}
 	inserted, err := d.projectEvent(transaction, &event)
 	if err != nil {
 		return err
@@ -690,12 +780,17 @@ func (d *DB) projectDomain(transaction *sql.Tx, event *protocol.Event) error {
 		"direction.transitioned": projectDirectionTransitioned,
 		"work_unit.created":      projectWorkUnitCreated, "work_unit.updated": projectWorkUnitUpdated,
 		"work_unit.transitioned": projectWorkUnitTransitioned, "work_unit.actor_joined": projectWorkUnitActorJoined,
-		"work_unit.actor_left": projectWorkUnitActorJoined, "checkpoint.requested": projectCheckpointRequested,
+		"work_unit.change_attached": projectWorkUnitChangeAttached,
+		"work_unit.actor_left":      projectWorkUnitActorJoined, "checkpoint.requested": projectCheckpointRequested,
 		"collision.actor_dead": projectCollisionActorDead, "collision.transitioned": projectCollisionTransitioned,
 		"collision.upserted":        projectCollisionUpserted,
 		"external_change.observed":  projectExternalChange,
 		"watch.continuity_lost":     projectWatchContinuity,
 		"watch.continuity_restored": projectWatchContinuity,
+		"lease.acquired":            projectLeaseLifecycle, "lease.waiting": projectLeaseLifecycle, "lease.renewed": projectLeaseLifecycle,
+		"lease.released": projectLeaseLifecycle, "lease.expired": projectLeaseLifecycle, "lease.canceled": projectLeaseLifecycle,
+		"lease.superseded": projectLeaseLifecycle, "lease.takeover": projectLeaseLifecycle,
+		"lease.revoked": projectLeaseLifecycle,
 	}
 	if handler := handlers[event.Type]; handler != nil {
 		return handler(transaction, event)
@@ -1222,6 +1317,197 @@ func projectWorkUnitTransitioned(transaction *sql.Tx, event *protocol.Event) err
 		return errors.New("work unit transition references unknown unit")
 	}
 	return nil
+}
+
+func hydrateLeaseLineage(transaction *sql.Tx, l *protocol.MutationLease) error {
+	var root, predecessor, superseded []byte
+	var depth uint64
+	if err := transaction.QueryRowContext(context.Background(), `SELECT root_lease_uuid,predecessor_lease_uuid,takeover_depth,superseded_by_lease_uuid FROM mutation_leases WHERE lease_uuid=?`, uuidBlob(l.LeaseUUID)).Scan(&root, &predecessor, &depth, &superseded); err == nil {
+		if l.RootLeaseUUID == "" {
+			l.RootLeaseUUID = uuidString(root)
+		}
+		if l.PredecessorLeaseUUID == "" {
+			l.PredecessorLeaseUUID = uuidString(predecessor)
+		}
+		if l.TakeoverDepth == 0 {
+			l.TakeoverDepth = depth
+		}
+		if l.SupersededByLeaseUUID == "" {
+			l.SupersededByLeaseUUID = uuidString(superseded)
+		}
+	}
+	if len(l.Paths) != 0 {
+		return nil
+	}
+	rows, err := transaction.QueryContext(context.Background(), `SELECT path FROM mutation_lease_paths WHERE lease_uuid=? ORDER BY path`, uuidBlob(l.LeaseUUID))
+	if err != nil {
+		return nil
+	}
+	defer closeLeaseRows(rows)
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return err
+		}
+		l.Paths = append(l.Paths, path)
+	}
+	return rows.Err()
+}
+
+//nolint:cyclop,gocognit,nestif // One projector validates and applies every lease lifecycle variant atomically.
+func projectLeaseLifecycle(transaction *sql.Tx, event *protocol.Event) error {
+	var lifecycle protocol.MutationLeaseLifecycleEvent
+	if err := json.Unmarshal(event.Data, &lifecycle); err != nil {
+		return err
+	}
+	l := lifecycle.Lease
+	for _, id := range []string{l.LeaseUUID, l.FencingToken, l.ActorUUID, l.RepositoryUUID, l.WorkspaceUUID} {
+		if err := protocol.ValidateUUID(id); err != nil {
+			return err
+		}
+	}
+	// Lineage fields are optional on renewal/release payloads. Preserve the
+	// projected lineage rather than rejecting a legitimate empty optional UUID.
+	if l.RootLeaseUUID == "" || l.PredecessorLeaseUUID == "" || l.SupersededByLeaseUUID == "" || len(l.Paths) == 0 {
+		if err := hydrateLeaseLineage(transaction, &l); err != nil {
+			return err
+		}
+	}
+	if l.RootLeaseUUID == "" {
+		l.RootLeaseUUID = l.LeaseUUID
+	}
+
+	if err := protocol.ValidateUUID(l.RootLeaseUUID); err != nil {
+		return err
+	}
+	for _, id := range []string{l.PredecessorLeaseUUID, l.SupersededByLeaseUUID} {
+		if id != "" {
+			if err := protocol.ValidateUUID(id); err != nil {
+				return err
+			}
+		}
+	}
+	var err error
+	if lifecycle.Action == "takeover" {
+		if lifecycle.PredecessorLease == nil || lifecycle.SuccessorLease == nil || lifecycle.Message == nil {
+			return errors.New("takeover event must contain predecessor, successor, and message snapshots")
+		}
+		// Terminalize the predecessor before inserting the successor so the
+		// one-active-leaf index does not ignore the successor insert. Foreign-key
+		// checks are deferred until both sides of the lineage relation exist.
+		if err := projectLeaseSnapshot(transaction, lifecycle.PredecessorLease); err != nil {
+			return err
+		}
+		if err := projectLeaseSnapshot(transaction, lifecycle.SuccessorLease); err != nil {
+			return err
+		}
+		l = *lifecycle.SuccessorLease
+	} else if err := projectLeaseSnapshot(transaction, &l); err != nil {
+		return err
+	}
+	if lifecycle.Action == "takeover" {
+		if protocol.ValidateUUID(lifecycle.PreviousHolderUUID) != nil || strings.TrimSpace(lifecycle.NotificationBody) == "" {
+			return errors.New("invalid takeover notification")
+		}
+		requester := uuidBlob(lifecycle.RequesterActorUUID)
+		if _, err = transaction.ExecContext(context.Background(), `INSERT INTO mutation_lease_audit(predecessor_lease_uuid,successor_lease_uuid,requester_actor_uuid,requester_generation,acquisition_source,reason,work_unit_uuid,collision_id,requested_at,notification_body) VALUES(?,?,?,?,?,?,?,?,?,?)`, uuidBlob(l.PredecessorLeaseUUID), uuidBlob(l.LeaseUUID), requester, lifecycle.RequesterGeneration, lifecycle.AcquisitionSource, lifecycle.Reason, nullableUUID(lifecycle.WorkUnitUUID), nullableUUID(lifecycle.CollisionID), event.At.UTC().Format(time.RFC3339Nano), lifecycle.NotificationBody); err != nil {
+			return err
+		}
+		message := lifecycle.Message
+		if message.GlobalSequence == 0 {
+			if err := transaction.QueryRowContext(context.Background(), `SELECT COALESCE(MAX(global_sequence),0)+1 FROM messages`).Scan(&message.GlobalSequence); err != nil {
+				return err
+			}
+			if err := transaction.QueryRowContext(context.Background(), `SELECT COALESCE(MAX(sender_sequence),0)+1 FROM messages WHERE from_actor=?`, uuidBlob(message.From)).Scan(&message.SenderSequence); err != nil {
+				return err
+			}
+			if err := transaction.QueryRowContext(context.Background(), `SELECT COALESCE(MAX(recipient_sequence),0)+1 FROM messages WHERE to_actor=?`, uuidBlob(message.To)).Scan(&message.RecipientSequence); err != nil {
+				return err
+			}
+		}
+		if protocol.ValidateUUID(message.From) != nil || protocol.ValidateUUID(message.To) != nil || message.ID == "" || message.Body == "" {
+			return errors.New("invalid takeover message")
+		}
+		if _, err = transaction.ExecContext(context.Background(), `INSERT OR IGNORE INTO messages(id,kind,from_actor,to_actor,body,global_sequence,sender_sequence,recipient_sequence,created_at,data,event_sequence) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, message.ID, message.Kind, uuidBlob(message.From), uuidBlob(message.To), message.Body, message.GlobalSequence, message.SenderSequence, message.RecipientSequence, message.CreatedAt.UTC().Format(time.RFC3339Nano), message.Body, event.Sequence); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func projectLeaseSnapshot(transaction *sql.Tx, l *protocol.MutationLease) error {
+	if _, err := transaction.ExecContext(context.Background(), `INSERT OR IGNORE INTO mutation_leases(lease_uuid,fencing_token,actor_uuid,generation,repository_uuid,workspace_uuid,intent_id,tool_call_id,granted_at,renewed_at,expires_at,hard_deadline,state,predecessor_lease_uuid,root_lease_uuid,takeover_depth,superseded_by_lease_uuid,terminal_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, uuidBlob(l.LeaseUUID), uuidBlob(l.FencingToken), uuidBlob(l.ActorUUID), l.Generation, uuidBlob(l.RepositoryUUID), uuidBlob(l.WorkspaceUUID), l.IntentID, l.ToolCallID, l.GrantedAt.UTC().Format(time.RFC3339Nano), l.RenewedAt.UTC().Format(time.RFC3339Nano), l.ExpiresAt.UTC().Format(time.RFC3339Nano), l.HardDeadline.UTC().Format(time.RFC3339Nano), l.State, nullableUUID(l.PredecessorLeaseUUID), uuidBlob(l.RootLeaseUUID), l.TakeoverDepth, nullableUUID(l.SupersededByLeaseUUID), nullableTime(l.TerminalAt)); err != nil {
+		return err
+	}
+	if _, err := transaction.ExecContext(context.Background(), `UPDATE mutation_leases SET fencing_token=?,actor_uuid=?,generation=?,repository_uuid=?,workspace_uuid=?,intent_id=?,tool_call_id=?,granted_at=?,renewed_at=?,expires_at=?,hard_deadline=?,state=?,predecessor_lease_uuid=?,root_lease_uuid=?,takeover_depth=?,superseded_by_lease_uuid=?,terminal_at=? WHERE lease_uuid=?`, uuidBlob(l.FencingToken), uuidBlob(l.ActorUUID), l.Generation, uuidBlob(l.RepositoryUUID), uuidBlob(l.WorkspaceUUID), l.IntentID, l.ToolCallID, l.GrantedAt.UTC().Format(time.RFC3339Nano), l.RenewedAt.UTC().Format(time.RFC3339Nano), l.ExpiresAt.UTC().Format(time.RFC3339Nano), l.HardDeadline.UTC().Format(time.RFC3339Nano), l.State, nullableUUID(l.PredecessorLeaseUUID), uuidBlob(l.RootLeaseUUID), l.TakeoverDepth, nullableUUID(l.SupersededByLeaseUUID), nullableTime(l.TerminalAt), uuidBlob(l.LeaseUUID)); err != nil {
+		return err
+	}
+	if _, err := transaction.ExecContext(context.Background(), `DELETE FROM mutation_lease_paths WHERE lease_uuid=?`, uuidBlob(l.LeaseUUID)); err != nil {
+		return err
+	}
+	for _, path := range l.Paths {
+		if _, err := transaction.ExecContext(context.Background(), `INSERT INTO mutation_lease_paths(lease_uuid,path) VALUES(?,?)`, uuidBlob(l.LeaseUUID), path); err != nil {
+			return err
+		}
+	}
+	if l.State == protocol.LeaseWaiting && l.BlockingLeaseUUID != "" {
+		if _, err := transaction.ExecContext(context.Background(), `INSERT OR REPLACE INTO mutation_lease_blockers(waiting_lease_uuid,blocking_lease_uuid,blocking_root_lease_uuid,collision_id) VALUES(?,?,?,?)`, uuidBlob(l.LeaseUUID), uuidBlob(l.BlockingLeaseUUID), uuidBlob(l.BlockingRootLeaseUUID), nullableUUID(l.CollisionID)); err != nil {
+			return err
+		}
+	} else if _, err := transaction.ExecContext(context.Background(), `DELETE FROM mutation_lease_blockers WHERE waiting_lease_uuid=?`, uuidBlob(l.LeaseUUID)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func projectWorkUnitChangeAttached(transaction *sql.Tx, event *protocol.Event) error {
+	var attached protocol.WorkUnitChangeAttachedEvent
+	if err := json.Unmarshal(event.Data, &attached); err != nil {
+		return err
+	}
+	relation := attached.Relation
+	if err := validateProjectedWorkUnitChange(&relation); err != nil {
+		return err
+	}
+	var active int
+	if err := transaction.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM work_unit_actors WHERE work_unit_uuid=? AND actor_uuid=? AND left_at IS NULL AND participation_state='active'`, uuidBlob(relation.WorkUnitUUID), uuidBlob(relation.Actor)).Scan(&active); err != nil {
+		return err
+	}
+	if active != 1 {
+		return errors.New("work unit change references inactive participant")
+	}
+	result, err := transaction.ExecContext(context.Background(), `INSERT OR IGNORE INTO work_unit_changes(work_unit_uuid, change_id, kind, actor_uuid, attached_at) VALUES (?, ?, ?, ?, ?)`, uuidBlob(relation.WorkUnitUUID), relation.ChangeID, relation.Kind, uuidBlob(relation.Actor), relation.AttachedAt.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil {
+		return err
+	} else if count == 0 {
+		var existingKind string
+		var existingActor []byte
+		if err := transaction.QueryRowContext(context.Background(), `SELECT kind, actor_uuid FROM work_unit_changes WHERE work_unit_uuid=? AND change_id=?`, uuidBlob(relation.WorkUnitUUID), relation.ChangeID).Scan(&existingKind, &existingActor); err != nil {
+			return err
+		}
+		if existingKind != relation.Kind {
+			return errors.New("conflicting work unit change projection")
+		}
+		if !bytes.Equal(existingActor, uuidBlob(relation.Actor)) {
+			return errors.New("work unit change relation is already owned by another actor")
+		}
+	}
+	return nil
+}
+
+func validateProjectedWorkUnitChange(relation *protocol.WorkUnitChange) error {
+	if protocol.ValidateUUID(relation.WorkUnitUUID) != nil || protocol.ValidateUUID(relation.Actor) != nil || strings.TrimSpace(relation.ChangeID) == "" || relation.AttachedAt.IsZero() {
+		return errors.New("invalid work unit change relation")
+	}
+	switch relation.Kind {
+	case protocol.WorkUnitChangeWorking, protocol.WorkUnitChangeMaterialized, protocol.WorkUnitChangeFollowUp:
+		return nil
+	default:
+		return fmt.Errorf("invalid work unit change kind %q", relation.Kind)
+	}
 }
 
 func projectWorkUnitActorJoined(transaction *sql.Tx, event *protocol.Event) error {
@@ -1845,18 +2131,23 @@ type ProjectionHealth struct {
 
 // ProjectingAppender appends events and projects them asynchronously.
 type ProjectingAppender struct {
-	primary           interface{ Append(protocol.Event) error }
-	db                *DB
-	queue             chan protocol.Event
-	done              chan struct{}
-	closing           chan struct{}
-	stop              chan struct{}
-	appenders         sync.WaitGroup
+	primary   interface{ Append(protocol.Event) error }
+	db        *DB
+	queue     chan protocol.Event
+	done      chan struct{}
+	closing   chan struct{}
+	stop      chan struct{}
+	appenders sync.WaitGroup
+	// publishMu covers durable append through queue submission, preserving
+	// journal order even when the projection queue is backpressured.
+	publishMu         sync.Mutex
 	mu                sync.Mutex
 	closed            bool
+	poisoned          bool
 	lastErr           error
 	journalSequence   uint64
 	projectedSequence uint64
+	observer          func(protocol.Event) error
 	notify            chan struct{}
 	once              sync.Once
 }
@@ -1894,37 +2185,77 @@ func newProjectingAppender(primary interface{ Append(protocol.Event) error }, da
 	return appender
 }
 
-// Append appends an event and schedules its projection.
+// Append appends an event with an already assigned sequence. New production
+// events should use AppendNext so allocation and durable append share this
+// authority.
 //
-//nolint:gocritic // Appender requires value semantics
+//nolint:gocritic // Appender interface requires value semantics.
 func (p *ProjectingAppender) Append(event protocol.Event) error {
-	// Serialize the durable append with journalSequence publication. Register
-	// the sender before releasing mu so Close cannot race it with shutdown.
+	_, err := p.append(event, false)
+	return err
+}
+
+// AppendNext allocates the next contiguous journal sequence and durably
+// publishes the event. Engine and lease lifecycle events use this same path.
+//
+//nolint:gocritic // Appender interface requires value semantics.
+func (p *ProjectingAppender) AppendNext(event protocol.Event) (protocol.Event, error) {
+	return p.append(event, true)
+}
+
+// append serializes allocation and durable append, then queues the durable
+// event for projection.
+//
+//nolint:gocritic // Event values are required by the appender boundary.
+func (p *ProjectingAppender) append(event protocol.Event, allocate bool) (protocol.Event, error) {
+	p.publishMu.Lock()
+	defer p.publishMu.Unlock()
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		return errors.New("provenance projection is closed")
+		return event, errors.New("provenance projection is closed")
+	}
+	if p.poisoned {
+		p.mu.Unlock()
+		return event, errors.New("provenance appender is poisoned; restart the daemon before retrying")
+	}
+	if allocate {
+		event.Sequence = p.journalSequence + 1
+	} else if event.Sequence != p.journalSequence+1 {
+		p.mu.Unlock()
+		return event, fmt.Errorf("projection event sequence %d is not contiguous after %d", event.Sequence, p.journalSequence)
 	}
 	p.appenders.Add(1)
 	defer p.appenders.Done()
-	// Keep the publication lock across the durable append. WaitForCurrent must
-	// not observe a pre-append tail while an append is in flight.
 	if err := p.primary.Append(event); err != nil {
+		// The primary may have partially written or durably written the event.
+		// Never retry in-process: reusing this sequence could corrupt replay.
+		p.poisoned = true
 		p.mu.Unlock()
-		return err
+		return event, err
 	}
 	p.journalSequence = max(p.journalSequence, event.Sequence)
+	observer := p.observer
 	p.signalLocked()
 	p.mu.Unlock()
-	// The journal is already durable. If shutdown wins while this sender is
-	// waiting for queue space, return without risking a send on a closed queue;
-	// the next startup replays the journal and rebuilds the projection.
+	if observer != nil && strings.HasPrefix(event.Type, "lease.") {
+		if err := observer(event); err != nil {
+			return event, err
+		}
+	}
 	select {
 	case p.queue <- event:
-		return nil
+		return event, nil
 	case <-p.closing:
-		return errors.New("provenance projection is shutting down")
+		return event, errors.New("provenance projection is shutting down")
 	}
+}
+
+// SetObserver installs a live consumer for authoritative lease events.
+func (p *ProjectingAppender) SetObserver(observer func(protocol.Event) error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.observer = observer
 }
 
 func (p *ProjectingAppender) projectLoop() {

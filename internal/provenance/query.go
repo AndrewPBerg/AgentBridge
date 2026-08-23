@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -92,26 +93,60 @@ type Status struct {
 
 // WorkUnitRecord describes a projected work unit.
 type WorkUnitRecord struct {
-	UUID               string                   `json:"work_unit_uuid"`
-	DirectionUUID      string                   `json:"direction_uuid,omitempty"`
-	RepositoryUUID     string                   `json:"repository_uuid"`
-	RepositoryRoot     string                   `json:"repository_root,omitempty"`
-	WorkspaceUUID      string                   `json:"workspace_uuid"`
-	WorkspaceRoot      string                   `json:"workspace_root,omitempty"`
-	WorkspaceKind      string                   `json:"workspace_kind,omitempty"`
-	Objective          string                   `json:"objective"`
-	AcceptanceCriteria string                   `json:"acceptance_criteria,omitempty"`
-	Context            string                   `json:"context,omitempty"`
-	State              protocol.WorkUnitState   `json:"state"`
-	CreatedBy          string                   `json:"created_by"`
-	CreatedAt          string                   `json:"created_at"`
-	UpdatedAt          string                   `json:"updated_at"`
-	CompletedAt        string                   `json:"completed_at,omitempty"`
-	Tickets            protocol.Tickets         `json:"tickets,omitempty"`
-	Participants       []protocol.WorkUnitActor `json:"participants"`
-	Checkpoints        []CheckpointRecord       `json:"checkpoints"`
-	CheckpointCount    int                      `json:"checkpoint_count"`
-	LatestCheckpoint   *CheckpointRecord        `json:"latest_checkpoint,omitempty"`
+	UUID                    string                      `json:"work_unit_uuid"`
+	DirectionUUID           string                      `json:"direction_uuid,omitempty"`
+	RepositoryUUID          string                      `json:"repository_uuid"`
+	RepositoryRoot          string                      `json:"repository_root,omitempty"`
+	WorkspaceUUID           string                      `json:"workspace_uuid"`
+	WorkspaceRoot           string                      `json:"workspace_root,omitempty"`
+	WorkspaceKind           string                      `json:"workspace_kind,omitempty"`
+	Objective               string                      `json:"objective"`
+	AcceptanceCriteria      string                      `json:"acceptance_criteria,omitempty"`
+	Context                 string                      `json:"context,omitempty"`
+	State                   protocol.WorkUnitState      `json:"state"`
+	CreatedBy               string                      `json:"created_by"`
+	CreatedAt               string                      `json:"created_at"`
+	UpdatedAt               string                      `json:"updated_at"`
+	CompletedAt             string                      `json:"completed_at,omitempty"`
+	Tickets                 protocol.Tickets            `json:"tickets,omitempty"`
+	Participants            []protocol.WorkUnitActor    `json:"participants"`
+	Changes                 []protocol.WorkUnitChange   `json:"changes"`
+	Checkpoints             []CheckpointRecord          `json:"checkpoints"`
+	CheckpointCount         int                         `json:"checkpoint_count"`
+	LatestCheckpoint        *CheckpointRecord           `json:"latest_checkpoint,omitempty"`
+	LatestCheckpointSummary *DirectionCheckpointSummary `json:"latest_checkpoint_summary,omitempty"`
+}
+
+// DirectionParticipant is the authoritative, compact participant presence view.
+type DirectionParticipant struct {
+	Actor          string             `json:"actor"`
+	Alias          string             `json:"alias,omitempty"`
+	State          string             `json:"state,omitempty"`
+	Live           bool               `json:"live"`
+	HeartbeatAt    string             `json:"heartbeat_at,omitempty"`
+	RecentActivity *DirectionActivity `json:"recent_activity,omitempty"`
+}
+
+// DirectionActivity contains projected session metadata, never message bodies.
+type DirectionActivity struct {
+	Type    string `json:"type"`
+	At      string `json:"at"`
+	Summary string `json:"summary,omitempty"`
+}
+
+// DirectionCheckpointSummary is a bounded, evidence-shaped checkpoint view.
+type DirectionCheckpointSummary struct {
+	ID           string                  `json:"id"`
+	WorkUnitUUID string                  `json:"work_unit_uuid"`
+	Kind         string                  `json:"kind"`
+	JournalEnd   uint64                  `json:"journal_end_sequence"`
+	Claims       []DirectionClaimSummary `json:"claims,omitempty"`
+}
+
+// DirectionClaimSummary is a projected claim status.
+type DirectionClaimSummary struct {
+	Kind   string `json:"kind"`
+	Status string `json:"status"`
 }
 
 // DirectionEvidenceSummary is derived from projected checkpoints and claims.
@@ -135,10 +170,13 @@ type DirectionReadinessSummary struct {
 
 // DirectionStatus is the deterministic, read-only rollup for a direction.
 type DirectionStatus struct {
-	Direction protocol.Direction        `json:"direction"`
-	WorkUnits []WorkUnitRecord          `json:"work_units"`
-	Evidence  DirectionEvidenceSummary  `json:"evidence"`
-	Readiness DirectionReadinessSummary `json:"readiness"`
+	Direction         protocol.Direction           `json:"direction"`
+	WorkUnits         []WorkUnitRecord             `json:"work_units"`
+	Participants      []DirectionParticipant       `json:"participants,omitempty"`
+	OpenCollisions    int                          `json:"open_collisions,omitempty"`
+	LatestCheckpoints []DirectionCheckpointSummary `json:"latest_checkpoints,omitempty"`
+	Evidence          DirectionEvidenceSummary     `json:"evidence"`
+	Readiness         DirectionReadinessSummary    `json:"readiness"`
 }
 
 // Direction returns the direction identified by uuid.
@@ -172,6 +210,7 @@ func (d *DB) Direction(uuid string) (protocol.Direction, error) {
 
 // WorkUnit returns the work unit identified by uuid.
 //
+//nolint:cyclop,gocognit,sqlclosecheck // hydration keeps direct and rollup data consistent.
 //nolint:cyclop // query hydration keeps the direct and rollup APIs consistent.
 func (d *DB) WorkUnit(uuid string) (WorkUnitRecord, error) {
 	var record WorkUnitRecord
@@ -225,6 +264,33 @@ func (d *DB) WorkUnit(uuid string) (WorkUnitRecord, error) {
 	if err := rows.Err(); err != nil {
 		return record, err
 	}
+	changeRows, err := d.db.QueryContext(context.Background(), `SELECT change_id, kind, actor_uuid, attached_at FROM work_unit_changes WHERE work_unit_uuid=? ORDER BY change_id`, uuidBlob(uuid))
+	if err != nil {
+		return record, err
+	}
+	record.Changes = []protocol.WorkUnitChange{}
+	for changeRows.Next() {
+		var change protocol.WorkUnitChange
+		var actor []byte
+		var attachedAt string
+		if err := changeRows.Scan(&change.ChangeID, &change.Kind, &actor, &attachedAt); err != nil {
+			if closeErr := changeRows.Close(); closeErr != nil {
+				return record, closeErr
+			}
+			return record, err
+		}
+		change.WorkUnitUUID, change.Actor, change.AttachedAt = record.UUID, uuidString(actor), parseTime(attachedAt)
+		record.Changes = append(record.Changes, change)
+	}
+	if err := changeRows.Err(); err != nil {
+		if closeErr := changeRows.Close(); closeErr != nil {
+			return record, closeErr
+		}
+		return record, err
+	}
+	if err := changeRows.Close(); err != nil {
+		return record, err
+	}
 	record.Checkpoints, err = d.ListCheckpoints(uuid, 1000)
 	if err != nil {
 		return record, err
@@ -257,8 +323,165 @@ func (d *DB) DirectionStatus(uuid string) (DirectionStatus, error) {
 		result.WorkUnits = append(result.WorkUnits, record)
 		mergeDirectionEvidence(&result.Evidence, &evidence)
 	}
+	if err := d.enrichDirectionStatus(&result); err != nil {
+		return result, err
+	}
 	result.Readiness = deriveDirectionReadiness(result.WorkUnits, result.Evidence)
 	return result, nil
+}
+
+func (d *DB) enrichDirectionStatus(result *DirectionStatus) error {
+	participantIDs := map[string]struct{}{result.Direction.CreatedBy: {}}
+	scopes := make([]ActorScope, 0, len(result.WorkUnits))
+	for index := range result.WorkUnits {
+		unit := &result.WorkUnits[index]
+		participantIDs[unit.CreatedBy] = struct{}{}
+		scopes = append(scopes, ActorScope{RepositoryUUID: unit.RepositoryUUID, WorkspaceUUID: unit.WorkspaceUUID})
+		for _, participant := range unit.Participants {
+			participantIDs[participant.Actor] = struct{}{}
+		}
+	}
+	actors := make([]string, 0, len(participantIDs))
+	for actor := range participantIDs {
+		actors = append(actors, actor)
+	}
+	sort.Strings(actors)
+	result.Participants = make([]DirectionParticipant, 0, len(actors))
+	for _, actor := range actors {
+		participant, err := d.directionParticipant(actor)
+		if err != nil {
+			return err
+		}
+		result.Participants = append(result.Participants, participant)
+	}
+	var err error
+	result.OpenCollisions, err = d.directionOpenCollisionCount(scopes)
+	if err != nil {
+		return err
+	}
+	for index := range result.WorkUnits {
+		if summary := checkpointSummary(result.WorkUnits[index].LatestCheckpoint, result.WorkUnits[index].UUID); summary != nil {
+			result.WorkUnits[index].LatestCheckpointSummary = summary
+		}
+	}
+	return d.populateLatestDirectionCheckpoints(result)
+}
+
+func (d *DB) directionParticipant(actor string) (DirectionParticipant, error) {
+	result := DirectionParticipant{Actor: actor}
+	var state, alias, heartbeat string
+	err := d.db.QueryRowContext(context.Background(), `SELECT COALESCE(alias,''), state, heartbeat_at FROM actors WHERE session_uuid=?`, uuidBlob(actor)).Scan(&alias, &state, &heartbeat)
+	if errors.Is(err, sql.ErrNoRows) {
+		return result, nil
+	}
+	if err != nil {
+		return result, err
+	}
+	result.Alias, result.State, result.HeartbeatAt = alias, state, heartbeat
+	heartbeatAt, parseErr := time.Parse(time.RFC3339Nano, heartbeat)
+	now := time.Now().UTC()
+	result.Live = parseErr == nil && state != "dead" && !heartbeatAt.After(now) && now.Sub(heartbeatAt) <= actorHeartbeatFreshness
+	var activity DirectionActivity
+	var summary sql.NullString
+	err = d.db.QueryRowContext(context.Background(), `SELECT type, at, summary FROM session_events WHERE actor=? ORDER BY at DESC, event_sequence DESC, id DESC LIMIT 1`, uuidBlob(actor)).Scan(&activity.Type, &activity.At, &summary)
+	if errors.Is(err, sql.ErrNoRows) {
+		return result, nil
+	}
+	if err != nil {
+		return result, err
+	}
+	if summary.Valid {
+		activity.Summary = sanitizeDirectionSummary(summary.String)
+	}
+	result.RecentActivity = &activity
+	return result, nil
+}
+
+func (d *DB) directionOpenCollisionCount(scopes []ActorScope) (int, error) {
+	if len(scopes) == 0 {
+		return 0, nil
+	}
+	conditions := make([]string, 0, len(scopes))
+	args := make([]any, 0, len(scopes)*2)
+	for _, scope := range scopes {
+		conditions = append(conditions, `(
+			EXISTS (SELECT 1 FROM events e WHERE e.type='intent.started'
+				AND (json_extract(e.data,'$.id')=json_extract(c.data,'$.intent_ids[0]') OR json_extract(e.data,'$.id')=json_extract(c.data,'$.intent_ids[1]'))
+				AND json_extract(e.data,'$.repository_uuid')=? AND json_extract(e.data,'$.workspace_uuid')=?
+			)
+			OR (NOT EXISTS (SELECT 1 FROM events e WHERE e.type='intent.started'
+				AND (json_extract(e.data,'$.id')=json_extract(c.data,'$.intent_ids[0]') OR json_extract(e.data,'$.id')=json_extract(c.data,'$.intent_ids[1]')))
+				AND EXISTS (SELECT 1 FROM collision_actors ca JOIN actors aa ON aa.session_uuid=ca.session_uuid WHERE ca.collision_id=c.id AND aa.repository_uuid=? AND aa.workspace_uuid=?)
+			)
+		)`)
+		args = append(args, scope.RepositoryUUID, scope.WorkspaceUUID, uuidBlob(scope.RepositoryUUID), uuidBlob(scope.WorkspaceUUID))
+	}
+	query := `SELECT COUNT(DISTINCT c.id) FROM collisions c WHERE c.state <> 'resolved' AND (` + strings.Join(conditions, " OR ") + ")"
+	var count int
+	err := d.db.QueryRowContext(context.Background(), query, args...).Scan(&count)
+	return count, err
+}
+
+func (d *DB) populateLatestDirectionCheckpoints(result *DirectionStatus) error {
+	ids := make([]any, 0, len(result.WorkUnits))
+	for index := range result.WorkUnits {
+		ids = append(ids, uuidBlob(result.WorkUnits[index].UUID))
+	}
+	if len(ids) == 0 {
+		result.LatestCheckpoints = []DirectionCheckpointSummary{}
+		return nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	rows, err := d.db.QueryContext(context.Background(), `SELECT id, actor, declared_by, session_generation, repository_uuid, workspace_uuid, COALESCE(work_unit_uuid,''), checkpoint_kind, journal_start_sequence, journal_end_sequence, data, event_sequence FROM checkpoint_requests WHERE work_unit_uuid IN (`+placeholders+`) ORDER BY journal_end_sequence DESC, event_sequence DESC, id DESC LIMIT 20`, ids...)
+	if err != nil {
+		return err
+	}
+	defer closeRows(rows)
+	result.LatestCheckpoints = make([]DirectionCheckpointSummary, 0, 20)
+	for rows.Next() {
+		checkpoint, err := scanCheckpoint(rows)
+		if err != nil {
+			return err
+		}
+		if err := d.hydrateCheckpoint(&checkpoint); err != nil {
+			return err
+		}
+		if summary := checkpointSummary(&checkpoint, checkpoint.WorkUnitUUID); summary != nil {
+			result.LatestCheckpoints = append(result.LatestCheckpoints, *summary)
+		}
+	}
+	return rows.Err()
+}
+
+const directionSummaryLimit = 240
+
+func sanitizeDirectionSummary(value string) string {
+	value = strings.TrimSpace(value)
+	lower := strings.ToLower(value)
+	for _, marker := range []string{"password", "secret", "api_key", "token=", "bearer ", "authorization:"} {
+		if strings.Contains(lower, marker) {
+			return "[REDACTED]"
+		}
+	}
+	runes := []rune(value)
+	if len(runes) > directionSummaryLimit {
+		runes = runes[:directionSummaryLimit]
+	}
+	return string(runes)
+}
+
+func checkpointSummary(checkpoint *CheckpointRecord, workUnit string) *DirectionCheckpointSummary {
+	if checkpoint == nil {
+		return nil
+	}
+	summary := &DirectionCheckpointSummary{ID: checkpoint.ID, WorkUnitUUID: workUnit, Kind: checkpoint.CheckpointKind, JournalEnd: checkpoint.JournalEnd}
+	for index, claim := range checkpoint.Claims {
+		if index >= 8 {
+			break
+		}
+		summary.Claims = append(summary.Claims, DirectionClaimSummary{Kind: claim.Kind, Status: string(claim.Status)})
+	}
+	return summary
 }
 
 func (d *DB) directionWorkUnitUUIDs(directionUUID string) ([][]byte, error) {
@@ -301,13 +524,9 @@ func (d *DB) populateDirectionCheckpointSummary(workUnit []byte, record *WorkUni
 	if record.CheckpointCount == 0 {
 		return nil
 	}
-	if record.CheckpointCount <= len(record.Checkpoints) {
-		record.LatestCheckpoint = &record.Checkpoints[len(record.Checkpoints)-1]
-		return nil
-	}
 	row := d.db.QueryRowContext(context.Background(), `SELECT id, actor, declared_by, session_generation, repository_uuid, workspace_uuid,
 		COALESCE(work_unit_uuid, ''), checkpoint_kind, journal_start_sequence, journal_end_sequence,
-		data, event_sequence FROM checkpoint_requests WHERE work_unit_uuid = ? ORDER BY event_sequence DESC, id DESC LIMIT 1`, workUnit)
+		data, event_sequence FROM checkpoint_requests WHERE work_unit_uuid = ? ORDER BY journal_end_sequence DESC, event_sequence DESC, id DESC LIMIT 1`, workUnit)
 	latest, err := scanCheckpoint(row)
 	if err != nil {
 		return err

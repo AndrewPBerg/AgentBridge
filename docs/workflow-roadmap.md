@@ -197,7 +197,7 @@ The current Pi adapter and daemon already:
 - record turn, compaction, session, collision, and mutation provenance;
 - provide immutable checkpoints, WorkUnits, Directions, and local ticket context;
 - preserve explicit parent/launch/child provenance and optional WorkUnit attachment;
-- observe conservative external changes through Watchman;
+- observe conservative external changes through Watchman, retiring idle workspace subscriptions after a 30-second liveness grace period;
 - detect recent exact-path intent overlap;
 - push durable collision messages; and
 - support `open -> negotiating -> yielded -> resolved` collision state.
@@ -613,13 +613,14 @@ Put stable norms in the prompt, recipes in skills, mechanics in the adapter, and
 
 ## Immediate next implementation slice
 
-The checkpoint, WorkUnit, Direction, launch-provenance, and external-observation foundations now exist. The next disciplined workflow slice is **atomic mutation admission**, followed by **observed-baseline protection**:
+The checkpoint, WorkUnit, Direction, launch-provenance, external-observation, and durable exact-path lease foundations now exist. The lease data model/RPC substrate covers active and waiting claims, takeover lineage, TTL/fencing, cancellation/expiry, journal replay, and SQLite projection. The next disciplined workflow slice is **Pi atomic-admission wiring**, followed by **observed-baseline protection**:
 
-1. change `intent.begin` into an atomic `grant | wait | warn | block` decision;
-2. serialize overlapping exact-path mutation attempts while leaving disjoint work silent;
-3. expire leases on tool completion, cancellation, actor death, or bounded TTL;
-4. record complete file-read observations without treating partial reads as whole-file baselines;
-5. block high-confidence stale whole-file writes; and
-6. fixture-test both same-workspace success and escalation to a WTF workspace.
+1. acquire through the lease RPC before exact-path Pi `edit`/`write` execution;
+2. asynchronously hold waiting calls and refuse blocked calls without running the tool;
+3. renew while the exact tool call remains open and release/cancel on every terminal path;
+4. recover active/waiting claims after reconnect and preserve fencing identity;
+5. record complete file-read observations without treating partial reads as whole-file baselines;
+6. block high-confidence stale whole-file writes; and
+7. fixture-test both same-workspace success and escalation to a WTF workspace.
 
 This safety slice is the prerequisite for making shared-workspace execution the normal multi-agent default. WTF integration may begin with capability discovery and explicit isolation requests, but policy must continue to choose physical isolation whenever writers are uninstrumented, scopes are broad, or runtime resources conflict.

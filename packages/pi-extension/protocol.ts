@@ -156,6 +156,21 @@ export type WorkUnit = {
 export type DirectionStatus = {
   direction: Direction;
   work_units: WorkUnit[];
+  participants?: Array<{
+    actor: string;
+    alias?: string;
+    state?: string;
+    live: boolean;
+    recent_activity?: { type: string; at: string; summary?: string };
+  }>;
+  open_collisions?: number;
+  latest_checkpoints?: Array<{
+    id: string;
+    work_unit_uuid: string;
+    kind: string;
+    journal_end_sequence: number;
+    claims?: Array<{ kind: string; status: string }>;
+  }>;
 };
 
 export type CheckpointClaim = {

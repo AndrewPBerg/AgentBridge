@@ -193,7 +193,7 @@ Lifecycle mutation authorization, ownership policy, human approval, and future R
 
 A WorkUnit is semantic coordination state, not a synonym for a JJ change. One WorkUnit may begin inside shared `@`, span many checkpoints, and eventually produce zero, one, or several JJ changes. Several actors may co-author the same WorkUnit, while separate virtual WorkUnits may temporarily coexist in one physical working-copy change.
 
-A later normalized `work_unit_changes` relation may record working, materialized, or follow-up JJ changes. The first WorkUnit slice should only preserve JJ identities through checkpoint evidence and must not require VCS history shaping.
+The normalized `work_unit_changes` relation records an explicit authored association, with `working`, `materialized`, or `follow_up` kind. A JJ change ID is a caller-authored relation, not verified VCS evidence; verification remains the responsibility of checkpoint and external-observation evidence. The attaching actor must be an active WorkUnit participant in the WorkUnit's repository/workspace scope. Reusing the same `(work_unit_uuid, change_id, kind)` with another actor is rejected by both live state and provenance projection; kind is immutable, and changing it requires a future explicit update event. This relation contract does not authenticate local callers; caller authentication and broader adapter authorization remain Phase 5.6 work. The first WorkUnit slice must not require VCS history shaping.
 
 ### Initial WorkUnit slice
 
@@ -270,7 +270,7 @@ Direction
 
 A Direction composes the repository-scoped WorkUnits required for one integrated outcome. A WorkUnit composes the JJ changes that materialize that issue over time; it is not required to map one-to-one to a change. Checkpoints are immutable evidence boundaries over the mutations, tests, messages, and observed file changes that led toward or validated those JJ changes. They do not own files or replace JJ history.
 
-The eventual `work_unit_changes` relation should make the WorkUnit-to-JJ association explicit, including working, materialized, and follow-up changes. Checkpoint evidence should retain JJ identity plus normalized mutation/file references so operators can move from strategic outcome down to the exact observed changes without inferring hierarchy from timestamps or prose.
+The landed `work_unit_changes` relation records explicit authored WorkUnit-to-JJ associations as `working`, `materialized`, or `follow_up`. These relations organize work but are not verified VCS evidence; checkpoint evidence retains observed JJ identity plus normalized mutation/file references so operators can move from strategic outcome down to exact observed changes without inferring hierarchy from timestamps or prose.
 
 ### Direction responsibilities
 
@@ -367,7 +367,7 @@ The Pi extension could expose a conversation-local project selection workflow:
 
 Selection is convenience state, not coordination truth. It must be scoped to the actor session and validated by the daemon. Stale selections must be cleared or rejected deterministically. The daemon remains authoritative for Direction identity, WorkUnit containment, participants, lifecycle, and readiness. Agents must never attach work by guessing the latest-created Direction or WorkUnit.
 
-A compact Direction rollup should favor actionable project state over a large injected plan: objective, ready and blocked WorkUnits, active participants, open collisions, latest checkpoints, and unmet success criteria. Detailed provenance remains available lazily.
+A compact Direction rollup should favor actionable project state over a large injected plan: objective, ready and blocked WorkUnits, active participants, open collisions, latest checkpoints, and unmet success criteria. `open_collisions` is a conservative count of descendant WorkUnit scope overlap; it is not a direct Direction relation. Detailed provenance remains available lazily.
 
 ### Multi-repository and eventual multi-machine scope
 
@@ -427,13 +427,15 @@ Deferred after the immediate operability slice:
 - [x] first-class `parent actor -> launch -> child actor -> optional WorkUnit` provenance with a stable launch UUID and harness attachment events;
 - [ ] warn when mutations occur in a scope related to an active WorkUnit but lack WorkUnit context;
 - [ ] correlate instrumented creation of brand-new paths by matching active create intent with `Before.Exists=false` before Watchman classifies it as unknown;
-- [ ] retire Watchman workspace watches after no active actor remains, with a bounded grace period;
-- [ ] remove no-op legacy `activity.*` compatibility RPCs after deployed adapters no longer call them;
-- [ ] include actor aliases, roles, liveness, and recent activity in Direction rollups;
+- [x] retire Watchman workspace watches after no addressable actor remains, with a 30-second bounded grace period;
+- [x] remove no-op legacy `activity.*` compatibility RPCs; deployed adapters use intent/session events;
+- [x] include actor aliases, heartbeat-derived liveness, recent bounded activity, scoped open-collision counts, and globally ordered latest checkpoints in Direction rollups;
+- [ ] add actor roles only after an authoritative role model exists;
 - [ ] include open questions and message summaries in Direction status;
-- [ ] add explicit normalized WorkUnit-to-JJ-change relations;
-- [ ] inject a compact Pi hierarchy cue: `Direction -> WorkUnit -> JJ changes -> checkpoint/mutations -> files`; and
+- [x] add explicit normalized WorkUnit-to-JJ-change relations;
 - [ ] add dependencies and deterministic readiness only after local rollup and evidence behavior remain stable under dogfood.
+
+Explicitly deferred until demonstrated as a blocker: automatic Pi hierarchy prompt cues such as `Direction -> WorkUnit -> JJ changes -> checkpoint/mutations -> files`. Current models and parent coordination should use selected state and lazy queries without default prompt injection.
 
 Exit condition for the local slice: several agents can coordinate one project-shaped Direction containing issues and sub-issues, inspect deterministic readiness and blockers, and verify the integrated outcome from descendant checkpoint evidence without confusing project state, executable work, VCS state, or provenance boundaries.
 
@@ -494,7 +496,7 @@ A human can mention any ticket-shaped context naturally; an agent can store it o
 
 ## Phase 5 — External-change provenance and safety work carried forward
 
-**Status: initial unknown-actor, Watchman transport/baseline, continuity, and external-observation substrate landed.** Full stress acceptance and conservative correlation hardening remain active; observed-baseline write protection and destructive-operation admission have not landed.
+**Status: initial unknown-actor, Watchman transport/baseline, continuity, and external-observation substrate landed.** Idle subscription cleanup and legacy activity-RPC removal are complete. The durable exact-path mutation-lease data model and daemon RPC substrate—including waiting claims, lineage/takeover, TTL/fencing, journal rebuild, and SQLite projection—are landed. Pi tool-call admission wiring is active but incomplete, so atomic mutation admission is not yet a completed product capability. Full stress acceptance, observed-baseline write protection, and destructive-operation admission remain active.
 
 Continue this lane in this order:
 

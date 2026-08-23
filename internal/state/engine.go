@@ -26,6 +26,12 @@ type Appender interface {
 	Append(protocol.Event) error
 }
 
+// SequencedAppender is the single authority for journal sequence allocation.
+// It allocates and durably appends while holding one publication lock.
+type SequencedAppender interface {
+	AppendNext(protocol.Event) (protocol.Event, error)
+}
+
 // Engine maintains coordination state and its event journal.
 type Engine struct {
 	mu sync.Mutex
@@ -53,6 +59,7 @@ type Engine struct {
 	testResultSequence map[string]uint64
 	workUnits          map[string]protocol.WorkUnit
 	workUnitActors     map[string]map[string]protocol.WorkUnitActor
+	workUnitChanges    map[string]map[string]protocol.WorkUnitChange
 	launches           map[string]protocol.Launch
 	directions         map[string]protocol.Direction
 	externalChanges    map[string]protocol.ExternalChange
@@ -102,6 +109,7 @@ func New(journal Appender, events []protocol.Event, options Options) (*Engine, e
 		testResultSequence: make(map[string]uint64),
 		workUnits:          make(map[string]protocol.WorkUnit),
 		workUnitActors:     make(map[string]map[string]protocol.WorkUnitActor),
+		workUnitChanges:    make(map[string]map[string]protocol.WorkUnitChange),
 		launches:           make(map[string]protocol.Launch),
 		directions:         make(map[string]protocol.Direction),
 		externalChanges:    make(map[string]protocol.ExternalChange),
@@ -128,14 +136,20 @@ func (e *Engine) record(eventType string, value any) error {
 		return err
 	}
 	event := protocol.Event{
-		Version:  protocol.Version,
-		Sequence: e.eventSequence + 1,
-		Type:     eventType,
-		At:       e.now().UTC(),
-		Data:     data,
+		Version: protocol.Version,
+		Type:    eventType,
+		At:      e.now().UTC(),
+		Data:    data,
 	}
-	if err := e.journal.Append(event); err != nil {
-		return err
+	var appendErr error
+	if publisher, ok := e.journal.(SequencedAppender); ok {
+		event, appendErr = publisher.AppendNext(event)
+	} else {
+		event.Sequence = e.eventSequence + 1
+		appendErr = e.journal.Append(event)
+	}
+	if appendErr != nil {
+		return appendErr
 	}
 	if err := e.apply(event); err != nil {
 		// The journal append is already durable. Continuing would reuse the
@@ -182,6 +196,32 @@ func (e *Engine) apply(event protocol.Event) error {
 		// Legacy execution-presence events from the abandoned Zed ACP
 		// experiment remain journal history but no longer affect coordination.
 		break
+	case "lease.acquired", "lease.waiting", "lease.renewed", "lease.released", "lease.expired", "lease.canceled", "lease.superseded", "lease.takeover", "lease.revoked":
+		lifecycle, err := decode[protocol.MutationLeaseLifecycleEvent](event)
+		if err != nil {
+			return err
+		}
+		actors := []string{lifecycle.Lease.ActorUUID}
+		if lifecycle.PredecessorLease != nil {
+			actors = append(actors, lifecycle.PredecessorLease.ActorUUID)
+		}
+		if lifecycle.SuccessorLease != nil {
+			actors = append(actors, lifecycle.SuccessorLease.ActorUUID)
+		}
+		for _, actor := range actors {
+			if _, ok := e.actors[actor]; !ok {
+				return fmt.Errorf("lease event references unknown actor %q", actor)
+			}
+		}
+		if lifecycle.Action == "takeover" && lifecycle.Message != nil {
+			if _, ok := e.actors[lifecycle.Message.From]; !ok {
+				return fmt.Errorf("lease message references unknown sender %q", lifecycle.Message.From)
+			}
+			if _, ok := e.actors[lifecycle.Message.To]; !ok {
+				return fmt.Errorf("lease message references unknown recipient %q", lifecycle.Message.To)
+			}
+			e.applyLeaseMessage(lifecycle.Message, event.Sequence)
+		}
 	case "external_change.observed":
 		change, err := decode[protocol.ExternalChange](event)
 		if err != nil {
@@ -261,12 +301,7 @@ func (e *Engine) apply(event protocol.Event) error {
 		if err != nil {
 			return err
 		}
-		e.messages[message.ID] = message
-		e.messageSequence[message.ID] = event.Sequence
-		e.mailboxes[message.To] = append(e.mailboxes[message.To], message.ID)
-		e.globalSequence = max(e.globalSequence, message.GlobalSequence)
-		e.senderSequences[message.From] = max(e.senderSequences[message.From], message.SenderSequence)
-		e.recipientSequences[message.To] = max(e.recipientSequences[message.To], message.RecipientSequence)
+		e.applyLeaseMessage(&message, event.Sequence)
 	case "session.event":
 		if _, err := decode[protocol.SessionEvent](event); err != nil {
 			return err
@@ -439,6 +474,7 @@ func (e *Engine) apply(event protocol.Event) error {
 		}
 		e.workUnits[created.WorkUnit.UUID] = created.WorkUnit
 		e.workUnitActors[created.WorkUnit.UUID] = make(map[string]protocol.WorkUnitActor)
+		e.workUnitChanges[created.WorkUnit.UUID] = make(map[string]protocol.WorkUnitChange)
 	case "work_unit.updated":
 		updated, err := decode[protocol.WorkUnitUpdatedEvent](event)
 		if err != nil {
@@ -481,6 +517,22 @@ func (e *Engine) apply(event protocol.Event) error {
 			unit.CompletedAt = &at
 		}
 		e.workUnits[unit.UUID] = unit
+	case "work_unit.change_attached":
+		attached, err := decode[protocol.WorkUnitChangeAttachedEvent](event)
+		if err != nil {
+			return err
+		}
+		relation := attached.Relation
+		if err := validateWorkUnitChange(&relation); err != nil {
+			return err
+		}
+		if _, ok := e.workUnits[relation.WorkUnitUUID]; !ok || !activeWorkUnitParticipant(e, relation.WorkUnitUUID, relation.Actor) {
+			return errors.New("invalid work unit change participant")
+		}
+		if existing, ok := e.workUnitChanges[relation.WorkUnitUUID][relation.ChangeID]; ok && !reflect.DeepEqual(existing, relation) {
+			return errors.New("conflicting work unit change replay")
+		}
+		e.workUnitChanges[relation.WorkUnitUUID][relation.ChangeID] = relation
 	case "work_unit.actor_joined", "work_unit.actor_left":
 		membership, err := decode[protocol.WorkUnitActorEvent](event)
 		if err != nil {
@@ -722,7 +774,7 @@ func (e *Engine) notifyDeadCollisionsLocked(deadActor string) {
 				continue
 			}
 			message := e.nextMessage("agent-bridge", recipient, "collision-dead", fmt.Sprintf("Agent %s is no longer alive while collision %s remains active on %s. Reassess ownership before continuing.", deadActor, collision.ID, collision.Path), protocol.SendParams{ID: collision.ID + ":dead:" + recipient}, collision.ID)
-			if err := e.enqueue(message); err != nil {
+			if err := e.enqueue(&message); err != nil {
 				continue
 			}
 		}
@@ -881,8 +933,45 @@ func (e *Engine) nextMessage(from, to, kind, body string, params protocol.SendPa
 }
 
 //nolint:gocritic // Messages are journaled as value snapshots.
-func (e *Engine) enqueue(message protocol.Message) error {
-	return e.record("message.enqueued", message)
+func (e *Engine) applyLeaseMessage(message *protocol.Message, sequence uint64) {
+	if message.GlobalSequence == 0 {
+		e.globalSequence++
+		e.senderSequences[message.From]++
+		e.recipientSequences[message.To]++
+		message.GlobalSequence = e.globalSequence
+		message.SenderSequence = e.senderSequences[message.From]
+		message.RecipientSequence = e.recipientSequences[message.To]
+	}
+	if existing, ok := e.messages[message.ID]; ok && reflect.DeepEqual(existing, *message) {
+		return
+	}
+	e.messages[message.ID] = *message
+	e.messageSequence[message.ID] = sequence
+	e.mailboxes[message.To] = append(e.mailboxes[message.To], message.ID)
+	e.globalSequence = max(e.globalSequence, message.GlobalSequence)
+	e.senderSequences[message.From] = max(e.senderSequences[message.From], message.SenderSequence)
+	e.recipientSequences[message.To] = max(e.recipientSequences[message.To], message.RecipientSequence)
+}
+
+// ApplyExternal applies a journal event published by a subsystem such as the
+// provenance lease projector. It is used for live events; replay uses New.
+//
+//nolint:gocritic // protocol observer callbacks require value-event semantics.
+func (e *Engine) ApplyExternal(event protocol.Event) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if event.Sequence != e.eventSequence+1 {
+		return fmt.Errorf("external event sequence %d is not contiguous after %d", event.Sequence, e.eventSequence)
+	}
+	if err := e.apply(event); err != nil {
+		return err
+	}
+	e.eventSequence = event.Sequence
+	return nil
+}
+
+func (e *Engine) enqueue(message *protocol.Message) error {
+	return e.record("message.enqueued", *message)
 }
 
 // Send enqueues a message for another actor.
@@ -927,7 +1016,7 @@ func (e *Engine) Send(params protocol.SendParams) (protocol.Message, error) {
 		return protocol.Message{}, err
 	}
 	message := e.nextMessage(params.From, target.Address, "message", body, params, "")
-	if err := e.enqueue(message); err != nil {
+	if err := e.enqueue(&message); err != nil {
 		return protocol.Message{}, err
 	}
 	return message, nil
@@ -1053,7 +1142,7 @@ func (e *Engine) ensureCollisionSignals(collision protocol.Collision, left, righ
 		otherIntent := byActor[other]
 		body := fmt.Sprintf("AUTOMATIC COLLISION on %s\n%s is also operating on this file via %s/%s. Do not revert unfamiliar work; coordinate, yield, or resolve collision %s.", collision.Path, other, otherIntent.Tool, otherIntent.Operation, collision.ID)
 		message := e.nextMessage("agent-bridge", to, "collision", body, protocol.SendParams{ID: collision.ID + ":" + to}, collision.ID)
-		if err := e.enqueue(message); err != nil {
+		if err := e.enqueue(&message); err != nil {
 			return err
 		}
 	}
@@ -1337,6 +1426,18 @@ func activeWorkUnitParticipant(e *Engine, workUnit, actor string) bool {
 	return ok && member.LeftAt == nil && member.ParticipationState == "active"
 }
 
+func validateWorkUnitChange(relation *protocol.WorkUnitChange) error {
+	if protocol.ValidateUUID(relation.WorkUnitUUID) != nil || protocol.ValidateUUID(relation.Actor) != nil || strings.TrimSpace(relation.ChangeID) == "" || relation.AttachedAt.IsZero() {
+		return errors.New("invalid work unit change relation")
+	}
+	switch relation.Kind {
+	case protocol.WorkUnitChangeWorking, protocol.WorkUnitChangeMaterialized, protocol.WorkUnitChangeFollowUp:
+		return nil
+	default:
+		return fmt.Errorf("invalid work unit change kind %q", relation.Kind)
+	}
+}
+
 //nolint:gocritic // Scope comparison is intentionally side-effect free.
 func sameWorkUnitScope(unit protocol.WorkUnit, actor protocol.Actor) bool {
 	return unit.RepositoryUUID == actor.RepositoryUUID && unit.WorkspaceUUID == actor.WorkspaceUUID
@@ -1417,6 +1518,55 @@ func (e *Engine) WorkUnit(uuid string) (protocol.WorkUnit, []protocol.WorkUnitAc
 	}
 	sort.Slice(actors, func(i, j int) bool { return actors[i].Actor < actors[j].Actor })
 	return unit, actors, nil
+}
+
+// WorkUnitChanges returns explicit JJ relations for a WorkUnit.
+func (e *Engine) WorkUnitChanges(uuid string) ([]protocol.WorkUnitChange, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.workUnits[uuid]; !ok {
+		return nil, fmt.Errorf("unknown work unit %q", uuid)
+	}
+	changes := make([]protocol.WorkUnitChange, 0, len(e.workUnitChanges[uuid]))
+	for _, change := range e.workUnitChanges[uuid] {
+		changes = append(changes, change)
+	}
+	sort.Slice(changes, func(i, j int) bool { return changes[i].ChangeID < changes[j].ChangeID })
+	return changes, nil
+}
+
+// AttachWorkUnitChange records an explicit, replay-safe WorkUnit to JJ relation.
+func (e *Engine) AttachWorkUnitChange(params protocol.WorkUnitChangeAttachParams) (protocol.WorkUnitChange, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	unit, ok := e.workUnits[params.WorkUnitUUID]
+	if !ok {
+		return protocol.WorkUnitChange{}, fmt.Errorf("unknown work unit %q", params.WorkUnitUUID)
+	}
+	actor, ok := e.actors[params.Actor]
+	if !ok || !sameWorkUnitScope(unit, actor) || !activeWorkUnitParticipant(e, params.WorkUnitUUID, params.Actor) {
+		return protocol.WorkUnitChange{}, errors.New("actor is not an active work unit participant")
+	}
+	relation := protocol.WorkUnitChange{WorkUnitUUID: params.WorkUnitUUID, ChangeID: strings.TrimSpace(params.ChangeID), Kind: params.Kind, Actor: params.Actor, AttachedAt: e.now().UTC()}
+	if relation.Kind == "" {
+		relation.Kind = protocol.WorkUnitChangeWorking
+	}
+	if err := validateWorkUnitChange(&relation); err != nil {
+		return protocol.WorkUnitChange{}, err
+	}
+	if existing, ok := e.workUnitChanges[relation.WorkUnitUUID][relation.ChangeID]; ok {
+		if existing.Kind != relation.Kind {
+			return protocol.WorkUnitChange{}, errors.New("JJ change is already attached with another relation kind")
+		}
+		if existing.Actor != relation.Actor {
+			return protocol.WorkUnitChange{}, errors.New("JJ change relation is already owned by another actor")
+		}
+		return existing, nil
+	}
+	if err := e.record("work_unit.change_attached", protocol.WorkUnitChangeAttachedEvent{Relation: relation}); err != nil {
+		return protocol.WorkUnitChange{}, err
+	}
+	return relation, nil
 }
 
 // UpdateWorkUnit updates mutable work unit fields.

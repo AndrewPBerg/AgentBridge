@@ -764,7 +764,14 @@ describe("Go Agent Bridge adapter", () => {
     ];
     const client = mockClient((method, params) => {
       if (method === "direction.create") return direction;
-      if (method === "direction.status") return { direction, work_units: units };
+      if (method === "direction.status")
+        return {
+          direction,
+          work_units: units,
+          participants: [{ actor: "sender", alias: "builder", live: true }],
+          open_collisions: 2,
+          latest_checkpoints: [{ id: "cp-1", work_unit_uuid: units[0].work_unit_uuid, kind: "test", journal_end_sequence: 9 }],
+        };
       if (method === "direction.transition") {
         direction = { ...direction, state: params.state };
         return direction;
@@ -775,7 +782,10 @@ describe("Go Agent Bridge adapter", () => {
     await pi.commands.get("direction").handler("ship orchestration", ctx);
     await pi.commands.get("direction").handler("status", ctx);
     expect(client.call).toHaveBeenCalledWith("direction.status", { direction_uuid: directionUUID });
-    expect(ctx.ui.notify).toHaveBeenCalledWith("ship orchestration · draft · WorkUnits active=2 paused=1", "info");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "ship orchestration · draft · WorkUnits active=2 paused=1 · participants=live:@builder · collisions=2 · checkpoints=1",
+      "info",
+    );
     for (const [command, state] of [
       ["start", "active"],
       ["pause", "paused"],

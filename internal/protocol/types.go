@@ -816,6 +816,42 @@ type WorkUnitActor struct {
 	ParticipationState string     `json:"participation_state"`
 }
 
+// WorkUnitChange is an explicit normalized relation to a JJ change. ChangeID
+// is intentionally text: JJ identities are not Agent Bridge UUID identities.
+type WorkUnitChange struct {
+	WorkUnitUUID string    `json:"work_unit_uuid"`
+	ChangeID     string    `json:"change_id"`
+	Kind         string    `json:"kind"`
+	Actor        string    `json:"actor"`
+	AttachedAt   time.Time `json:"attached_at"`
+}
+
+// WorkUnit-to-JJ relation kinds.
+const (
+	WorkUnitChangeWorking      = "working"
+	WorkUnitChangeMaterialized = "materialized"
+	WorkUnitChangeFollowUp     = "follow_up"
+)
+
+// WorkUnitChangeAttachedEvent records one explicit, authored WorkUnit-to-JJ
+// relation. It is not verified VCS evidence: change_id is supplied by the
+// caller and must be interpreted alongside checkpoint or external observations.
+// The actor must be an active participant in the WorkUnit's repository/workspace
+// scope. A relation's kind is immutable; changing it requires a future explicit
+// update event rather than reusing this event. Local caller authentication is
+// intentionally outside this contract and remains Phase 5.6 authorization work.
+type WorkUnitChangeAttachedEvent struct {
+	Relation WorkUnitChange `json:"relation"`
+}
+
+// WorkUnitChangeAttachParams requests an explicit WorkUnit-to-JJ relation.
+type WorkUnitChangeAttachParams struct {
+	WorkUnitUUID string `json:"work_unit_uuid"`
+	Actor        string `json:"actor"`
+	ChangeID     string `json:"change_id"`
+	Kind         string `json:"kind"`
+}
+
 // WorkUnitCreatedEvent is a protocol value.
 type WorkUnitCreatedEvent struct {
 	WorkUnit WorkUnit `json:"work_unit"`

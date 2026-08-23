@@ -193,8 +193,12 @@ var requestHandlers = map[string]requestHandler{
 	"mailbox.ack":                 (*Server).handleMailboxAck,
 	"intent.begin":                (*Server).handleIntentBegin,
 	"intent.end":                  (*Server).handleIntentEnd,
-	"activity.report":             (*Server).handleLegacyActivityReport,
-	"activities.list":             (*Server).handleLegacyActivitiesList,
+	"mutation_lease.acquire":      (*Server).handleMutationLeaseAcquire,
+	"mutation_lease.takeover":     (*Server).handleMutationLeaseTakeover,
+	"mutation_lease.ancestry":     (*Server).handleMutationLeaseAncestry,
+	"mutation_lease.list":         (*Server).handleMutationLeaseList,
+	"mutation_lease.renew":        (*Server).handleMutationLeaseRenew,
+	"mutation_lease.release":      (*Server).handleMutationLeaseRelease,
 	"session.event":               (*Server).handleSessionEvent,
 	"test.result":                 (*Server).handleTestResult,
 	"launch.create":               (*Server).handleLaunchCreate,
@@ -213,6 +217,7 @@ var requestHandlers = map[string]requestHandler{
 	"work_unit.join":              (*Server).handleWorkUnitJoin,
 	"work_unit.leave":             (*Server).handleWorkUnitLeave,
 	"work_unit.transition":        (*Server).handleWorkUnitTransition,
+	"work_unit.attach_change":     (*Server).handleWorkUnitAttachChange,
 	"provenance.work_unit":        (*Server).handleProvenanceWorkUnit,
 	"checkpoint.request":          (*Server).handleCheckpointRequest,
 	"provenance.checkpoint":       (*Server).handleProvenanceCheckpoint,
@@ -368,16 +373,6 @@ func (s *Server) handleIntentEnd(_ context.Context, request protocol.Request) pr
 		return failure(request.ID, "intent_failed", err)
 	}
 	return success(request.ID, intent)
-}
-
-// handleLegacyActivityReport is a transition shim for Pi sessions that have
-// not yet reloaded after removal of the abandoned activity feature.
-func (s *Server) handleLegacyActivityReport(_ context.Context, request protocol.Request) protocol.Response {
-	return success(request.ID, map[string]any{"ignored": true})
-}
-
-func (s *Server) handleLegacyActivitiesList(_ context.Context, request protocol.Request) protocol.Response {
-	return success(request.ID, map[string]any{"activities": []any{}})
 }
 
 func (s *Server) handleSessionEvent(_ context.Context, request protocol.Request) protocol.Response {
@@ -550,10 +545,15 @@ func (s *Server) handleWorkUnitGet(_ context.Context, request protocol.Request) 
 	if err != nil {
 		return failure(request.ID, "work_unit_get_failed", err)
 	}
+	changes, err := s.engine.WorkUnitChanges(value.UUID)
+	if err != nil {
+		return failure(request.ID, "work_unit_get_failed", err)
+	}
 	return success(request.ID, struct {
-		Unit   protocol.WorkUnit        `json:"work_unit"`
-		Actors []protocol.WorkUnitActor `json:"actors"`
-	}{unit, actors})
+		Unit    protocol.WorkUnit         `json:"work_unit"`
+		Actors  []protocol.WorkUnitActor  `json:"actors"`
+		Changes []protocol.WorkUnitChange `json:"changes"`
+	}{unit, actors, changes})
 }
 
 func (s *Server) handleWorkUnitCreate(_ context.Context, request protocol.Request) protocol.Response {
@@ -614,6 +614,18 @@ func (s *Server) handleWorkUnitTransition(_ context.Context, request protocol.Re
 		return failure(request.ID, "work_unit_transition_failed", err)
 	}
 	return success(request.ID, unit)
+}
+
+func (s *Server) handleWorkUnitAttachChange(_ context.Context, request protocol.Request) protocol.Response {
+	value, err := params[protocol.WorkUnitChangeAttachParams](request)
+	if err != nil {
+		return failure(request.ID, "invalid_params", err)
+	}
+	change, err := s.engine.AttachWorkUnitChange(value)
+	if err != nil {
+		return failure(request.ID, "work_unit_change_attach_failed", err)
+	}
+	return success(request.ID, change)
 }
 
 func (s *Server) handleProvenanceWorkUnit(ctx context.Context, request protocol.Request) protocol.Response {

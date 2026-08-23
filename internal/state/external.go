@@ -239,7 +239,7 @@ func (e *Engine) NotifyExternalChange(change protocol.ExternalChange) error {
 		}
 		body := fmt.Sprintf("UNATTRIBUTED EXTERNAL CHANGE observed on %s (%s). Source %s is unknown and non-addressable. Re-read before writing.", change.Path, change.ChangeKind, change.UnknownActor)
 		message := e.nextMessage(change.UnknownActor, actor.Address, "external_change", body, protocol.SendParams{ID: change.ID + ":" + actor.Address}, "")
-		if err := e.enqueue(message); err != nil {
+		if err := e.enqueue(&message); err != nil {
 			return err
 		}
 	}

@@ -72,7 +72,7 @@ func serve(args []string) error {
 		return err
 	}
 	defer closeQuietly(journal)
-	database, err := provenance.Open(*databasePath)
+	database, err := provenance.OpenProjection(*databasePath)
 	if err != nil {
 		return err
 	}
@@ -94,10 +94,14 @@ func serve(args []string) error {
 	}
 	appender := provenance.NewProjectingAppender(journal, database, initialSequence)
 	defer appender.Close()
+	// Lease commands publish through the same authoritative journal/appender as
+	// every other coordination event; the SQLite lease tables are projections.
+	database.SetLeaseAppender(appender, initialSequence)
 	engine, err := state.New(appender, events, state.Options{})
 	if err != nil {
 		return err
 	}
+	appender.SetObserver(engine.ApplyExternal)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 	watchManager := watchsidecar.New(engine)
