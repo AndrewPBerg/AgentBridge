@@ -176,6 +176,8 @@ launches
   created_at DATETIME NOT NULL
   child_attached_at DATETIME
   work_unit_attached_at DATETIME
+  terminated_at DATETIME
+  termination_reason TEXT
 
 launch_parent_actors
   launch_uuid BLOB NOT NULL REFERENCES launches(launch_uuid)
@@ -184,7 +186,7 @@ launch_parent_actors
   PRIMARY KEY (launch_uuid, ordinal)
 ```
 
-The journal records `launch.created`, `launch.child_attached`, and `launch.work_unit_attached`. A stable launch UUID makes retries idempotent and connects a child that registers after the spawn request. Parent relations record causal provenance, not permanent hierarchy or ownership; once attached, the child is an ordinary addressable actor within the launch-family communication policy.
+The journal records `launch.created`, `launch.child_attached`, `launch.work_unit_attached`, and `launch.terminated`. A stable launch UUID makes retries idempotent and connects a child that registers after the spawn request; a failed spawn terminates the unattached launch with an auditable reason. Parent relations record causal provenance, not permanent hierarchy or ownership; once attached, the child is an ordinary addressable actor within the launch-family communication policy.
 
 The harness must still own lifecycle policy: it grants a worker a canonical session UUID, constrained capabilities, repository/workspace scope, and the explicit launch provenance link. Workers must not gain recursive spawning or unrestricted process control merely by becoming addressable peers. The first experiment should register two local bounded workers, attach each to its launch and WorkUnit, allow direct `bridge_message`, and prove mailbox replay and shutdown behavior.
 
