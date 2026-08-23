@@ -73,4 +73,6 @@ Attribution is exact for Pi's direct `edit`/`write` tools and conservative for r
 
 ## Awakening a dead Pi session
 
-`bridge_awaken` accepts a dead, same-workspace Pi actor and a bounded task, then forks its saved session into a detached Pi child. The original actor stays dead; the new child registers with a new identity, retains explicit launch provenance, joins the supplied or selected WorkUnit, and can use normal direct `bridge_message` communication. The child must re-read the repository and mailbox because its forked transcript may be stale. If the Pi process cannot start, the launch is durably marked terminated with the failure reason.
+`bridge_awaken` accepts a dead, same-workspace Pi actor and a bounded task, then forks its saved session into a detached Pi child. The original actor stays dead; the new child registers with a new identity, retains explicit launch provenance, and selects the supplied or inherited WorkUnit. Launch-family policy limits direct `bridge_message` communication to explicit parents and same-parent, same-WorkUnit siblings. The child must re-read the repository and mailbox because its forked transcript may be stale.
+
+A created launch is terminated with an auditable reason when WorkUnit attachment or process spawning fails. After a successful OS spawn, the parent adapter checks for child registration after 30 seconds and terminates an orphaned launch if no child attached. Cross-process reconciliation after the parent adapter exits remains future daemon lifecycle work.

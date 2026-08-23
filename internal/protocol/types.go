@@ -901,6 +901,13 @@ type LaunchChildAttachedEvent struct {
 	At         time.Time `json:"at"`
 }
 
+// ActorRegisteredWithLaunchEvent atomically registers a child and attaches its launch.
+type ActorRegisteredWithLaunchEvent struct {
+	Actor      Actor     `json:"actor"`
+	LaunchUUID string    `json:"launch_uuid"`
+	AttachedAt time.Time `json:"attached_at"`
+}
+
 // LaunchWorkUnitAttachedEvent associates a WorkUnit once.
 type LaunchWorkUnitAttachedEvent struct {
 	LaunchUUID   string    `json:"launch_uuid"`

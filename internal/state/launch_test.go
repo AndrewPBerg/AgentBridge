@@ -85,6 +85,48 @@ func TestLaunchTerminationIsReplayableAndPreventsAttachment(t *testing.T) {
 	}
 }
 
+//nolint:cyclop // One regression test verifies rejection, atomic registration, attachment, and replay.
+func TestRegisterWithLaunchIsAtomicAndReplayable(t *testing.T) {
+	engine, journal, now := newTestEngine(t)
+	parent := register(t, engine, "parent")
+	childUUID := testActorUUID("atomic-child")
+	child := protocol.Actor{
+		Address: childUUID, SessionUUID: childUUID, Harness: "pi", CWD: "/repo",
+		RepositoryUUID: parent.RepositoryUUID, WorkspaceUUID: parent.WorkspaceUUID,
+	}
+	if _, err := engine.RegisterWithLaunch(child, testActorUUID("missing-launch")); err == nil {
+		t.Fatal("unknown launch registration succeeded")
+	}
+	for _, actor := range engine.Sessions(true) {
+		if actor.Address == childUUID {
+			t.Fatal("failed launch registration left an actor behind")
+		}
+	}
+	launchUUID := testActorUUID("atomic-launch")
+	if _, err := engine.CreateLaunch(protocol.LaunchCreateParams{LaunchUUID: launchUUID, ParentActors: []string{parent.Address}}); err != nil {
+		t.Fatal(err)
+	}
+	registered, err := engine.RegisterWithLaunch(child, launchUUID)
+	if err != nil || registered.Address != childUUID {
+		t.Fatalf("register with launch = %#v, %v", registered, err)
+	}
+	launch, err := engine.Launch(launchUUID)
+	if err != nil || launch.ChildActor != childUUID {
+		t.Fatalf("attached launch = %#v, %v", launch, err)
+	}
+	if got := journal.events[len(journal.events)-1].Type; got != "actor.registered_with_launch" {
+		t.Fatalf("atomic event type = %q", got)
+	}
+	replayed, err := New(&memoryJournal{}, journal.events, Options{Now: func() time.Time { return *now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch, err = replayed.Launch(launchUUID)
+	if err != nil || launch.ChildActor != childUUID {
+		t.Fatalf("replayed launch = %#v, %v", launch, err)
+	}
+}
+
 func TestLaunchRejectsUnknownOrDuplicateParents(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
 	parent := register(t, engine, "parent")

@@ -163,16 +163,21 @@ func (e *Engine) apply(event protocol.Event) error {
 		if err != nil {
 			return err
 		}
-		if actor.ActorKind == "" {
-			actor.ActorKind = "agent"
+		e.applyActorUpsert(&actor)
+	case "actor.registered_with_launch":
+		registered, err := decode[protocol.ActorRegisteredWithLaunchEvent](event)
+		if err != nil {
+			return err
 		}
-		if actor.PresenceKind == "" {
-			actor.PresenceKind = "lease"
+		if err := validateActorRegistration(registered.Actor); err != nil {
+			return err
 		}
-		if actor.ActorKind == "agent" && !actor.Addressable {
-			actor.Addressable = true
-		}
-		e.actors[actor.Address] = actor
+		e.applyActorUpsert(&registered.Actor)
+		return e.applyLaunchChildAttached(protocol.LaunchChildAttachedEvent{
+			LaunchUUID: registered.LaunchUUID,
+			ChildActor: registered.Actor.Address,
+			At:         registered.AttachedAt,
+		})
 	case "activity.started", "activity.completed":
 		// Legacy execution-presence events from the abandoned Zed ACP
 		// experiment remain journal history but no longer affect coordination.
@@ -540,12 +545,21 @@ func validateActorRegistration(actor protocol.Actor) error {
 	return nil
 }
 
-// Register adds or refreshes an actor session.
-//
-//nolint:gocritic // Public API uses value snapshots.
-func (e *Engine) Register(actor protocol.Actor) (protocol.Actor, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+func (e *Engine) applyActorUpsert(actor *protocol.Actor) {
+	if actor.ActorKind == "" {
+		actor.ActorKind = "agent"
+	}
+	if actor.PresenceKind == "" {
+		actor.PresenceKind = "lease"
+	}
+	if actor.ActorKind == "agent" && !actor.Addressable {
+		actor.Addressable = true
+	}
+	e.actors[actor.Address] = *actor
+}
+
+//nolint:gocritic // Registration prepares a complete value snapshot.
+func (e *Engine) prepareActorRegistration(actor protocol.Actor) (protocol.Actor, error) {
 	if err := validateActorRegistration(actor); err != nil {
 		return protocol.Actor{}, err
 	}
@@ -553,13 +567,14 @@ func (e *Engine) Register(actor protocol.Actor) (protocol.Actor, error) {
 	if actor.Alias == "" {
 		actor.Alias = previous.Alias
 	}
+	now := e.now().UTC()
 	if actor.StartedAt.IsZero() {
-		actor.StartedAt = e.now().UTC()
+		actor.StartedAt = now
 	}
 	if !previous.StartedAt.IsZero() {
 		actor.StartedAt = previous.StartedAt
 	}
-	actor.HeartbeatAt = e.now().UTC()
+	actor.HeartbeatAt = now
 	if actor.State == "" {
 		actor.State = "waiting"
 	}
@@ -567,7 +582,55 @@ func (e *Engine) Register(actor protocol.Actor) (protocol.Actor, error) {
 	actor.ActorKind = "agent"
 	actor.Addressable = true
 	actor.PresenceKind = "lease"
+	return actor, nil
+}
+
+// Register adds or refreshes an actor session.
+//
+//nolint:gocritic // Public API uses value snapshots.
+func (e *Engine) Register(actor protocol.Actor) (protocol.Actor, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	actor, err := e.prepareActorRegistration(actor)
+	if err != nil {
+		return protocol.Actor{}, err
+	}
 	if err := e.record("actor.upserted", actor); err != nil {
+		return protocol.Actor{}, err
+	}
+	return actor, nil
+}
+
+// RegisterWithLaunch atomically registers a child actor and claims one launch.
+//
+//nolint:gocritic // Public API uses value snapshots.
+func (e *Engine) RegisterWithLaunch(actor protocol.Actor, launchUUID string) (protocol.Actor, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	actor, err := e.prepareActorRegistration(actor)
+	if err != nil {
+		return protocol.Actor{}, err
+	}
+	launch, ok := e.launches[launchUUID]
+	if !ok {
+		return protocol.Actor{}, fmt.Errorf("unknown launch %q", launchUUID)
+	}
+	if launch.TerminatedAt != nil {
+		return protocol.Actor{}, fmt.Errorf("launch %q is terminated", launchUUID)
+	}
+	if launch.ChildActor != "" {
+		if launch.ChildActor == actor.Address {
+			if err := e.record("actor.upserted", actor); err != nil {
+				return protocol.Actor{}, err
+			}
+			return actor, nil
+		}
+		return protocol.Actor{}, fmt.Errorf("launch %q already has child actor %q", launchUUID, launch.ChildActor)
+	}
+	attachedAt := e.now().UTC()
+	if err := e.record("actor.registered_with_launch", protocol.ActorRegisteredWithLaunchEvent{
+		Actor: actor, LaunchUUID: launchUUID, AttachedAt: attachedAt,
+	}); err != nil {
 		return protocol.Actor{}, err
 	}
 	return actor, nil

@@ -30,12 +30,19 @@ const HEARTBEAT_MS = 2_000;
 const JJ_REFRESH_MS = 10_000;
 const MAILBOX_POLL_MS = 250;
 const INTENT_TTL_MS = 5 * 60_000;
+const AWAKEN_ATTACH_TIMEOUT_MS = 30_000;
 const ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$/;
 
 type SessionsResult = { actors: ActorRecord[] };
 type PollResult = { messages: BridgeMessage[] | null };
 type IntentResult = { intent: MutationIntent; collisions: Collision[] };
 type AwakenLauncher = (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }) => Promise<void>;
+type AwakenScheduler = (callback: () => void, delayMillis: number) => void;
+
+function scheduleAwakenCheck(callback: () => void, delayMillis: number) {
+  const timer = setTimeout(callback, delayMillis);
+  timer.unref?.();
+}
 
 function launchAwakenedPi(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }): Promise<void> {
   const child = spawn(command, args, { cwd: options.cwd, env: options.env, detached: true, stdio: "ignore" });
@@ -48,7 +55,12 @@ function launchAwakenedPi(command: string, args: string[], options: { cwd: strin
   });
 }
 
-export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient(), awakenLauncher: AwakenLauncher = launchAwakenedPi) {
+export function createAgentBridge(
+  pi: ExtensionAPI,
+  client = new BridgeClient(),
+  awakenLauncher: AwakenLauncher = launchAwakenedPi,
+  awakenScheduler: AwakenScheduler = scheduleAwakenCheck,
+) {
   const openIntents = new Map<string, MutationIntent>();
   const deliveredInRuntime = new Set<string>();
   const pendingAcknowledgements = new Set<string>();
@@ -586,14 +598,14 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient(),
       }
       const launchUUID = randomUUID();
       await call("launch.create", { launch_uuid: launchUUID, parent_actor_uuids: [actor.address] });
-      if (workUnitUUID) await call("launch.attach_work_unit", { launch_uuid: launchUUID, work_unit_uuid: workUnitUUID });
-      const prompt = [
-        "You are an awakened Agent Bridge child, forked from a dead Pi session.",
-        "Review the current repository state and your durable mailbox before acting; your prior transcript may be stale.",
-        "Coordinate directly with your parent through Agent Bridge when needed.",
-        `Awakening request: ${request}`,
-      ].join("\n\n");
       try {
+        if (workUnitUUID) await call("launch.attach_work_unit", { launch_uuid: launchUUID, work_unit_uuid: workUnitUUID });
+        const prompt = [
+          "You are an awakened Agent Bridge child, forked from a dead Pi session.",
+          "Review the current repository state and your durable mailbox before acting; your prior transcript may be stale.",
+          "Coordinate directly with your parent through Agent Bridge when needed.",
+          `Awakening request: ${request}`,
+        ].join("\n\n");
         await awakenLauncher(
           process.env.AGENT_BRIDGE_PI_BIN || "pi",
           ["--fork", sessionFile, "--name", `awakened-${target.session_uuid.slice(0, 8)}`, prompt],
@@ -602,6 +614,17 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient(),
             env: { ...process.env, AGENT_BRIDGE_LAUNCH_UUID: launchUUID, AGENT_BRIDGE_WORK_UNIT_UUID: workUnitUUID },
           },
         );
+        awakenScheduler(() => {
+          void (async () => {
+            const launch = await call<{ child_actor_uuid?: string; terminated_at?: string }>("launch.get", { launch_uuid: launchUUID });
+            if (!launch.child_actor_uuid && !launch.terminated_at) {
+              await call("launch.terminate", {
+                launch_uuid: launchUUID,
+                reason: `child did not register within ${AWAKEN_ATTACH_TIMEOUT_MS}ms`,
+              });
+            }
+          })().catch((error) => reportError(sessionCtx, error));
+        }, AWAKEN_ATTACH_TIMEOUT_MS);
       } catch (error) {
         await call("launch.terminate", { launch_uuid: launchUUID, reason: error instanceof Error ? error.message : String(error) });
         throw error;

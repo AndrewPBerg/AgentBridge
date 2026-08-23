@@ -658,7 +658,8 @@ func (d *DB) Project(event protocol.Event) error {
 
 func (d *DB) projectDomain(transaction *sql.Tx, event *protocol.Event) error {
 	handlers := map[string]func(*sql.Tx, *protocol.Event) error{
-		"actor.upserted": projectActorUpserted, "intent.started": projectIntentStarted,
+		"actor.upserted": projectActorUpserted, "actor.registered_with_launch": projectActorRegisteredWithLaunch,
+		"intent.started":   projectIntentStarted,
 		"intent.completed": projectIntentStarted, "message.enqueued": projectMessageEnqueued,
 		"message.acked": projectMessageAcked, "session.event": projectSessionEvent,
 		"test.result": projectTestResult, "launch.created": projectLaunchCreated,
@@ -680,6 +681,33 @@ func (d *DB) projectDomain(transaction *sql.Tx, event *protocol.Event) error {
 		return handler(transaction, event)
 	}
 	return nil
+}
+
+func projectActorRegisteredWithLaunch(transaction *sql.Tx, event *protocol.Event) error {
+	var registered protocol.ActorRegisteredWithLaunchEvent
+	if err := json.Unmarshal(event.Data, &registered); err != nil {
+		return err
+	}
+	actorData, err := json.Marshal(registered.Actor)
+	if err != nil {
+		return err
+	}
+	actorEvent := *event
+	actorEvent.Data = actorData
+	if err := projectActorUpserted(transaction, &actorEvent); err != nil {
+		return err
+	}
+	attachmentData, err := json.Marshal(protocol.LaunchChildAttachedEvent{
+		LaunchUUID: registered.LaunchUUID,
+		ChildActor: registered.Actor.Address,
+		At:         registered.AttachedAt,
+	})
+	if err != nil {
+		return err
+	}
+	attachmentEvent := *event
+	attachmentEvent.Data = attachmentData
+	return projectLaunchChildAttached(transaction, &attachmentEvent)
 }
 
 func projectActorUpserted(transaction *sql.Tx, event *protocol.Event) error {

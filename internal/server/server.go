@@ -256,14 +256,14 @@ func (s *Server) handleActorRegister(_ context.Context, request protocol.Request
 	if err != nil {
 		return failure(request.ID, "invalid_params", err)
 	}
-	actor, err := s.engine.Register(value.Actor)
+	var actor protocol.Actor
+	if value.LaunchUUID == "" {
+		actor, err = s.engine.Register(value.Actor)
+	} else {
+		actor, err = s.engine.RegisterWithLaunch(value.Actor, value.LaunchUUID)
+	}
 	if err != nil {
 		return failure(request.ID, "register_failed", err)
-	}
-	if value.LaunchUUID != "" {
-		if _, err := s.engine.AttachLaunchChild(protocol.LaunchChildAttachParams{LaunchUUID: value.LaunchUUID, ChildActor: actor.Address}); err != nil {
-			return failure(request.ID, "launch_attach_child_failed", err)
-		}
 	}
 	return success(request.ID, actor)
 }

@@ -101,9 +101,15 @@ describe("Go Agent Bridge adapter", () => {
       return undefined;
     });
     const launches: Array<{ command: string; args: string[]; options: { cwd: string; env: NodeJS.ProcessEnv } }> = [];
-    createAgentBridge(pi, client, async (command, args, options) => {
-      launches.push({ command, args, options });
-    });
+    const scheduled: Array<{ callback: () => void; delayMillis: number }> = [];
+    createAgentBridge(
+      pi,
+      client,
+      async (command, args, options) => {
+        launches.push({ command, args, options });
+      },
+      (callback, delayMillis) => scheduled.push({ callback, delayMillis }),
+    );
     const ctx = context();
     await pi.events.get("session_start")?.[0]?.({ reason: "startup" }, ctx);
     const result = await pi.tools.get("bridge_awaken").execute("awaken", { target: dead.address, request: "Compare the style change." });
@@ -113,6 +119,52 @@ describe("Go Agent Bridge adapter", () => {
     expect(launches[0]?.command).toBe("pi");
     expect(launches[0]?.args.slice(0, 2)).toEqual(["--fork", "/sessions/dead.jsonl"]);
     expect(launches[0]?.options.env.AGENT_BRIDGE_LAUNCH_UUID).toBe(result.details.launch_uuid);
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]?.delayMillis).toBe(30_000);
+    scheduled[0]?.callback();
+    await vi.waitFor(() =>
+      expect(client.call).toHaveBeenCalledWith(
+        "launch.terminate",
+        expect.objectContaining({ launch_uuid: result.details.launch_uuid, reason: expect.stringContaining("did not register") }),
+      ),
+    );
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("terminates a created launch when WorkUnit attachment fails", async () => {
+    const pi = createMockPi();
+    const parent = {
+      ...actor("11111111-1111-5111-8111-111111111111"),
+      repository_uuid: repositoryUUID,
+      workspace_uuid: workspaceUUID,
+    };
+    const dead = {
+      ...actor("44444444-4444-5444-8444-444444444444"),
+      state: "dead" as const,
+      repository_uuid: repositoryUUID,
+      workspace_uuid: workspaceUUID,
+      session_file: "/sessions/dead.jsonl",
+      cwd: "/repo",
+    };
+    const client = mockClient((method) => {
+      if (method === "actor.register" || method === "actor.heartbeat") return parent;
+      if (method === "sessions.list") return { actors: [parent, dead] };
+      if (method === "provenance.work_unit") return workUnit();
+      if (method === "launch.create" || method === "launch.terminate") return {};
+      if (method === "launch.attach_work_unit") throw new Error("attachment rejected");
+      return undefined;
+    });
+    const launcher = vi.fn(async () => undefined);
+    createAgentBridge(pi, client, launcher);
+    const ctx = context();
+    await pi.events.get("session_start")?.[0]?.({ reason: "startup" }, ctx);
+    await expect(
+      pi.tools
+        .get("bridge_awaken")
+        .execute("awaken", { target: dead.address, request: "Compare the style change.", workUnitUUID: defaultWorkUnitUUID }),
+    ).rejects.toThrow("attachment rejected");
+    expect(client.call).toHaveBeenCalledWith("launch.terminate", expect.objectContaining({ reason: "attachment rejected" }));
+    expect(launcher).not.toHaveBeenCalled();
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });
 

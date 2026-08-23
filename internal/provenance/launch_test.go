@@ -29,7 +29,14 @@ func TestLaunchProjectionStoresNormalizedUUIDRelationsAsBlobs(t *testing.T) {
 	if err := db.Project(event(t, 2, "launch.created", protocol.LaunchCreatedEvent{Launch: launch})); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Project(event(t, 3, "launch.child_attached", protocol.LaunchChildAttachedEvent{LaunchUUID: launch.UUID, ChildActor: "41234567-89ab-4def-8123-456789abcdef", At: at.Add(time.Second)})); err != nil {
+	childUUID := "41234567-89ab-4def-8123-456789abcdef"
+	child := protocol.Actor{
+		Address: childUUID, SessionUUID: childUUID, Harness: "pi", CWD: "/repo",
+		RepositoryUUID: unit.RepositoryUUID, WorkspaceUUID: unit.WorkspaceUUID,
+		ActorKind: "agent", Addressable: true, PresenceKind: "lease", State: "active",
+		StartedAt: at, HeartbeatAt: at,
+	}
+	if err := db.Project(event(t, 3, "actor.registered_with_launch", protocol.ActorRegisteredWithLaunchEvent{Actor: child, LaunchUUID: launch.UUID, AttachedAt: at.Add(time.Second)})); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Project(event(t, 4, "launch.work_unit_attached", protocol.LaunchWorkUnitAttachedEvent{LaunchUUID: launch.UUID, WorkUnitUUID: unit.UUID, At: at.Add(2 * time.Second)})); err != nil {
