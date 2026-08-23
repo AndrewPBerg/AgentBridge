@@ -44,6 +44,12 @@ function scheduleAwakenCheck(callback: () => void, delayMillis: number) {
   timer.unref?.();
 }
 
+function piExecutable(): string {
+  // Reuse the binary that started this Pi runtime, avoiding shell wrappers that
+  // may inject incompatible local flags into the awakened child.
+  return process.env.AGENT_BRIDGE_PI_BIN || process.argv[1] || "pi";
+}
+
 function launchAwakenedPi(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }): Promise<void> {
   const child = spawn(command, args, { cwd: options.cwd, env: options.env, detached: true, stdio: "ignore" });
   return new Promise((resolve, reject) => {
@@ -572,7 +578,7 @@ export function createAgentBridge(
     },
   });
 
-  pi.registerTool({
+  const awakenTool = {
     name: "bridge_awaken",
     label: "Agent Bridge Awaken",
     description:
@@ -583,7 +589,7 @@ export function createAgentBridge(
       request: Type.String({ description: "Bounded question or task for the awakened child." }),
       workUnitUUID: Type.Optional(Type.String({ description: "Optional same-scope WorkUnit for the child." })),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId: string, params: Record<string, any>) {
       if (!actor) throw new Error("Agent Bridge is not attached to an active session");
       const request = String(params.request ?? "").trim();
       if (!request || request.length > 4_000) throw new Error("Awaken request must contain 1 to 4000 characters");
@@ -606,14 +612,10 @@ export function createAgentBridge(
           "Coordinate directly with your parent through Agent Bridge when needed.",
           `Awakening request: ${request}`,
         ].join("\n\n");
-        await awakenLauncher(
-          process.env.AGENT_BRIDGE_PI_BIN || "pi",
-          ["--fork", sessionFile, "--name", `awakened-${target.session_uuid.slice(0, 8)}`, prompt],
-          {
-            cwd: target.cwd,
-            env: { ...process.env, AGENT_BRIDGE_LAUNCH_UUID: launchUUID, AGENT_BRIDGE_WORK_UNIT_UUID: workUnitUUID },
-          },
-        );
+        await awakenLauncher(piExecutable(), ["--fork", sessionFile, "--name", `awakened-${target.session_uuid.slice(0, 8)}`, prompt], {
+          cwd: target.cwd,
+          env: { ...process.env, AGENT_BRIDGE_LAUNCH_UUID: launchUUID, AGENT_BRIDGE_WORK_UNIT_UUID: workUnitUUID },
+        });
         awakenScheduler(() => {
           void (async () => {
             const launch = await call<{ child_actor_uuid?: string; terminated_at?: string }>("launch.get", { launch_uuid: launchUUID });
@@ -639,7 +641,8 @@ export function createAgentBridge(
         details: { launch_uuid: launchUUID, source_actor: target.address, work_unit_uuid: workUnitUUID },
       };
     },
-  });
+  };
+  pi.registerTool(awakenTool);
 
   pi.registerCommand("awaken", {
     description: "Fork a dead Pi session into an awakened child: /awaken <actor> <request>",
@@ -650,7 +653,7 @@ export function createAgentBridge(
         return;
       }
       try {
-        const result = await pi.tools.get("bridge_awaken")?.execute("/awaken", { target, request: request.join(" ") });
+        const result = await awakenTool.execute("/awaken", { target, request: request.join(" ") });
         ctx.ui.notify(result?.content?.[0]?.text ?? "Awakening started.", "info");
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");

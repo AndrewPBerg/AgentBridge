@@ -116,10 +116,12 @@ describe("Go Agent Bridge adapter", () => {
     expect(result.details.source_actor).toBe(dead.address);
     expect(client.call).toHaveBeenCalledWith("launch.create", expect.objectContaining({ parent_actor_uuids: [parent.address] }));
     expect(launches).toHaveLength(1);
-    expect(launches[0]?.command).toBe("pi");
+    expect(launches[0]?.command).toBe(process.argv[1] || "pi");
     expect(launches[0]?.args.slice(0, 2)).toEqual(["--fork", "/sessions/dead.jsonl"]);
     expect(launches[0]?.options.env.AGENT_BRIDGE_LAUNCH_UUID).toBe(result.details.launch_uuid);
-    expect(scheduled).toHaveLength(1);
+    await pi.commands.get("awaken").handler(`${dead.address} Compare the style change.`, ctx);
+    expect(launches).toHaveLength(2);
+    expect(scheduled).toHaveLength(2);
     expect(scheduled[0]?.delayMillis).toBe(30_000);
     scheduled[0]?.callback();
     await vi.waitFor(() =>
