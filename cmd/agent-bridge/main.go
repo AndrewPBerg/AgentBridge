@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/AndrewPBerg/agent-bridge/internal/client"
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
@@ -34,6 +35,7 @@ func main() {
 
 //nolint:cyclop // startup keeps ownership, replay, projection, Watchman, and serving in one ordered lifecycle.
 func serve(args []string) error {
+	startupStarted := time.Now()
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	socket := flags.String("socket", defaultSocket(), "Unix socket path")
 	journalPath := flags.String("journal", defaultJournal(), "append-only event journal")
@@ -48,6 +50,14 @@ func serve(args []string) error {
 		if err := migrateLegacyJournal(*journalPath); err != nil {
 			return err
 		}
+	}
+	lock, err := acquireDaemonLock()
+	if err != nil {
+		return fmt.Errorf("acquire daemon startup lock: %w", err)
+	}
+	defer closeQuietly(lock)
+	if err := removeStaleDaemonMetadata(); err != nil {
+		return fmt.Errorf("reconcile daemon metadata: %w", err)
 	}
 	metadata, err := newDaemonMetadata(*socket, *databasePath, *journalPath)
 	if err != nil {
@@ -74,6 +84,7 @@ func serve(args []string) error {
 	if projectedSequence > uint64(len(events)) {
 		return fmt.Errorf("provenance projection sequence %d is ahead of journal sequence %d", projectedSequence, len(events))
 	}
+	backfillCount := len(events) - int(projectedSequence)
 	if err := database.ProjectAll(events[projectedSequence:]); err != nil {
 		return fmt.Errorf("backfill provenance database: %w", err)
 	}
@@ -91,7 +102,7 @@ func serve(args []string) error {
 	defer stop()
 	watchManager := watchsidecar.New(engine)
 	go watchManager.Run(ctx)
-	fmt.Fprintf(os.Stderr, "agent-bridge listening on %s (replayed %d events, provenance %s, watchman %t)\n", *socket, len(events), *databasePath, watchManager.Available())
+	fmt.Fprintf(os.Stderr, "agent-bridge listening on %s (ready in %s, replayed %d events, backfilled %d, provenance %s, watchman %t)\n", *socket, time.Since(startupStarted).Round(time.Millisecond), len(events), backfillCount, *databasePath, watchManager.Available())
 	return server.NewWithProvenance(engine, database, *socket, appender).Serve(ctx)
 }
 

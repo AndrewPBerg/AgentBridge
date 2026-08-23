@@ -605,14 +605,27 @@ func (d *DB) Snapshot(path string) error {
 	return nil
 }
 
-// ProjectAll projects events into the provenance database.
+// ProjectAll projects a replay/backfill batch in one atomic transaction. A
+// per-event commit made startup proportional to fsync latency and turned a
+// schema re-projection into tens of thousands of durable commits.
 func (d *DB) ProjectAll(events []protocol.Event) error {
-	for _, event := range events {
-		if err := d.Project(event); err != nil {
+	if len(events) == 0 {
+		return nil
+	}
+	transaction, err := d.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer rollbackProjection(transaction)
+	for index := range events {
+		if _, err := d.projectEvent(transaction, &events[index]); err != nil {
 			return err
 		}
 	}
-	return nil
+	if err := transaction.Commit(); err != nil {
+		return err
+	}
+	return secureDatabaseFiles(d.path)
 }
 
 // Project projects one event into the provenance database.
@@ -623,37 +636,44 @@ func (d *DB) Project(event protocol.Event) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err := transaction.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			log.Printf("agent-bridge: rollback provenance projection transaction: %v", err)
-		}
-	}()
-	result, err := transaction.ExecContext(context.Background(), `INSERT OR IGNORE INTO events(sequence, type, at, data) VALUES (?, ?, ?, ?)`,
-		event.Sequence, event.Type, event.At.UTC().Format(time.RFC3339Nano), string(event.Data))
-	if err != nil {
-		return fmt.Errorf("record provenance event %d: %w", event.Sequence, err)
-	}
-	inserted, err := result.RowsAffected()
+	defer rollbackProjection(transaction)
+	inserted, err := d.projectEvent(transaction, &event)
 	if err != nil {
 		return err
 	}
-	if inserted == 0 {
-		var existingType, existingData string
-		if err := transaction.QueryRowContext(context.Background(), `SELECT type, data FROM events WHERE sequence = ?`, event.Sequence).Scan(&existingType, &existingData); err != nil {
-			return fmt.Errorf("check duplicate provenance event %d: %w", event.Sequence, err)
-		}
-		if existingType != event.Type || existingData != string(event.Data) {
-			return fmt.Errorf("conflicting provenance event sequence %d", event.Sequence)
-		}
+	if !inserted {
 		return nil
-	}
-	if err := d.projectDomain(transaction, &event); err != nil {
-		return err
 	}
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
 	return secureDatabaseFiles(d.path)
+}
+
+func (d *DB) projectEvent(transaction *sql.Tx, event *protocol.Event) (bool, error) {
+	result, err := transaction.ExecContext(context.Background(), `INSERT OR IGNORE INTO events(sequence, type, at, data) VALUES (?, ?, ?, ?)`,
+		event.Sequence, event.Type, event.At.UTC().Format(time.RFC3339Nano), string(event.Data))
+	if err != nil {
+		return false, fmt.Errorf("record provenance event %d: %w", event.Sequence, err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if inserted == 0 {
+		var existingType, existingData string
+		if err := transaction.QueryRowContext(context.Background(), `SELECT type, data FROM events WHERE sequence = ?`, event.Sequence).Scan(&existingType, &existingData); err != nil {
+			return false, fmt.Errorf("check duplicate provenance event %d: %w", event.Sequence, err)
+		}
+		if existingType != event.Type || existingData != string(event.Data) {
+			return false, fmt.Errorf("conflicting provenance event sequence %d", event.Sequence)
+		}
+		return false, nil
+	}
+	if err := d.projectDomain(transaction, event); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (d *DB) projectDomain(transaction *sql.Tx, event *protocol.Event) error {

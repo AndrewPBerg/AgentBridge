@@ -45,7 +45,51 @@ func removeQuietly(path string) {
 	}
 }
 
-func pidfilePath() string { return filepath.Join(stateDir(), "daemon.pid") }
+func pidfilePath() string    { return filepath.Join(stateDir(), "daemon.pid") }
+func daemonLockPath() string { return filepath.Join(stateDir(), "daemon.lock") }
+
+// acquireDaemonLock holds a kernel-backed singleton lock for the daemon's
+// lifetime. Unlike the pidfile, flock ownership is released automatically on
+// process exit, including crashes and forced service stops.
+func acquireDaemonLock() (*os.File, error) {
+	path := daemonLockPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		closeQuietly(file)
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, errors.New("daemon startup lock is held by another process")
+		}
+		return nil, err
+	}
+	return file, nil
+}
+
+// removeStaleDaemonMetadata is safe only while holding daemonLockPath. A live
+// verified owner is never removed; dead metadata cannot block crash recovery.
+func removeStaleDaemonMetadata() error {
+	data, err := os.ReadFile(pidfilePath())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var metadata daemonMetadata
+	if json.Unmarshal(data, &metadata) == nil && metadataOwner(metadata) {
+		return errors.New("daemon pidfile belongs to a running process")
+	}
+	if err := os.Remove(pidfilePath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func newDaemonMetadata(socket, database, journal string) (daemonMetadata, error) {
 	e, err := os.Executable()
 	if err != nil {

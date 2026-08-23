@@ -456,6 +456,32 @@ func setupTursoProjectionFixture(t *testing.T) (*DB, protocol.Actor, string) {
 	return database, actor, path
 }
 
+func TestProjectAllRollsBackWholeBackfillOnFailure(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
+	events := []protocol.Event{
+		event(t, 1, "unhandled.valid_event", map[string]string{"value": "kept only on commit"}),
+		event(t, 2, "launch.created", protocol.LaunchCreatedEvent{Launch: protocol.Launch{UUID: "not-a-uuid"}}),
+	}
+	if err := database.ProjectAll(events); err == nil {
+		t.Fatal("invalid backfill unexpectedly succeeded")
+	}
+	var count int
+	if err := database.db.QueryRowContext(context.Background(), `SELECT count(*) FROM events`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("failed backfill committed %d events", count)
+	}
+}
+
 func assertTursoProjectionQueries(t *testing.T, database *DB, actor *protocol.Actor, path string) {
 	assertTursoStatusAndScopes(t, database, actor)
 	assertTursoMutationQueries(t, database, actor)

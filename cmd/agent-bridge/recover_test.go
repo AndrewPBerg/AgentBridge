@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
@@ -28,6 +29,38 @@ func TestResolveMetadataOwnerRefusesLiveIdentityMismatch(t *testing.T) {
 	owned, err := resolveMetadataOwner(metadata)
 	require.False(t, owned)
 	require.ErrorContains(t, err, "still alive")
+}
+
+func TestDaemonLockSerializesStartupAndReleasesOnClose(t *testing.T) {
+	t.Setenv("AGENT_BRIDGE_STATE_DIR", t.TempDir())
+	first, err := acquireDaemonLock()
+	require.NoError(t, err)
+	_, err = acquireDaemonLock()
+	require.ErrorContains(t, err, "startup lock is held")
+	require.NoError(t, first.Close())
+	second, err := acquireDaemonLock()
+	require.NoError(t, err)
+	require.NoError(t, second.Close())
+}
+
+func TestRemoveStaleDaemonMetadataPreservesLiveOwner(t *testing.T) {
+	t.Setenv("AGENT_BRIDGE_STATE_DIR", t.TempDir())
+	metadata, err := newDaemonMetadata("socket", "database", "journal")
+	require.NoError(t, err)
+	encoded, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(pidfilePath(), encoded, 0o600))
+	require.ErrorContains(t, removeStaleDaemonMetadata(), "running process")
+	_, err = os.Stat(pidfilePath())
+	require.NoError(t, err)
+
+	metadata.StartTicks++
+	encoded, err = json.Marshal(metadata)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(pidfilePath(), encoded, 0o600))
+	require.NoError(t, removeStaleDaemonMetadata())
+	_, err = os.Stat(pidfilePath())
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func TestRemoveUnreachableSocketRemovesStaleSocket(t *testing.T) {
