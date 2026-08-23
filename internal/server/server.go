@@ -200,6 +200,7 @@ var requestHandlers = map[string]requestHandler{
 	"launch.create":               (*Server).handleLaunchCreate,
 	"launch.attach_child":         (*Server).handleLaunchAttachChild,
 	"launch.attach_work_unit":     (*Server).handleLaunchAttachWorkUnit,
+	"launch.terminate":            (*Server).handleLaunchTerminate,
 	"launch.get":                  (*Server).handleLaunchGet,
 	"direction.create":            (*Server).handleDirectionCreate,
 	"direction.get":               (*Server).handleDirectionGet,
@@ -496,6 +497,18 @@ func (s *Server) handleLaunchAttachWorkUnit(_ context.Context, request protocol.
 	launch, err := s.engine.AttachLaunchWorkUnit(value)
 	if err != nil {
 		return failure(request.ID, "launch_attach_work_unit_failed", err)
+	}
+	return success(request.ID, launch)
+}
+
+func (s *Server) handleLaunchTerminate(_ context.Context, request protocol.Request) protocol.Response {
+	value, err := params[protocol.LaunchTerminateParams](request)
+	if err != nil {
+		return failure(request.ID, "invalid_params", err)
+	}
+	launch, err := s.engine.TerminateLaunch(value)
+	if err != nil {
+		return failure(request.ID, "launch_terminate_failed", err)
 	}
 	return success(request.ID, launch)
 }

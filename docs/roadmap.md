@@ -1,11 +1,10 @@
 # Roadmap
-testing watchman
 
 ## Product direction
 
 Agent Bridge is a local coordination control plane for independently launched coding agents. Near-term work should strengthen the Pi vertical slice, preserve deterministic provenance as truth, and add semantic understanding only when concurrent work makes its cost useful.
 
-The checkpoint and WorkUnit substrate is complete. The next major capability is **Direction orchestration**: project-sized coordination over issues and sub-issues, while evidence-backed checkpoints and deterministic provenance remain the source of truth. Semantic extraction stays optional enrichment rather than coordination authority.
+Checkpoints, WorkUnits, the local Direction core, generic ticket context, explicit launch provenance, and the initial Watchman external-change substrate are implemented. The next product lane is deterministic workflow safety—mutation admission, observed-baseline protection, and controlled escalation to WTF workspaces—while evidence-backed checkpoints and provenance remain the source of truth. Semantic extraction stays optional enrichment rather than coordination authority.
 
 ## Landed foundation
 
@@ -227,7 +226,9 @@ Top-level workflow ordering and WorkUnit dependencies follow after this slice; t
 
 ## Phase 3 — Direction orchestration
 
-A Direction is a durable project above WorkUnits. It coordinates a coherent larger outcome that may be decomposed, reprioritized, and carried by different agents over time. This phase is intentionally hypothetical until the WorkUnit substrate demonstrates which project-level coordination queries are genuinely useful.
+**Status: local core landed; dependency/readiness and richer rollups remain.** Direction creation, lifecycle, session selection, WorkUnit attachment and nesting, repository-aware status rollups, and bounded non-Pi worker controls are implemented.
+
+A Direction is a durable project above WorkUnits. It coordinates a coherent larger outcome that may be decomposed, reprioritized, and carried by different agents over time.
 
 ### Project, issue, sub-issue, and evidence mapping
 
@@ -423,7 +424,7 @@ Immediate follow-up:
 
 Deferred after the immediate operability slice:
 
-- [ ] first-class `parent actor -> launch -> child actor -> optional WorkUnit` provenance with a stable launch UUID and harness attachment events;
+- [x] first-class `parent actor -> launch -> child actor -> optional WorkUnit` provenance with a stable launch UUID and harness attachment events;
 - [ ] warn when mutations occur in a scope related to an active WorkUnit but lack WorkUnit context;
 - [ ] correlate instrumented creation of brand-new paths by matching active create intent with `Before.Exists=false` before Watchman classifies it as unknown;
 - [ ] retire Watchman workspace watches after no active actor remains, with a bounded grace period;
@@ -436,9 +437,11 @@ Deferred after the immediate operability slice:
 
 Exit condition for the local slice: several agents can coordinate one project-shaped Direction containing issues and sub-issues, inspect deterministic readiness and blockers, and verify the integrated outcome from descendant checkpoint evidence without confusing project state, executable work, VCS state, or provenance boundaries.
 
-## Phase 4 — Generic ticket context
+## Phase 4 — Generic ticket context ✅
 
-Agent Bridge needs a low-friction local place to retain the ticket context a human or agent already has, without choosing Linear, GitHub, Jira, or any other tracker as its model. This phase is deliberately **local only**: tracker connectivity, OAuth, webhooks, remote mutation, synchronization, and cloud projection are deferred.
+**Status: complete.** Protocol normalization, replay-safe Direction and WorkUnit updates, immutable checkpoint tickets, relational projections, and the Pi `bridge_ticket` workflow are implemented. Provider-specific connectivity remains deferred.
+
+Agent Bridge provides a low-friction local place to retain ticket context without choosing Linear, GitHub, Jira, or any other tracker as its model. This phase is deliberately **local only**: tracker connectivity, OAuth, webhooks, remote mutation, synchronization, and cloud projection are deferred.
 
 ### Simple local contract
 
@@ -491,7 +494,9 @@ A human can mention any ticket-shaped context naturally; an agent can store it o
 
 ## Phase 5 — External-change provenance and safety work carried forward
 
-This lane may proceed alongside the checkpoint and WorkUnit substrates. Implement it in this order:
+**Status: initial unknown-actor, Watchman transport/baseline, continuity, and external-observation substrate landed.** Full stress acceptance and conservative correlation hardening remain active; observed-baseline write protection and destructive-operation admission have not landed.
+
+Continue this lane in this order:
 
 ```text
 unknown-actor substrate

@@ -7,6 +7,7 @@ import (
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
 )
 
+//nolint:cyclop // One end-to-end replay test keeps both mutable ticket aggregates aligned.
 func TestDirectionAndWorkUnitTicketUpdatesReplay(t *testing.T) {
 	engine, journal, now := newTestEngine(t)
 	actor := register(t, engine, "01234567-89ab-4def-8123-456789abcdef")

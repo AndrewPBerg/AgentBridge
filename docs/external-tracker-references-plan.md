@@ -1,5 +1,7 @@
 # Generic ticket context implementation plan
 
+**Status:** implemented in the local daemon and Pi vertical slice; provider adapters remain deferred.
+
 **WorkUnit:** `0ec39226-cb2f-4083-bcff-ac559e6533e6`
 
 ## Decision

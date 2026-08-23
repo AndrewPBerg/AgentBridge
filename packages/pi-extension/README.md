@@ -16,7 +16,7 @@ The adapter owns only Pi-specific behavior:
 - `/bridge` commands
 - `/checkpoint [kind]` human checkpoint declaration
 - `/work` WorkUnit creation and session selection
-- `bridge_message`, `bridge_collision`, and `bridge_checkpoint` tools
+- `bridge_awaken`, `bridge_message`, `bridge_collision`, and `bridge_checkpoint` tools
 
 The Go daemon owns actors, aliases, ordered durable queues, collision state, selector resolution, and event persistence.
 
@@ -47,6 +47,7 @@ The extension starts `agent-bridge serve` automatically when the socket is unava
 /work use <uuid>
 /work status | /work clear
 /checkpoint [manual|settled|handoff|test]
+/awaken <dead Pi actor> <bounded request>
 ```
 
 The talk overlay supports multi-select and an `All in this repo` recipient. It shows harness, state, cwd, and Git/JJ identity before sending.
@@ -59,6 +60,7 @@ The talk overlay supports multi-select and an `All in this repo` recipient. It s
 AGENT_BRIDGE_BIN        daemon binary, default: agent-bridge
 AGENT_BRIDGE_SOCKET     explicit Unix socket path
 AGENT_BRIDGE_STATE_DIR  state directory override (default: ~/.agent-bridge)
+AGENT_BRIDGE_PI_BIN     Pi executable for awakening (default: pi)
 ```
 
 ## Prototype boundary
@@ -68,3 +70,7 @@ Git repositories are first-class: the adapter reports repository/worktree roots,
 Mutation provenance records before/after metadata and SHA-256 hashes (not file contents), plus turn boundaries and compaction summaries, in the daemon's local Turso read model.
 
 Attribution is exact for Pi's direct `edit`/`write` tools and conservative for recognized shell operations (`jj restore`, `git restore`, `git checkout --`, `rm`, `mv`, and `cp`). Arbitrary shell scripts and external editors remain best-effort because filesystem events do not carry a reliable agent identity.
+
+## Awakening a dead Pi session
+
+`bridge_awaken` accepts a dead, same-workspace Pi actor and a bounded task, then forks its saved session into a detached Pi child. The original actor stays dead; the new child registers with a new identity, retains explicit launch provenance, joins the supplied or selected WorkUnit, and can use normal direct `bridge_message` communication. The child must re-read the repository and mailbox because its forked transcript may be stale. If the Pi process cannot start, the launch is durably marked terminated with the failure reason.

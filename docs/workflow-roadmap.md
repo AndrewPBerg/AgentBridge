@@ -186,18 +186,21 @@ A work unit spans Pi turns. A Pi turn, tool call, snapshot, description, and sem
 
 ## Current implementation baseline
 
-The current Pi adapter already:
+The current Pi adapter and daemon already:
 
-- registers sessions and heartbeat leases;
-- reports Git repository/worktree identity plus JJ workspace/change identity;
-- refreshes VCS identity every ten seconds;
-- uses `jj --ignore-working-copy` for passive, non-snapshotting inspection;
-- records mutation intent before recognized tools execute;
-- records file metadata and hashes before and after mutations;
-- records turn, compaction, session, collision, and mutation provenance;
-- detects recent exact-path intent overlap;
-- pushes durable collision messages; and
-- supports `open -> negotiating -> yielded -> resolved` collision state.
+- register sessions and heartbeat leases;
+- report Git repository/worktree identity plus JJ workspace/change identity;
+- refresh VCS identity every ten seconds;
+- use `jj --ignore-working-copy` for passive, non-snapshotting inspection;
+- record mutation intent before recognized tools execute;
+- record file metadata and hashes before and after mutations;
+- record turn, compaction, session, collision, and mutation provenance;
+- provide immutable checkpoints, WorkUnits, Directions, and local ticket context;
+- preserve explicit parent/launch/child provenance and optional WorkUnit attachment;
+- observe conservative external changes through Watchman;
+- detect recent exact-path intent overlap;
+- push durable collision messages; and
+- support `open -> negotiating -> yielded -> resolved` collision state.
 
 The current adapter does not yet:
 
@@ -207,7 +210,7 @@ The current adapter does not yet:
 - block a stale whole-file write;
 - serialize exact-path mutation attempts;
 - classify most mutating JJ commands;
-- represent per-agent work inside shared `@`;
+- associate WorkUnits with normalized JJ change relations;
 - synchronize workspace-wide JJ transitions; or
 - provide provenance-aware rewind.
 
@@ -610,24 +613,13 @@ Put stable norms in the prompt, recipes in skills, mechanics in the adapter, and
 
 ## Immediate next implementation slice
 
-The next disciplined slice is the **agent- and human-declared checkpoint substrate**. Checkpoints stand alone initially, but conceptually are child evidence records that a WorkUnit can own or link through an optional `work_unit_id`. An explicit checkpoint records an immutable evidence boundary, while WorkUnit composition, `/work <objective>`, and top-level ordering follow afterward.
+The checkpoint, WorkUnit, Direction, launch-provenance, and external-observation foundations now exist. The next disciplined workflow slice is **atomic mutation admission**, followed by **observed-baseline protection**:
 
-Why first:
+1. change `intent.begin` into an atomic `grant | wait | warn | block` decision;
+2. serialize overlapping exact-path mutation attempts while leaving disjoint work silent;
+3. expire leases on tool completion, cancellation, actor death, or bounded TTL;
+4. record complete file-read observations without treating partial reads as whole-file baselines;
+5. block high-confidence stale whole-file writes; and
+6. fixture-test both same-workspace success and escalation to a WTF workspace.
 
-- it establishes durable provenance without model dependence;
-- it gives agents and humans explicit stopping points;
-- it keeps checkpoint identity and evidence independently testable; and
-- it provides the stable child records from which future WorkUnits can be composed.
-
-Suggested order:
-
-1. add the minimal checkpoint protocol and declaration path;
-2. capture agent/human declaration source and immutable evidence identity;
-3. project deterministic evidence references and latest-checkpoint queries; and
-4. add replay, idempotency, and immutability tests.
-
-WorkUnit composition should later add the mutable objective/lifecycle envelope and `/work <objective>` behavior. Reserve known verbs such as `status`, `list`, `stop`, `handoff`, `resume`, and `attach` for future subcommands, with quoting/disambiguation for objectives beginning with them.
-
-### Later safety work
-
-Defer atomic mutation admission, path leases, and observed-baseline protection until the core workflow is useful. Preserve the existing collision observation behavior in the meantime; when implemented, admission should remain deterministic, auditable, and independent of semantic sidecars.
+This safety slice is the prerequisite for making shared-workspace execution the normal multi-agent default. WTF integration may begin with capability discovery and explicit isolation requests, but policy must continue to choose physical isolation whenever writers are uninstrumented, scopes are broad, or runtime resources conflict.

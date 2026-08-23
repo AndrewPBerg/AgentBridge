@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -34,8 +35,20 @@ const ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$/;
 type SessionsResult = { actors: ActorRecord[] };
 type PollResult = { messages: BridgeMessage[] | null };
 type IntentResult = { intent: MutationIntent; collisions: Collision[] };
+type AwakenLauncher = (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }) => Promise<void>;
 
-export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient()) {
+function launchAwakenedPi(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }): Promise<void> {
+  const child = spawn(command, args, { cwd: options.cwd, env: options.env, detached: true, stdio: "ignore" });
+  return new Promise((resolve, reject) => {
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+    child.once("error", reject);
+  });
+}
+
+export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient(), awakenLauncher: AwakenLauncher = launchAwakenedPi) {
   const openIntents = new Map<string, MutationIntent>();
   const deliveredInRuntime = new Set<string>();
   const pendingAcknowledgements = new Set<string>();
@@ -459,6 +472,26 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
     return (await call<SessionsResult>("sessions.list", { include_stale: false })).actors;
   }
 
+  async function dormantPiActor(selector: string): Promise<ActorRecord> {
+    const normalized = selector.trim().replace(/^@/, "");
+    if (!normalized) throw new Error("Awaken target is required");
+    const actors = (await call<SessionsResult>("sessions.list", { include_stale: true })).actors;
+    const matches = actors.filter(
+      (candidate) =>
+        candidate.state === "dead" &&
+        candidate.harness === "pi" &&
+        (candidate.address === normalized || candidate.session_uuid === normalized || candidate.alias === normalized),
+    );
+    if (matches.length !== 1) throw new Error(`Expected one dead Pi session for ${JSON.stringify(selector)}`);
+    const target = matches[0]!;
+    if (!target.session_file || !target.cwd) throw new Error("Dead Pi session has no resumable session file and working directory");
+    const scope = requireWorkUnitScope();
+    if (target.repository_uuid !== scope.repository_uuid || target.workspace_uuid !== scope.workspace_uuid) {
+      throw new Error("Dead Pi session belongs to a different repository or workspace");
+    }
+    return target;
+  }
+
   async function sessions(): Promise<string[]> {
     const [actors, herdrAgents] = await Promise.all([activeActors(), listHerdrAgents(pi)]);
     const bridge = { actors };
@@ -521,6 +554,81 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
         }
         await heartbeat(parts[0] === "on" ? "stealth" : ordinaryPresenceState());
         ctx.ui.notify(`Agent Bridge stealth mode ${parts[0] === "on" ? "enabled" : "disabled"}.`, "info");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "bridge_awaken",
+    label: "Agent Bridge Awaken",
+    description:
+      "Fork a dead same-workspace Pi session into a bounded child agent and give it a rehydration request. The original session remains dead; the child gets a new identity and can communicate directly through Agent Bridge.",
+    promptSnippet: "Awaken a dead Pi agent when the user explicitly requests it.",
+    parameters: Type.Object({
+      target: Type.String({ description: "Dead Pi actor address, session UUID, or @alias." }),
+      request: Type.String({ description: "Bounded question or task for the awakened child." }),
+      workUnitUUID: Type.Optional(Type.String({ description: "Optional same-scope WorkUnit for the child." })),
+    }),
+    async execute(_toolCallId, params) {
+      if (!actor) throw new Error("Agent Bridge is not attached to an active session");
+      const request = String(params.request ?? "").trim();
+      if (!request || request.length > 4_000) throw new Error("Awaken request must contain 1 to 4000 characters");
+      const target = await dormantPiActor(String(params.target ?? ""));
+      const sessionFile = target.session_file;
+      if (!sessionFile) throw new Error("Dead Pi session has no resumable session file");
+      let workUnitUUID: string | undefined;
+      if (params.workUnitUUID) {
+        workUnitUUID = (await fetchWorkUnit(canonicalUUID(params.workUnitUUID, "WorkUnit UUID"))).work_unit_uuid;
+      } else if (selectedWorkUnit) {
+        workUnitUUID = (await fetchWorkUnit(selectedWorkUnit.work_unit_uuid)).work_unit_uuid;
+      }
+      const launchUUID = randomUUID();
+      await call("launch.create", { launch_uuid: launchUUID, parent_actor_uuids: [actor.address] });
+      if (workUnitUUID) await call("launch.attach_work_unit", { launch_uuid: launchUUID, work_unit_uuid: workUnitUUID });
+      const prompt = [
+        "You are an awakened Agent Bridge child, forked from a dead Pi session.",
+        "Review the current repository state and your durable mailbox before acting; your prior transcript may be stale.",
+        "Coordinate directly with your parent through Agent Bridge when needed.",
+        `Awakening request: ${request}`,
+      ].join("\n\n");
+      try {
+        await awakenLauncher(
+          process.env.AGENT_BRIDGE_PI_BIN || "pi",
+          ["--fork", sessionFile, "--name", `awakened-${target.session_uuid.slice(0, 8)}`, prompt],
+          {
+            cwd: target.cwd,
+            env: { ...process.env, AGENT_BRIDGE_LAUNCH_UUID: launchUUID, AGENT_BRIDGE_WORK_UNIT_UUID: workUnitUUID },
+          },
+        );
+      } catch (error) {
+        await call("launch.terminate", { launch_uuid: launchUUID, reason: error instanceof Error ? error.message : String(error) });
+        throw error;
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Awakening launch ${launchUUID} started for ${target.address}. It will register as a new child identity and can then receive direct bridge messages.`,
+          },
+        ],
+        details: { launch_uuid: launchUUID, source_actor: target.address, work_unit_uuid: workUnitUUID },
+      };
+    },
+  });
+
+  pi.registerCommand("awaken", {
+    description: "Fork a dead Pi session into an awakened child: /awaken <actor> <request>",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const [target, ...request] = args.trim().split(/\s+/);
+      if (!target || request.length === 0) {
+        ctx.ui.notify("Usage: /awaken <dead Pi actor> <bounded request>", "warning");
+        return;
+      }
+      try {
+        const result = await pi.tools.get("bridge_awaken")?.execute("/awaken", { target, request: request.join(" ") });
+        ctx.ui.notify(result?.content?.[0]?.text ?? "Awakening started.", "info");
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
       }
@@ -1099,7 +1207,14 @@ export function createAgentBridge(pi: ExtensionAPI, client = new BridgeClient())
         heartbeat_at: now,
       } satisfies ActorRecord,
     });
-    await recordSessionEvent("session.started", { data: { reason: event.reason } });
+    const workUnitUUID = process.env.AGENT_BRIDGE_WORK_UNIT_UUID;
+    if (workUnitUUID !== undefined) {
+      canonicalUUID(workUnitUUID, "Agent Bridge WorkUnit UUID");
+      const inheritedWorkUnit = await fetchWorkUnit(workUnitUUID);
+      await call("work_unit.join", { work_unit_uuid: workUnitUUID, actor: actor.address });
+      await selectWorkUnit(inheritedWorkUnit);
+    }
+    await recordSessionEvent("session.started", { data: { reason: event.reason, work_unit_uuid: workUnitUUID } });
     await pollMailbox();
     heartbeatTimer = setInterval(() => void heartbeat(), HEARTBEAT_MS);
     heartbeatTimer.unref?.();

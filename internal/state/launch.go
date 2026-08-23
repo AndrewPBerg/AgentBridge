@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
 )
@@ -24,7 +25,7 @@ func normalizeLaunchParents(parents []string) ([]string, error) {
 	return result, nil
 }
 
-//nolint:cyclop // Immutable launch attachments require paired identity/time validation.
+//nolint:cyclop,gocognit // Immutable launch attachments require paired identity/time validation.
 func validateLaunch(launch *protocol.Launch) error {
 	if err := protocol.ValidateUUID(launch.UUID); err != nil {
 		return fmt.Errorf("launch_uuid: %w", err)
@@ -54,6 +55,12 @@ func validateLaunch(launch *protocol.Launch) error {
 	}
 	if launch.WorkUnitUUID == "" && launch.WorkUnitAttachedAt != nil {
 		return errors.New("unattached launch cannot have work_unit_attached_at")
+	}
+	if launch.TerminatedAt == nil && launch.TerminationReason != "" {
+		return errors.New("unterminated launch cannot have termination_reason")
+	}
+	if launch.TerminatedAt != nil && (launch.TerminationReason == "" || launch.ChildActor != "") {
+		return errors.New("invalid terminated launch")
 	}
 	return nil
 }
@@ -95,6 +102,9 @@ func (e *Engine) AttachLaunchChild(params protocol.LaunchChildAttachParams) (pro
 	if !ok {
 		return protocol.Launch{}, fmt.Errorf("unknown launch %q", params.LaunchUUID)
 	}
+	if launch.TerminatedAt != nil {
+		return protocol.Launch{}, fmt.Errorf("launch %q is terminated", params.LaunchUUID)
+	}
 	if err := protocol.ValidateUUID(params.ChildActor); err != nil {
 		return protocol.Launch{}, fmt.Errorf("child_actor_uuid: %w", err)
 	}
@@ -122,6 +132,9 @@ func (e *Engine) AttachLaunchWorkUnit(params protocol.LaunchWorkUnitAttachParams
 	if !ok {
 		return protocol.Launch{}, fmt.Errorf("unknown launch %q", params.LaunchUUID)
 	}
+	if launch.TerminatedAt != nil {
+		return protocol.Launch{}, fmt.Errorf("launch %q is terminated", params.LaunchUUID)
+	}
 	if err := protocol.ValidateUUID(params.WorkUnitUUID); err != nil {
 		return protocol.Launch{}, fmt.Errorf("work_unit_uuid: %w", err)
 	}
@@ -136,6 +149,30 @@ func (e *Engine) AttachLaunchWorkUnit(params protocol.LaunchWorkUnitAttachParams
 	}
 	at := e.now().UTC()
 	if err := e.record("launch.work_unit_attached", protocol.LaunchWorkUnitAttachedEvent{LaunchUUID: launch.UUID, WorkUnitUUID: params.WorkUnitUUID, At: at}); err != nil {
+		return protocol.Launch{}, err
+	}
+	return e.launches[launch.UUID], nil
+}
+
+// TerminateLaunch records a launch failure before a child attaches.
+func (e *Engine) TerminateLaunch(params protocol.LaunchTerminateParams) (protocol.Launch, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	launch, ok := e.launches[params.LaunchUUID]
+	if !ok {
+		return protocol.Launch{}, fmt.Errorf("unknown launch %q", params.LaunchUUID)
+	}
+	if strings.TrimSpace(params.Reason) == "" {
+		return protocol.Launch{}, errors.New("launch termination reason is required")
+	}
+	if launch.ChildActor != "" {
+		return protocol.Launch{}, errors.New("cannot terminate attached launch")
+	}
+	if launch.TerminatedAt != nil {
+		return launch, nil
+	}
+	at := e.now().UTC()
+	if err := e.record("launch.terminated", protocol.LaunchTerminatedEvent{LaunchUUID: launch.UUID, Reason: params.Reason, At: at}); err != nil {
 		return protocol.Launch{}, err
 	}
 	return e.launches[launch.UUID], nil
@@ -177,6 +214,9 @@ func (e *Engine) applyLaunchChildAttached(attached protocol.LaunchChildAttachedE
 	if !ok {
 		return fmt.Errorf("unknown launch %q", attached.LaunchUUID)
 	}
+	if launch.TerminatedAt != nil {
+		return errors.New("cannot attach child to terminated launch")
+	}
 	if protocol.ValidateUUID(attached.LaunchUUID) != nil || protocol.ValidateUUID(attached.ChildActor) != nil || attached.At.IsZero() {
 		return errors.New("invalid launch child attachment")
 	}
@@ -195,34 +235,65 @@ func (e *Engine) applyLaunchChildAttached(attached protocol.LaunchChildAttachedE
 	return nil
 }
 
+func (e *Engine) applyLaunchTerminated(terminated protocol.LaunchTerminatedEvent) error {
+	launch, ok := e.launches[terminated.LaunchUUID]
+	if !ok {
+		return fmt.Errorf("unknown launch %q", terminated.LaunchUUID)
+	}
+	if protocol.ValidateUUID(terminated.LaunchUUID) != nil || strings.TrimSpace(terminated.Reason) == "" || terminated.At.IsZero() || launch.ChildActor != "" {
+		return errors.New("invalid launch termination")
+	}
+	if launch.TerminatedAt != nil {
+		if launch.TerminationReason == terminated.Reason && launch.TerminatedAt.Equal(terminated.At) {
+			return nil
+		}
+		return errors.New("launch already terminated")
+	}
+	at := terminated.At.UTC()
+	launch.TerminatedAt, launch.TerminationReason = &at, terminated.Reason
+	e.launches[launch.UUID] = launch
+	return nil
+}
+
 // launchFamilyAllows confines attached children to explicit parents and
 // same-WorkUnit siblings. Unattached actors retain the existing open policy.
 func (e *Engine) launchFamilyAllows(sender, recipient string) bool {
-	var senderLaunches, recipientLaunches []protocol.Launch
-	for _, launch := range e.launches {
-		if launch.ChildActor == sender {
-			senderLaunches = append(senderLaunches, launch)
-		}
-		if launch.ChildActor == recipient {
-			recipientLaunches = append(recipientLaunches, launch)
-		}
-	}
+	senderLaunches := e.launchIDsForChild(sender)
+	recipientLaunches := e.launchIDsForChild(recipient)
 	if len(senderLaunches) == 0 && len(recipientLaunches) == 0 {
 		return true
 	}
-	for _, launch := range senderLaunches {
-		if slices.Contains(launch.ParentActors, recipient) {
+	if e.launchesHaveParent(senderLaunches, recipient) || e.launchesHaveParent(recipientLaunches, sender) {
+		return true
+	}
+	return e.launchesShareWorkUnitAndParent(senderLaunches, recipientLaunches)
+}
+
+func (e *Engine) launchIDsForChild(actor string) []string {
+	result := []string{}
+	for uuid := range e.launches {
+		if e.launches[uuid].ChildActor == actor {
+			result = append(result, uuid)
+		}
+	}
+	return result
+}
+
+func (e *Engine) launchesHaveParent(launchUUIDs []string, actor string) bool {
+	for _, uuid := range launchUUIDs {
+		if slices.Contains(e.launches[uuid].ParentActors, actor) {
 			return true
 		}
 	}
-	for _, launch := range recipientLaunches {
-		if slices.Contains(launch.ParentActors, sender) {
-			return true
-		}
-	}
-	for _, left := range senderLaunches {
-		for _, right := range recipientLaunches {
-			if left.WorkUnitUUID != "" && left.WorkUnitUUID == right.WorkUnitUUID && sharesLaunchParent(left, right) {
+	return false
+}
+
+func (e *Engine) launchesShareWorkUnitAndParent(leftUUIDs, rightUUIDs []string) bool {
+	for _, leftUUID := range leftUUIDs {
+		left := e.launches[leftUUID]
+		for _, rightUUID := range rightUUIDs {
+			right := e.launches[rightUUID]
+			if left.WorkUnitUUID != "" && left.WorkUnitUUID == right.WorkUnitUUID && sharesLaunchParent(left.ParentActors, right.ParentActors) {
 				return true
 			}
 		}
@@ -230,9 +301,9 @@ func (e *Engine) launchFamilyAllows(sender, recipient string) bool {
 	return false
 }
 
-func sharesLaunchParent(left, right protocol.Launch) bool {
-	for _, parent := range left.ParentActors {
-		if slices.Contains(right.ParentActors, parent) {
+func sharesLaunchParent(left, right []string) bool {
+	for _, parent := range left {
+		if slices.Contains(right, parent) {
 			return true
 		}
 	}

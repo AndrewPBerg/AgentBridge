@@ -22,7 +22,7 @@ import (
 	_ "turso.tech/database/tursogo"
 )
 
-const projectionSchemaVersion = 18
+const projectionSchemaVersion = 19
 
 // DB stores and projects provenance events.
 type DB struct {
@@ -321,7 +321,7 @@ func initializeSchemaGroup2() []string {
 			actor_uuid BLOB NOT NULL, joined_at TEXT NOT NULL, left_at TEXT, participation_state TEXT NOT NULL,
 			PRIMARY KEY(work_unit_uuid, actor_uuid)
 		) STRICT`,
-		`CREATE TABLE IF NOT EXISTS launches (launch_uuid BLOB PRIMARY KEY, child_actor_uuid BLOB, work_unit_uuid BLOB REFERENCES work_units(work_unit_uuid), created_at TEXT NOT NULL, child_attached_at TEXT, work_unit_attached_at TEXT, created_sequence INTEGER NOT NULL, updated_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE IF NOT EXISTS launches (launch_uuid BLOB PRIMARY KEY, child_actor_uuid BLOB, work_unit_uuid BLOB REFERENCES work_units(work_unit_uuid), created_at TEXT NOT NULL, child_attached_at TEXT, work_unit_attached_at TEXT, terminated_at TEXT, termination_reason TEXT, created_sequence INTEGER NOT NULL, updated_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE IF NOT EXISTS launch_parent_actors (launch_uuid BLOB NOT NULL REFERENCES launches(launch_uuid) ON DELETE CASCADE, ordinal INTEGER NOT NULL, actor_uuid BLOB NOT NULL, PRIMARY KEY(launch_uuid, ordinal), UNIQUE(launch_uuid, actor_uuid)) STRICT`,
 		`CREATE INDEX IF NOT EXISTS launch_parent_actors_actor ON launch_parent_actors(actor_uuid, launch_uuid)`,
 		`CREATE INDEX IF NOT EXISTS launches_child_actor ON launches(child_actor_uuid)`,
@@ -494,7 +494,7 @@ func recreateBinaryProjectionTables(transaction *sql.Tx) error {
 		`CREATE TABLE external_changes (external_change_uuid BLOB PRIMARY KEY, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, unknown_actor_uuid BLOB NOT NULL, interval_started_at TEXT NOT NULL, interval_ended_at TEXT NOT NULL, continuity_state TEXT NOT NULL, change_kind TEXT NOT NULL, watchman_clock TEXT NOT NULL, before_json TEXT, after_json TEXT, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE external_change_paths (external_change_uuid BLOB NOT NULL REFERENCES external_changes(external_change_uuid) ON DELETE CASCADE, path TEXT NOT NULL, PRIMARY KEY(external_change_uuid, path)) STRICT`,
 		`CREATE TABLE external_change_intents (external_change_uuid BLOB NOT NULL REFERENCES external_changes(external_change_uuid) ON DELETE CASCADE, intent_id TEXT NOT NULL, PRIMARY KEY(external_change_uuid, intent_id)) STRICT`,
-		`CREATE TABLE launches (launch_uuid BLOB PRIMARY KEY, child_actor_uuid BLOB, work_unit_uuid BLOB REFERENCES work_units(work_unit_uuid), created_at TEXT NOT NULL, child_attached_at TEXT, work_unit_attached_at TEXT, created_sequence INTEGER NOT NULL, updated_sequence INTEGER NOT NULL) STRICT`,
+		`CREATE TABLE launches (launch_uuid BLOB PRIMARY KEY, child_actor_uuid BLOB, work_unit_uuid BLOB REFERENCES work_units(work_unit_uuid), created_at TEXT NOT NULL, child_attached_at TEXT, work_unit_attached_at TEXT, terminated_at TEXT, termination_reason TEXT, created_sequence INTEGER NOT NULL, updated_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE launch_parent_actors (launch_uuid BLOB NOT NULL REFERENCES launches(launch_uuid) ON DELETE CASCADE, ordinal INTEGER NOT NULL, actor_uuid BLOB NOT NULL, PRIMARY KEY(launch_uuid, ordinal), UNIQUE(launch_uuid, actor_uuid)) STRICT`,
 		`CREATE INDEX launch_parent_actors_actor ON launch_parent_actors(actor_uuid, launch_uuid)`,
 		`CREATE INDEX launches_child_actor ON launches(child_actor_uuid)`,
@@ -663,6 +663,7 @@ func (d *DB) projectDomain(transaction *sql.Tx, event *protocol.Event) error {
 		"message.acked": projectMessageAcked, "session.event": projectSessionEvent,
 		"test.result": projectTestResult, "launch.created": projectLaunchCreated,
 		"launch.child_attached": projectLaunchChildAttached, "launch.work_unit_attached": projectLaunchWorkUnitAttached,
+		"launch.terminated":      projectLaunchTerminated,
 		"direction.created":      projectDirectionCreated,
 		"direction.updated":      projectDirectionUpdated,
 		"direction.transitioned": projectDirectionTransitioned,
@@ -893,6 +894,25 @@ func projectLaunchWorkUnitAttached(transaction *sql.Tx, event *protocol.Event) e
 	return nil
 }
 
+func projectLaunchTerminated(transaction *sql.Tx, event *protocol.Event) error {
+	var terminated protocol.LaunchTerminatedEvent
+	if err := json.Unmarshal(event.Data, &terminated); err != nil {
+		return err
+	}
+	if protocol.ValidateUUID(terminated.LaunchUUID) != nil || strings.TrimSpace(terminated.Reason) == "" || terminated.At.IsZero() {
+		return errors.New("invalid launch termination")
+	}
+	result, err := transaction.ExecContext(context.Background(), `UPDATE launches SET terminated_at=?, termination_reason=?, updated_sequence=? WHERE launch_uuid=? AND child_actor_uuid IS NULL AND terminated_at IS NULL`, terminated.At.UTC().Format(time.RFC3339Nano), terminated.Reason, event.Sequence, uuidBlob(terminated.LaunchUUID))
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil || count != 1 {
+		return errors.New("launch termination references unknown, attached, or terminated launch")
+	}
+	return nil
+}
+
 func ticketJSON(tickets protocol.Tickets) string {
 	data, err := json.Marshal(tickets)
 	if err != nil {
@@ -962,6 +982,7 @@ func projectDirectionUpdated(transaction *sql.Tx, event *protocol.Event) error {
 	_, err = transaction.ExecContext(context.Background(), `UPDATE directions SET objective=?, success_criteria=?, constraints=?, context=?, updated_at=?, tickets_json=?, updated_sequence=? WHERE direction_uuid=?`, updated.Result.Objective, nullable(updated.Result.SuccessCriteria), nullable(updated.Result.Constraints), nullable(updated.Result.Context), updated.Result.UpdatedAt.UTC().Format(time.RFC3339Nano), ticketJSON(updated.Result.Tickets), event.Sequence, uuidBlob(updated.UUID))
 	return err
 }
+
 func loadProjectedDirection(transaction *sql.Tx, uuid string) (protocol.Direction, error) {
 	var result protocol.Direction
 	var id, creator []byte

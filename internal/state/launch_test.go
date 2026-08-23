@@ -59,6 +59,32 @@ func TestLaunchSupportsMultipleParentsAndReplayableAttachments(t *testing.T) {
 	}
 }
 
+func TestLaunchTerminationIsReplayableAndPreventsAttachment(t *testing.T) {
+	engine, journal, now := newTestEngine(t)
+	parent := register(t, engine, "parent")
+	child := register(t, engine, "child")
+	launchUUID := testActorUUID("launch")
+	if _, err := engine.CreateLaunch(protocol.LaunchCreateParams{LaunchUUID: launchUUID, ParentActors: []string{parent.Address}}); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(time.Second)
+	launch, err := engine.TerminateLaunch(protocol.LaunchTerminateParams{LaunchUUID: launchUUID, Reason: "pi unavailable"})
+	if err != nil || launch.TerminatedAt == nil || launch.TerminationReason != "pi unavailable" {
+		t.Fatalf("terminated launch = %#v, %v", launch, err)
+	}
+	if _, err := engine.AttachLaunchChild(protocol.LaunchChildAttachParams{LaunchUUID: launchUUID, ChildActor: child.Address}); err == nil {
+		t.Fatal("terminated launch accepted a child")
+	}
+	replayed, err := New(&memoryJournal{}, journal.events, Options{Now: func() time.Time { return *now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := replayed.Launch(launchUUID)
+	if err != nil || got.TerminatedAt == nil || got.TerminationReason != "pi unavailable" {
+		t.Fatalf("replayed terminated launch = %#v, %v", got, err)
+	}
+}
+
 func TestLaunchRejectsUnknownOrDuplicateParents(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
 	parent := register(t, engine, "parent")

@@ -79,6 +79,97 @@ describe("Go Agent Bridge adapter", () => {
     checkpoints: [],
   });
 
+  it("awakens a dead same-scope Pi session as a launch-provenanced child", async () => {
+    const pi = createMockPi();
+    const parent = {
+      ...actor("11111111-1111-5111-8111-111111111111"),
+      repository_uuid: repositoryUUID,
+      workspace_uuid: workspaceUUID,
+    };
+    const dead = {
+      ...actor("44444444-4444-5444-8444-444444444444"),
+      state: "dead" as const,
+      repository_uuid: repositoryUUID,
+      workspace_uuid: workspaceUUID,
+      session_file: "/sessions/dead.jsonl",
+      cwd: "/repo",
+    };
+    const client = mockClient((method) => {
+      if (method === "actor.register" || method === "actor.heartbeat") return parent;
+      if (method === "sessions.list") return { actors: [parent, dead] };
+      if (method === "launch.create" || method === "launch.attach_work_unit") return {};
+      return undefined;
+    });
+    const launches: Array<{ command: string; args: string[]; options: { cwd: string; env: NodeJS.ProcessEnv } }> = [];
+    createAgentBridge(pi, client, async (command, args, options) => {
+      launches.push({ command, args, options });
+    });
+    const ctx = context();
+    await pi.events.get("session_start")?.[0]?.({ reason: "startup" }, ctx);
+    const result = await pi.tools.get("bridge_awaken").execute("awaken", { target: dead.address, request: "Compare the style change." });
+    expect(result.details.source_actor).toBe(dead.address);
+    expect(client.call).toHaveBeenCalledWith("launch.create", expect.objectContaining({ parent_actor_uuids: [parent.address] }));
+    expect(launches).toHaveLength(1);
+    expect(launches[0]?.command).toBe("pi");
+    expect(launches[0]?.args.slice(0, 2)).toEqual(["--fork", "/sessions/dead.jsonl"]);
+    expect(launches[0]?.options.env.AGENT_BRIDGE_LAUNCH_UUID).toBe(result.details.launch_uuid);
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("inherits and selects a launch-provided WorkUnit", async () => {
+    vi.stubEnv("AGENT_BRIDGE_WORK_UNIT_UUID", defaultWorkUnitUUID);
+    try {
+      const pi = createMockPi();
+      const parent = {
+        ...actor("11111111-1111-5111-8111-111111111111"),
+        repository_uuid: repositoryUUID,
+        workspace_uuid: workspaceUUID,
+      };
+      const client = mockClient((method) => {
+        if (method === "actor.register" || method === "actor.heartbeat") return parent;
+        if (method === "provenance.work_unit") return workUnit();
+        if (method === "work_unit.join") return {};
+        return undefined;
+      });
+      const ctx = await start(pi, client);
+      expect(client.call).toHaveBeenCalledWith("provenance.work_unit", { work_unit_uuid: defaultWorkUnitUUID });
+      expect(client.call).toHaveBeenCalledWith("work_unit.join", { work_unit_uuid: defaultWorkUnitUUID, actor: parent.address });
+      await pi.commands.get("work").handler("status", ctx);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("ship orchestration"), "info");
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("records a terminated launch when child spawning fails", async () => {
+    const pi = createMockPi();
+    const parent = { ...actor("11111111-1111-5111-8111-111111111111"), repository_uuid: repositoryUUID, workspace_uuid: workspaceUUID };
+    const dead = {
+      ...actor("44444444-4444-5444-8444-444444444444"),
+      state: "dead" as const,
+      repository_uuid: repositoryUUID,
+      workspace_uuid: workspaceUUID,
+      session_file: "/sessions/dead.jsonl",
+      cwd: "/repo",
+    };
+    const client = mockClient((method) => {
+      if (method === "actor.register" || method === "actor.heartbeat") return parent;
+      if (method === "sessions.list") return { actors: [parent, dead] };
+      return {};
+    });
+    createAgentBridge(pi, client, async () => {
+      throw new Error("pi unavailable");
+    });
+    const ctx = context();
+    await pi.events.get("session_start")?.[0]?.({ reason: "startup" }, ctx);
+    await expect(pi.tools.get("bridge_awaken").execute("awaken", { target: dead.address, request: "Compare style." })).rejects.toThrow(
+      "pi unavailable",
+    );
+    expect(client.call).toHaveBeenCalledWith("launch.terminate", expect.objectContaining({ reason: "pi unavailable" }));
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
   it("toggles explicit stealth mode and restores ordinary presence", async () => {
     const pi = createMockPi();
     const states: string[] = [];

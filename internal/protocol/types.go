@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -520,14 +521,20 @@ func ValidCheckpointClaimKind(kind string) bool {
 // protocol value snapshots remain comparable and replay-safe.
 type Tickets string
 
+// MaxTicketsJSONBytes bounds ticket context at protocol boundaries.
 const MaxTicketsJSONBytes = 64 * 1024
 
+// MarshalJSON returns the canonical ticket array.
+//
+//nolint:unparam // encoding/json requires the error result even though canonical storage cannot fail.
 func (tickets Tickets) MarshalJSON() ([]byte, error) {
 	if tickets == "" {
 		return []byte("[]"), nil
 	}
 	return []byte(tickets), nil
 }
+
+// UnmarshalJSON validates and canonicalizes ticket context.
 func (tickets *Tickets) UnmarshalJSON(data []byte) error {
 	canonical, err := canonicalTicketsJSON(data)
 	if err != nil {
@@ -536,6 +543,8 @@ func (tickets *Tickets) UnmarshalJSON(data []byte) error {
 	*tickets = Tickets(canonical)
 	return nil
 }
+
+// NormalizeTickets returns a canonical, bounded ticket array.
 func NormalizeTickets(tickets Tickets) (Tickets, error) {
 	if tickets == "" {
 		return Tickets("[]"), nil
@@ -546,6 +555,7 @@ func NormalizeTickets(tickets Tickets) (Tickets, error) {
 	}
 	return Tickets(canonical), nil
 }
+
 func canonicalTicketsJSON(data []byte) ([]byte, error) {
 	if len(data) > MaxTicketsJSONBytes {
 		return nil, fmt.Errorf("tickets JSON exceeds %d bytes", MaxTicketsJSONBytes)
@@ -561,7 +571,7 @@ func canonicalTicketsJSON(data []byte) ([]byte, error) {
 	}
 	array, ok := value.([]any)
 	if !ok {
-		return nil, fmt.Errorf("tickets must be a JSON array")
+		return nil, errors.New("tickets must be a JSON array")
 	}
 	for i, item := range array {
 		if _, ok := item.(map[string]any); !ok {
@@ -577,6 +587,8 @@ func canonicalTicketsJSON(data []byte) ([]byte, error) {
 	}
 	return canonical, nil
 }
+
+//nolint:gocognit // Recursive token decoding keeps duplicate-key rejection at every object depth.
 func decodeTicketValue(decoder *json.Decoder) (any, error) {
 	token, err := decoder.Token()
 	if err != nil {
@@ -590,7 +602,10 @@ func decodeTicketValue(decoder *json.Decoder) (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			key := keyToken.(string)
+			key, ok := keyToken.(string)
+			if !ok {
+				return nil, errors.New("JSON object key must be a string")
+			}
 			if _, exists := object[key]; exists {
 				return nil, fmt.Errorf("duplicate JSON key %q", key)
 			}
@@ -617,11 +632,12 @@ func decodeTicketValue(decoder *json.Decoder) (any, error) {
 		return token, nil
 	}
 }
+
 func ensureTicketEOF(decoder *json.Decoder) error {
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
 		if err == nil {
-			return fmt.Errorf("tickets must contain one JSON value")
+			return errors.New("tickets must contain one JSON value")
 		}
 		return err
 	}
@@ -869,6 +885,8 @@ type Launch struct {
 	CreatedAt          time.Time  `json:"created_at"`
 	ChildAttachedAt    *time.Time `json:"child_attached_at,omitempty"`
 	WorkUnitAttachedAt *time.Time `json:"work_unit_attached_at,omitempty"`
+	TerminatedAt       *time.Time `json:"terminated_at,omitempty"`
+	TerminationReason  string     `json:"termination_reason,omitempty"`
 }
 
 // LaunchCreatedEvent is an immutable launch declaration.
@@ -890,6 +908,13 @@ type LaunchWorkUnitAttachedEvent struct {
 	At           time.Time `json:"at"`
 }
 
+// LaunchTerminatedEvent records a harness launch that failed before a child attached.
+type LaunchTerminatedEvent struct {
+	LaunchUUID string    `json:"launch_uuid"`
+	Reason     string    `json:"reason"`
+	At         time.Time `json:"at"`
+}
+
 // LaunchCreateParams creates a launch with its complete explicit parent set.
 type LaunchCreateParams struct {
 	LaunchUUID   string   `json:"launch_uuid"`
@@ -906,6 +931,12 @@ type LaunchChildAttachParams struct {
 type LaunchWorkUnitAttachParams struct {
 	LaunchUUID   string `json:"launch_uuid"`
 	WorkUnitUUID string `json:"work_unit_uuid"`
+}
+
+// LaunchTerminateParams records a failed harness launch.
+type LaunchTerminateParams struct {
+	LaunchUUID string `json:"launch_uuid"`
+	Reason     string `json:"reason"`
 }
 
 // TransitionParams is a protocol value.

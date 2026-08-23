@@ -210,7 +210,8 @@ func (e *Engine) MatchIntentTransition(workspaceUUID, path string, before, after
 // exact-path mutations conflict with an external observation.
 func (e *Engine) activeIntentActorsForPathLocked(workspaceUUID, path string) []string {
 	actors := make(map[string]struct{})
-	for _, intent := range e.intents {
+	for id := range e.intents {
+		intent := e.intents[id]
 		if intent.WorkspaceUUID == workspaceUUID && intent.CompletedAt == nil && slices.Contains(intent.Paths, path) {
 			actors[intent.Actor] = struct{}{}
 		}

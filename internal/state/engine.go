@@ -348,6 +348,12 @@ func (e *Engine) apply(event protocol.Event) error {
 			return err
 		}
 		return e.applyLaunchWorkUnitAttached(attached)
+	case "launch.terminated":
+		terminated, err := decode[protocol.LaunchTerminatedEvent](event)
+		if err != nil {
+			return err
+		}
+		return e.applyLaunchTerminated(terminated)
 	case "direction.created":
 		created, err := decode[protocol.DirectionCreatedEvent](event)
 		if err != nil {
@@ -1134,6 +1140,8 @@ func (e *Engine) CreateDirection(direction protocol.Direction) (protocol.Directi
 }
 
 // UpdateDirection updates mutable direction fields, including ticket context.
+//
+//nolint:cyclop // Each optional field is independently patchable at this API boundary.
 func (e *Engine) UpdateDirection(params protocol.DirectionUpdateParams) (protocol.Direction, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1273,7 +1281,7 @@ func sameWorkUnitScope(unit protocol.WorkUnit, actor protocol.Actor) bool {
 
 // CreateWorkUnit creates a work unit.
 //
-//nolint:cyclop,gocritic // Validation and idempotency are kept at the public API boundary.
+//nolint:cyclop,gocognit,gocritic // Validation and idempotency are kept at the public API boundary.
 func (e *Engine) CreateWorkUnit(unit protocol.WorkUnit) (protocol.WorkUnit, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()

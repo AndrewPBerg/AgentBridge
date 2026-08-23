@@ -15,6 +15,8 @@ import (
 // TestLaunchAttachmentStressOverUnixSocket simulates a Pi parent launching
 // several Luna sessions: each child presents only its own actor identity and
 // the explicit launch UUID during registration. Parentage is never inferred.
+//
+//nolint:cyclop,gocognit // The socket stress journey intentionally covers setup, concurrency, replay-visible reads, and shutdown.
 func TestLaunchAttachmentStressOverUnixSocket(t *testing.T) {
 	engine, err := state.New(memoryAppender{}, nil, state.Options{})
 	if err != nil {
