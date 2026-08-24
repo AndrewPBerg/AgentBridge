@@ -88,6 +88,20 @@ func testActor(root string) protocol.Actor {
 	}
 }
 
+func TestProcessorIgnoresGeneratedAndRuntimePaths(t *testing.T) {
+	root := t.TempDir()
+	actor := testActor(root)
+	processor := newProcessor(&fakeCoordination{}, &actor)
+	for _, relative := range []string{".venv/lib/module.py", ".next/trace", "pkg/__pycache__/module.pyc", "dist/bundle.js", "logs/audit.log", "tsconfig.tsbuildinfo", "coverage.out"} {
+		if processor.acceptedPath(filepath.Join(root, relative)) {
+			t.Errorf("accepted generated path %q", relative)
+		}
+	}
+	if !processor.acceptedPath(filepath.Join(root, "src", "service.py")) {
+		t.Fatal("rejected source path")
+	}
+}
+
 func TestProcessorRecordsOnlyUnexplainedStateTransitions(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "file.txt")

@@ -50,7 +50,9 @@ The extension starts `agent-bridge serve` automatically when the socket is unava
 /awaken <dead Pi actor> <bounded request>
 ```
 
-The talk overlay supports multi-select and an `All in this repo` recipient. It shows harness, state, cwd, and Git/JJ identity before sending.
+The talk overlay supports multi-select and an `All in this repo` recipient.
+
+**Identity note:** Pi session UUIDs (including IDs copied from the Pi session UI) can differ from Agent Bridge actor addresses. Use the Agent Bridge binding or `/bus list` to discover the actor UUID/address and pass it directly to `bridge_message`; `bridge_awaken` accepts a Pi session UUID for recovery. The overlay shows harness, state, cwd, and Git/JJ identity before sending.
 
 `/bridge` remains as a deprecated compatibility alias (`sessions→list`, `send→talk`).
 
@@ -76,3 +78,10 @@ Attribution is exact for Pi's direct `edit`/`write` tools and conservative for r
 `bridge_awaken` accepts a dead, same-workspace Pi actor and a bounded task, then forks its saved session into a detached Pi child. The original actor stays dead; the new child registers with a new identity, retains explicit launch provenance, and selects the supplied or inherited WorkUnit. Launch-family policy limits direct `bridge_message` communication to explicit parents and same-parent, same-WorkUnit siblings. The child must re-read the repository and mailbox because its forked transcript may be stale.
 
 A created launch is terminated with an auditable reason when WorkUnit attachment or process spawning fails. After a successful OS spawn, the parent adapter checks for child registration after 30 seconds and terminates an orphaned launch if no child attached. Cross-process reconciliation after the parent adapter exits remains future daemon lifecycle work.
+
+
+## Coordination guidance
+
+The extension supports lazy coordination: load the coordination tool domain only when actor discovery, messaging, Direction/WorkUnit status, or a durable checkpoint is needed. Use actor UUIDs directly. Agent-callable `bridge_work` can propose without joining, then explicitly join/use a proposal; the human shortcut `/work <objective>` still proposes and joins in one step. Use transient `bridge_message` for requests and durable `bridge_checkpoint` for proposals, findings, decisions, handoffs, collision resolutions, and verified evidence. Keep peer lenses provisional and asymmetric (for example correctness versus compatibility), and keep the graph sparse: one useful peer edge is better than all-to-all chatter. `ASK:` requests a bounded reply, `FYI:` requires none, and `Oi! Quiet.`/`QUIET:` ends chatter without acknowledgement.
+
+Deployment is versioned and checked as one unit. `./scripts/install-pi-extension.sh --check` verifies the installed extension, skill, and shared digest without changing files.

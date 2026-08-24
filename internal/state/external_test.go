@@ -1,6 +1,7 @@
 package state
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -47,6 +48,41 @@ func TestExternalChangeUsesDeterministicUnknownActorAndWorkspaceScope(t *testing
 	outside.ChangeKind = "created"
 	if _, err := engine.ObserveExternalChange(outside); err == nil {
 		t.Fatal("out-of-workspace external path was accepted")
+	}
+}
+
+func TestProjectedExternalChangeReplayDoesNotRequirePayload(t *testing.T) {
+	engine, err := New(&memoryJournal{}, []protocol.Event{{Version: protocol.Version, Sequence: 1, Type: "external_change.observed"}}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(engine.externalChanges) != 0 {
+		t.Fatalf("projected external replay populated cache: %#v", engine.externalChanges)
+	}
+}
+
+func TestExternalChangeCacheIsBounded(t *testing.T) {
+	engine, _, now := newTestEngine(t)
+	actor := register(t, engine, "external-cache")
+	firstID := testActorUUID("external-cache-0")
+	for index := 0; index <= externalChangeCacheLimit; index++ {
+		id := testActorUUID(fmt.Sprintf("external-cache-%d", index))
+		if _, err := engine.ObserveExternalChange(protocol.ExternalChange{
+			ID: id, RepositoryUUID: actor.RepositoryUUID, WorkspaceUUID: actor.WorkspaceUUID,
+			IntervalStartedAt: *now, IntervalEndedAt: *now, ContinuityState: "current", ChangeKind: "modified",
+			Path: "/repo/file.txt",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(engine.externalChanges) != externalChangeCacheLimit {
+		t.Fatalf("external cache size = %d", len(engine.externalChanges))
+	}
+	if _, err := engine.ExternalChange(firstID); err == nil {
+		t.Fatal("oldest external change was not evicted")
+	}
+	if _, err := engine.ExternalChange(testActorUUID(fmt.Sprintf("external-cache-%d", externalChangeCacheLimit))); err != nil {
+		t.Fatalf("latest external change missing: %v", err)
 	}
 }
 

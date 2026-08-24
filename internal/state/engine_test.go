@@ -584,8 +584,8 @@ func TestSessionsMarksExpiredActorsDead(t *testing.T) {
 	if len(actors) != 1 || actors[0].State != "dead" {
 		t.Fatalf("expired actor state = %#v", actors)
 	}
-	if len(journal.events) != 2 {
-		t.Fatalf("expected persisted death transition, got %d events", len(journal.events))
+	if len(journal.events) != 1 {
+		t.Fatalf("session reads must not persist expiry transitions, got %d events", len(journal.events))
 	}
 	if live := engine.Sessions(false); len(live) != 0 {
 		t.Fatalf("expired actor still considered live: %#v", live)

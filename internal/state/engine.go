@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,8 +18,9 @@ import (
 )
 
 const (
-	defaultActorTTL     = 12 * time.Second
-	defaultRecentWindow = 30 * time.Second
+	defaultActorTTL          = 60 * time.Second
+	defaultRecentWindow      = 30 * time.Second
+	externalChangeCacheLimit = 1024
 )
 
 // Appender persists state events.
@@ -41,30 +43,32 @@ type Engine struct {
 	actorTTL     time.Duration
 	recentWindow time.Duration
 
-	eventSequence      uint64
-	globalSequence     uint64
-	senderSequences    map[string]uint64
-	recipientSequences map[string]uint64
-	actors             map[string]protocol.Actor
-	intents            map[string]protocol.Intent
-	messages           map[string]protocol.Message
-	mailboxes          map[string][]string
-	collisions         map[string]protocol.Collision
-	collisionByKey     map[string]string
-	checkpoints        map[string]protocol.CheckpointRequest
-	intentSequence     map[string]uint64
-	messageSequence    map[string]uint64
-	collisionSequence  map[string]uint64
-	testResults        map[string]protocol.TestResult
-	testResultSequence map[string]uint64
-	workUnits          map[string]protocol.WorkUnit
-	workUnitActors     map[string]map[string]protocol.WorkUnitActor
-	workUnitChanges    map[string]map[string]protocol.WorkUnitChange
-	launches           map[string]protocol.Launch
-	directions         map[string]protocol.Direction
-	externalChanges    map[string]protocol.ExternalChange
-	continuity         map[string]protocol.WatchContinuity
-	poisoned           error
+	eventSequence        uint64
+	globalSequence       uint64
+	senderSequences      map[string]uint64
+	recipientSequences   map[string]uint64
+	actors               map[string]protocol.Actor
+	intents              map[string]protocol.Intent
+	messages             map[string]protocol.Message
+	mailboxes            map[string][]string
+	collisions           map[string]protocol.Collision
+	collisionByKey       map[string]string
+	checkpoints          map[string]protocol.CheckpointRequest
+	intentSequence       map[string]uint64
+	messageSequence      map[string]uint64
+	collisionSequence    map[string]uint64
+	testResults          map[string]protocol.TestResult
+	testResultSequence   map[string]uint64
+	workUnits            map[string]protocol.WorkUnit
+	workUnitActors       map[string]map[string]protocol.WorkUnitActor
+	workUnitChanges      map[string]map[string]protocol.WorkUnitChange
+	launches             map[string]protocol.Launch
+	directions           map[string]protocol.Direction
+	externalChanges      map[string]protocol.ExternalChange
+	externalChangeOrder  []string
+	externalChangeCursor int
+	continuity           map[string]protocol.WatchContinuity
+	poisoned             error
 }
 
 // Options configures an Engine.
@@ -223,6 +227,12 @@ func (e *Engine) apply(event protocol.Event) error {
 			e.applyLeaseMessage(lifecycle.Message, event.Sequence)
 		}
 	case "external_change.observed":
+		// Projected historical observations are query state, not coordination
+		// state. Startup may intentionally omit their payloads to avoid retaining
+		// hundreds of thousands of filesystem snapshots in memory.
+		if len(event.Data) == 0 {
+			break
+		}
 		change, err := decode[protocol.ExternalChange](event)
 		if err != nil {
 			return err
@@ -230,10 +240,9 @@ func (e *Engine) apply(event protocol.Event) error {
 		if err := validateExternalChange(change); err != nil {
 			return err
 		}
-		if existing, ok := e.externalChanges[change.ID]; ok && !reflect.DeepEqual(existing, change) {
-			return errors.New("conflicting external change replay")
+		if err := e.rememberExternalChange(change); err != nil {
+			return err
 		}
-		e.externalChanges[change.ID] = change
 	case "watch.continuity_lost", "watch.continuity_restored":
 		status, err := decode[protocol.WatchContinuity](event)
 		if err != nil {
@@ -729,6 +738,48 @@ func (e *Engine) Heartbeat(params protocol.HeartbeatParams) (protocol.Actor, err
 	return actor, nil
 }
 
+// AppendNext publishes and applies an event owned by another subsystem through
+// the engine's lock order. Routing lease events through this method keeps every
+// state transition ordered engine -> journal and avoids the inverse
+// journal -> engine observer deadlock.
+//
+//nolint:gocritic // SequencedAppender uses value events.
+func (e *Engine) AppendNext(event protocol.Event) (protocol.Event, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.poisoned != nil {
+		return event, fmt.Errorf("state engine is poisoned: %w", e.poisoned)
+	}
+	publisher, ok := e.journal.(SequencedAppender)
+	if !ok {
+		return event, errors.New("state journal does not allocate external event sequences")
+	}
+	published, err := publisher.AppendNext(event)
+	if err != nil {
+		return published, err
+	}
+	if published.Sequence != e.eventSequence+1 {
+		e.poisoned = fmt.Errorf("external event sequence %d is not contiguous after %d", published.Sequence, e.eventSequence)
+		return published, e.poisoned
+	}
+	if err := e.apply(published); err != nil {
+		e.eventSequence = published.Sequence
+		e.poisoned = fmt.Errorf("apply durable external event %d: %w", published.Sequence, err)
+		return published, e.poisoned
+	}
+	e.eventSequence = published.Sequence
+	return published, nil
+}
+
+// WaitForCurrent delegates projection synchronization without taking the
+// engine lock. Lease admission calls it only outside publication.
+func (e *Engine) WaitForCurrent(ctx context.Context) error {
+	if waiter, ok := e.journal.(interface{ WaitForCurrent(context.Context) error }); ok {
+		return waiter.WaitForCurrent(ctx)
+	}
+	return nil
+}
+
 // SetAlias assigns an active actor alias.
 //
 //nolint:unparam // Return value is part of the public API.
@@ -786,9 +837,10 @@ func (e *Engine) active(actor protocol.Actor) bool {
 	return actor.State != "dead" && e.now().Sub(actor.HeartbeatAt) <= e.actorTTL
 }
 
-// expireStaleLocked makes the persisted actor state agree with the liveness
-// check. Staleness used to be only a filter, which left old actors reporting
-// their last state (often "waiting") forever when stale sessions were listed.
+// expireStaleLocked updates only the in-memory presence lease. Session-list
+// reads must not append one actor event per expired session: after a daemon
+// restart that can hold the engine lock long enough to make every new actor
+// registration and mailbox request time out.
 func (e *Engine) expireStaleLocked() {
 	now := e.now().UTC()
 	//nolint:gocritic // Intentional value snapshot written back by address.
@@ -798,11 +850,6 @@ func (e *Engine) expireStaleLocked() {
 		}
 		actor.State = "dead"
 		e.actors[address] = actor
-		// A failed append should not make an actor appear live again in this
-		// process; the next journal replay will retain the prior state instead.
-		if err := e.record("actor.upserted", actor); err == nil {
-			e.notifyDeadCollisionsLocked(address)
-		}
 	}
 }
 

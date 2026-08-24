@@ -188,3 +188,14 @@ Pi exposes the concise client command:
 ## Harness adapters
 
 The Pi adapter is operational and remains the active product focus. Cross-harness adapters, including Codex, are intentionally deferred while provenance, Turso sync, and Pi workflows mature. The daemon remains the only owner of queues, collision state, and durable identity.
+
+**Identity note:** Pi session UUIDs can differ from Agent Bridge actor addresses. Use the Agent Bridge binding or `/bus list` to discover the actor UUID/address and message it directly; `agent-bridge sessions` is not the normal messaging path.
+
+
+## Peer coordination
+
+Use Agent Bridge for bounded swarming when there is a real dependency, overlapping work, recovery need, or useful independent review. Discover peers from the binding or `/bus list` and message their actor UUIDs directly. A Direction is the project objective; a WorkUnit is a repository/workspace-scoped slice. `/work <objective>` proposes and joins a new WorkUnit, while `/work use <uuid>` joins an existing proposal.
+
+Messages carry transient requests and findings. Record durable proposals, findings, decisions, handoffs, collision resolutions, and verification boundaries with checkpoints; distinguish asserted from evidence-backed verified claims. Avoid progress pings, duplicate investigations, and coordination for trivial work.
+
+The installer stages and verifies the extension and skill together and writes a shared deployment digest. Re-run `./scripts/install-pi-extension.sh --check` to detect drift; it never installs globally unless `PI_HOME` points at that location.

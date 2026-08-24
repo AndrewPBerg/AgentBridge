@@ -6,6 +6,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "@earendil-works/pi-coding-agent": resolve(__dirname, "test/mocks/pi-coding-agent.ts"),
+      "@earendil-works/pi-ai": resolve(__dirname, "test/mocks/pi-ai.ts"),
       "@earendil-works/pi-tui": resolve(__dirname, "test/mocks/pi-tui.ts"),
       typebox: resolve(__dirname, "test/mocks/typebox.ts"),
     },

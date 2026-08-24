@@ -23,7 +23,8 @@
     "paths": {
       "@earendil-works/pi-coding-agent": ["./test/mocks/pi-coding-agent.ts"],
       "@earendil-works/pi-tui": ["./test/mocks/pi-tui.ts"],
-      "typebox": ["./test/mocks/typebox.ts"]
+      "typebox": ["./test/mocks/typebox.ts"],
+      "@earendil-works/pi-ai": ["./test/mocks/pi-ai.ts"]
     }
   },
   "include": ["*.ts", "*.mts", "test/**/*.ts"],

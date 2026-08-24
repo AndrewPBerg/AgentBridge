@@ -31,6 +31,11 @@ type Server struct {
 	connections map[net.Conn]struct{}
 	closed      bool
 	wg          sync.WaitGroup
+
+	presenceMu      sync.Mutex
+	pendingPresence map[string]*protocol.Actor
+	presenceWake    chan struct{}
+	done            chan struct{}
 }
 
 // New creates a server without provenance queries.
@@ -51,6 +56,7 @@ func NewWithProvenance(
 	}
 	return &Server{
 		engine: engine, provenance: database, projection: projector, path: socketPath, connections: make(map[net.Conn]struct{}),
+		pendingPresence: make(map[string]*protocol.Actor), presenceWake: make(chan struct{}, 1), done: make(chan struct{}),
 	}
 }
 
@@ -82,6 +88,9 @@ func (s *Server) Serve(ctx context.Context) error {
 		<-ctx.Done()
 		ignoreError(s.Close())
 	}()
+	if s.provenance != nil {
+		go s.flushPresence(ctx)
+	}
 
 	for {
 		connection, err := listener.Accept()
@@ -282,7 +291,76 @@ func (s *Server) handleActorHeartbeat(_ context.Context, request protocol.Reques
 	if err != nil {
 		return failure(request.ID, "heartbeat_failed", err)
 	}
+	// Presence is an in-memory lease. Do not make its acknowledgement depend on
+	// the eventually-consistent provenance mirror: a busy SQLite/Turso writer
+	// must not turn a healthy actor into a client-side timeout storm.
+	s.queuePresence(&actor)
 	return success(request.ID, actor)
+}
+
+// queuePresence coalesces the latest lease update for each actor. The
+// provenance database is a read model, so it must never sit on the heartbeat
+// RPC's critical path.
+func (s *Server) queuePresence(actor *protocol.Actor) {
+	if s.provenance == nil {
+		return
+	}
+	key := fmt.Sprintf("%s:%d", actor.SessionUUID, actor.Generation)
+	s.presenceMu.Lock()
+	s.pendingPresence[key] = actor
+	s.presenceMu.Unlock()
+	select {
+	case s.presenceWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Server) takePresence() (string, *protocol.Actor, bool) {
+	s.presenceMu.Lock()
+	defer s.presenceMu.Unlock()
+	for key, actor := range s.pendingPresence {
+		delete(s.pendingPresence, key)
+		return key, actor, true
+	}
+	return "", nil, false
+}
+
+func (s *Server) restorePresence(key string, actor *protocol.Actor) {
+	s.presenceMu.Lock()
+	if _, newer := s.pendingPresence[key]; !newer {
+		s.pendingPresence[key] = actor
+	}
+	s.presenceMu.Unlock()
+}
+
+func (s *Server) flushPresence(ctx context.Context) {
+	for {
+		key, actor, ok := s.takePresence()
+		if !ok {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.done:
+				return
+			case <-s.presenceWake:
+				continue
+			}
+		}
+		if err := s.provenance.RefreshActorPresence(ctx, actor); err == nil {
+			continue
+		}
+		s.restorePresence(key, actor)
+		retry := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			retry.Stop()
+			return
+		case <-s.done:
+			retry.Stop()
+			return
+		case <-retry.C:
+		}
+	}
 }
 
 func (s *Server) handleActorAlias(_ context.Context, request protocol.Request) protocol.Response {
@@ -995,6 +1073,7 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.closed = true
+	close(s.done)
 	listener := s.listener
 	connections := make([]net.Conn, 0, len(s.connections))
 	for connection := range s.connections {

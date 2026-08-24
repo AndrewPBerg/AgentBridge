@@ -38,6 +38,36 @@ func TestJournalPoisonsAfterAmbiguousSyncFailure(t *testing.T) {
 }
 
 //nolint:cyclop,gocognit // end-to-end test keeps setup and assertions together.
+func TestJournalCanDiscardAlreadyProjectedExternalPayloads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	journal, _, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for sequence := uint64(1); sequence <= 2; sequence++ {
+		event := protocol.Event{Version: protocol.Version, Sequence: sequence, Type: "external_change.observed", At: time.Now(), Data: json.RawMessage(`{"path":"/repo/file"}`)}
+		if err := journal.Append(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, events, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened journal: %v", err)
+		}
+	})
+	if len(events) != 2 || events[0].Data != nil || len(events[1].Data) == 0 {
+		t.Fatalf("discarded replay payloads = %#v", events)
+	}
+}
+
+//nolint:cyclop // Recovery test intentionally keeps crash-tail setup and replay assertions together.
 func TestJournalReplaysAndTruncatesPartialCrashTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state", "events.jsonl")
 	journal, _, err := Open(path)

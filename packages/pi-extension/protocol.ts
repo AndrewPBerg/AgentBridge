@@ -168,6 +168,7 @@ export type Direction = {
 
 export type WorkUnit = {
   work_unit_uuid: string;
+  direction_uuid?: string;
   repository_uuid: string;
   repository_root?: string | null;
   workspace_uuid: string;
@@ -198,6 +199,13 @@ export type DirectionStatus = {
     journal_end_sequence: number;
     claims?: Array<{ kind: string; status: string }>;
   }>;
+};
+
+export type BridgeContext = {
+  self: ActorRecord;
+  peers: ActorRecord[];
+  direction?: DirectionStatus;
+  work_unit?: WorkUnit;
 };
 
 export type CheckpointClaim = {

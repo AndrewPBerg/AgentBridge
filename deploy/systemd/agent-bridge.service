@@ -12,6 +12,10 @@ TimeoutStopSec=10s
 KillMode=control-group
 UMask=0077
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+Environment=GOMEMLIMIT=768MiB
+MemoryHigh=1G
+MemoryMax=2G
+MemorySwapMax=512M
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

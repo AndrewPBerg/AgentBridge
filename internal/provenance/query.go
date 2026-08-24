@@ -747,9 +747,11 @@ func (d *DB) ProjectedSequence() (uint64, error) {
 // Status returns projection status and record counts.
 func (d *DB) Status() (Status, error) {
 	status := Status{DatabasePath: d.path}
+	// Journal sequences are contiguous, so MAX(sequence) is also the event
+	// count. Avoid a full scan of the large raw-event table for status calls.
 	err := d.db.QueryRowContext(context.Background(), `SELECT
 		COALESCE((SELECT MAX(sequence) FROM events), 0),
-		(SELECT COUNT(*) FROM events),
+		COALESCE((SELECT MAX(sequence) FROM events), 0),
 		(SELECT COUNT(*) FROM actors),
 		(SELECT COUNT(*) FROM repositories),
 		(SELECT COUNT(*) FROM workspaces),

@@ -68,16 +68,49 @@ func TestMutationLeaseExactPathGrantWaitAndSQLConflictRegression(t *testing.T) {
 	if err != nil || got.Decision != protocol.LeaseGrant {
 		t.Fatalf("first acquire = %#v, %v", got, err)
 	}
-	second := leaseRequest(b, actorUUID("lease-2"), actorUUID("token-2"), "intent-b", "tool-b", repo, workspace, 1, []string{"/repo/a"}, at)
+	second := leaseRequest(b, actorUUID("lease-2"), actorUUID("token-2"), "intent-b", "tool-b", actorUUID("wrong-wait-repo"), actorUUID("wrong-wait-workspace"), 1, []string{"/repo/a"}, at)
 	got, err = db.AcquireMutationLease(context.Background(), second)
 	if err != nil || got.Decision != protocol.LeaseWait || len(got.Conflicts) != 1 {
 		t.Fatalf("conflicting acquire = %#v, %v", got, err)
+	}
+	if got.Lease.RepositoryUUID != repo || got.Lease.WorkspaceUUID != workspace {
+		t.Fatalf("waiting lease scope = %s/%s, want %s/%s", got.Lease.RepositoryUUID, got.Lease.WorkspaceUUID, repo, workspace)
 	}
 	third := second
 	third.Paths = []string{"/repo/ab"}
 	got, err = db.AcquireMutationLease(context.Background(), third)
 	if err != nil || got.Decision != protocol.LeaseGrant {
 		t.Fatalf("prefix-like path incorrectly conflicted = %#v, %v", got, err)
+	}
+}
+
+//nolint:cyclop // Acceptance test intentionally validates the full persisted lease lifecycle.
+func TestMutationLeaseUsesPersistedIntentScopeAndRenewalIdentity(t *testing.T) {
+	db, at, actor, _, repository, workspace, intent := leaseFixture(t)
+	wrongRepository, wrongWorkspace := actorUUID("wrong-repo"), actorUUID("wrong-workspace")
+	request := leaseRequest(actor, actorUUID("scope-lease"), actorUUID("scope-token"), intent, "tool-a", wrongRepository, wrongWorkspace, 1, []string{"/repo/a"}, at.Add(30*time.Second))
+	got, err := db.AcquireMutationLease(context.Background(), request)
+	if err != nil || got.Decision != protocol.LeaseGrant {
+		t.Fatalf("scope acquire = %#v, %v", got, err)
+	}
+	if got.Lease.RepositoryUUID != repository || got.Lease.WorkspaceUUID != workspace {
+		t.Fatalf("lease scope = %s/%s, want %s/%s", got.Lease.RepositoryUUID, got.Lease.WorkspaceUUID, repository, workspace)
+	}
+
+	renewal := *request
+	renewal.IntentID, renewal.ToolCallID = "stale-intent", "stale-tool"
+	renewal.RepositoryUUID, renewal.WorkspaceUUID = wrongRepository, wrongWorkspace
+	renewal.Now = at.Add(31 * time.Second)
+	renewed, err := db.RenewMutationLease(renewal)
+	if err != nil || renewed.Decision != protocol.LeaseGrant {
+		t.Fatalf("renewal = %#v, %v", renewed, err)
+	}
+	if renewed.Lease.IntentID != intent || renewed.Lease.ToolCallID != "tool-a" || renewed.Lease.RepositoryUUID != repository || renewed.Lease.WorkspaceUUID != workspace {
+		t.Fatalf("renewal identity came from request: %#v", renewed.Lease)
+	}
+	listed, err := db.ListMutationLeases(context.Background(), actor, "")
+	if err != nil || len(listed) != 1 || listed[0].WorkspaceUUID != workspace {
+		t.Fatalf("actor-wide lease list = %#v, %v", listed, err)
 	}
 }
 

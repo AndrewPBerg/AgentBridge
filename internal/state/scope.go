@@ -9,7 +9,7 @@ import (
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
 )
 
-func scopeID(_, key string) string {
+func scopeID(key string) string {
 	return deterministicUUID(filepath.Clean(key))
 }
 
@@ -48,11 +48,11 @@ func normalizeActorScope(actor protocol.Actor) protocol.Actor {
 		workspaceRoot = actor.JJ.WorkspaceRoot
 		kind = "jj-workspace"
 	}
-	actor.RepositoryUUID = scopeID("repo", repositoryKey)
+	actor.RepositoryUUID = scopeID(repositoryKey)
 	repositoryRoot = filepath.Clean(repositoryRoot)
 	workspaceRoot = filepath.Clean(workspaceRoot)
 	actor.RepositoryRoot = repositoryRoot
-	actor.WorkspaceUUID = scopeID("workspace", actor.RepositoryUUID+"\x00"+workspaceRoot)
+	actor.WorkspaceUUID = scopeID(actor.RepositoryUUID + "\x00" + workspaceRoot)
 	// The repository-root workspace is the default workspace. Omit its
 	// duplicate root and kind from the wire model; consumers inherit them.
 	if workspaceRoot == repositoryRoot {

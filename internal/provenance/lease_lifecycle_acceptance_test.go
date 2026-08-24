@@ -13,13 +13,13 @@ import (
 
 func TestReleaseAppendFailureReturnsErrorAndPreservesActiveLease(t *testing.T) {
 	db, at, a, _, repo, workspace, intent := leaseFixture(t)
-	appender := &leaseTestAppender{}
-	db.SetLeaseAppender(appender, 0)
 	req := leaseRequest(a, actorUUID("release-failure"), actorUUID("release-token"), intent, "tool-a", repo, workspace, 1, []string{"/repo/release-failure"}, at)
 	lease, err := db.AcquireMutationLease(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
+	appender := &leaseTestAppender{}
+	db.SetLeaseAppender(appender, 0)
 	appender.mu.Lock()
 	appender.fail = true
 	appender.mu.Unlock()
@@ -57,11 +57,10 @@ func TestReleaseCommitFailureReturnsError(t *testing.T) {
 //nolint:cyclop // Rebuild acceptance intentionally checks each durable timestamp boundary.
 func TestRebuiltLeaseRetainsTerminalAt(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bridge.db")
-	db, err := OpenProjection(path)
+	db, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.SetLeaseAppender(&leaseTestAppender{}, 0)
 	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	a := actorUUID("terminal-a")
 	repo := actorUUID("terminal-repo")

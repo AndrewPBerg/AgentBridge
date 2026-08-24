@@ -13,7 +13,7 @@ import (
 	"github.com/AndrewPBerg/agent-bridge/internal/protocol"
 )
 
-const actorHeartbeatFreshness = 12 * time.Second
+const actorHeartbeatFreshness = 60 * time.Second
 
 // appendLeaseEvent publishes through the authoritative append-only journal.
 // The SQL transaction is deliberately not used to allocate sequences. The
@@ -120,7 +120,7 @@ func prepareLeaseRequest(request *protocol.MutationLeaseRequest) (preparedLeaseR
 	return input, nil
 }
 
-func findExistingLease(ctx context.Context, db *sql.DB, id []byte, request *protocol.MutationLeaseRequest) (*protocol.MutationLease, protocol.MutationLeaseResult, error) {
+func findExistingLease(ctx context.Context, db leaseQueryer, id []byte, request *protocol.MutationLeaseRequest) (*protocol.MutationLease, protocol.MutationLeaseResult, error) {
 	candidate, err := loadLease(ctx, db, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, protocol.MutationLeaseResult{}, nil
@@ -141,9 +141,10 @@ func findExistingLease(ctx context.Context, db *sql.DB, id []byte, request *prot
 //
 //nolint:cyclop // Admission coordinates validation, conflict selection, and one transaction.
 func (d *DB) AcquireMutationLease(ctx context.Context, request *protocol.MutationLeaseRequest) (protocol.MutationLeaseResult, error) {
-	if err := ensureLeaseSchema(ctx, d); err != nil {
-		return protocol.MutationLeaseResult{}, err
-	}
+	d.leaseCommandMu.Lock()
+	defer d.leaseCommandMu.Unlock()
+	d.leaseAdmissionMu.Lock()
+	defer d.leaseAdmissionMu.Unlock()
 	input, err := prepareLeaseRequest(request)
 	if err != nil {
 		return input.result, err
@@ -156,6 +157,11 @@ func (d *DB) AcquireMutationLease(ctx context.Context, request *protocol.Mutatio
 	}
 	d.projectionMu.Lock()
 	writeLocked := true
+	if err := ensureLeaseSchema(ctx, d); err != nil {
+		d.projectionMu.Unlock()
+		writeLocked = false
+		return protocol.MutationLeaseResult{}, err
+	}
 	defer func() {
 		if writeLocked {
 			d.projectionMu.Unlock()
@@ -166,22 +172,23 @@ func (d *DB) AcquireMutationLease(ctx context.Context, request *protocol.Mutatio
 		return protocol.MutationLeaseResult{}, err
 	}
 	defer rollbackLeaseTx(tx)
-	existing, result, err := findExistingLease(ctx, d.db, input.leaseID, request)
-	if err != nil || result.Lease != nil {
-		return result, err
-	}
 	if result, blocked := validateLeaseAdmission(ctx, tx, &input, request); blocked {
 		return result, nil
+	}
+	existing, result, err := findExistingLease(ctx, tx, input.leaseID, request)
+	if err != nil || result.Lease != nil {
+		return result, err
 	}
 	conflicts, err := findLeaseConflicts(ctx, tx, input.workspace, input.paths, input.now)
 	if err != nil {
 		return protocol.MutationLeaseResult{}, err
 	}
 	if leaseConflict(conflicts, request.LeaseUUID) {
-		result, committed, err := d.admitWaitingLease(ctx, tx, &input, request, existing, conflicts)
-		if err != nil || !committed {
+		result, published, err := d.admitWaitingLease(ctx, tx, &input, request, existing, conflicts)
+		if err != nil || !published {
 			return result, err
 		}
+		rollbackLeaseTx(tx)
 		d.projectionMu.Unlock()
 		writeLocked = false
 		if err := d.waitLeaseProjection(ctx); err != nil {
@@ -189,10 +196,11 @@ func (d *DB) AcquireMutationLease(ctx context.Context, request *protocol.Mutatio
 		}
 		return result, nil
 	}
-	lease, err := d.admitActiveLease(ctx, tx, &input, request, existing)
+	lease, err := d.admitActiveLease(&input, request, existing)
 	if err != nil {
 		return protocol.MutationLeaseResult{}, err
 	}
+	rollbackLeaseTx(tx)
 	d.projectionMu.Unlock()
 	writeLocked = false
 	if err := d.waitLeaseProjection(ctx); err != nil {
@@ -201,19 +209,13 @@ func (d *DB) AcquireMutationLease(ctx context.Context, request *protocol.Mutatio
 	return protocol.MutationLeaseResult{Decision: protocol.LeaseGrant, Lease: &lease}, nil
 }
 
-func (d *DB) admitActiveLease(ctx context.Context, tx *sql.Tx, input *preparedLeaseRequest, request *protocol.MutationLeaseRequest, existing *protocol.MutationLease) (protocol.MutationLease, error) {
-	lease, err := activateLease(ctx, tx, input, request, existing)
-	if err != nil {
-		return protocol.MutationLease{}, err
-	}
+func (d *DB) admitActiveLease(input *preparedLeaseRequest, request *protocol.MutationLeaseRequest, existing *protocol.MutationLease) (protocol.MutationLease, error) {
+	lease := activeLeaseSnapshot(input, request, existing)
 	reason := "exact-path grant"
 	if existing != nil {
 		reason = "waiting contender promoted"
 	}
 	if err := d.appendLeaseLifecycle("acquired", &lease, input.now, reason); err != nil {
-		return protocol.MutationLease{}, err
-	}
-	if err := tx.Commit(); err != nil {
 		return protocol.MutationLease{}, err
 	}
 	return lease, nil
@@ -228,11 +230,16 @@ func validateLeaseAdmission(ctx context.Context, tx *sql.Tx, input *preparedLeas
 	if err != nil || state == "dead" || input.now.Sub(heartbeatAt) > actorHeartbeatFreshness {
 		return protocol.MutationLeaseResult{Decision: protocol.LeaseBlock, Reason: "actor heartbeat is stale"}, true
 	}
-	var intentTool, intentStart, intentEnd string
-	if err := tx.QueryRowContext(ctx, `SELECT tool_call_id, started_at, COALESCE(completed_at,'') FROM mutations WHERE id=? AND actor=? AND session_generation=? AND tool_call_id=? AND repository_uuid=? AND workspace_uuid=?`, request.IntentID, input.actor, request.Generation, request.ToolCallID, input.repo, input.workspace).Scan(&intentTool, &intentStart, &intentEnd); err != nil || intentTool != request.ToolCallID || intentEnd != "" {
-		return protocol.MutationLeaseResult{Decision: protocol.LeaseBlock, Reason: "original intent is not active"}, true
+	var intentTool, intentEnd string
+	var repository, workspace []byte
+	if err := tx.QueryRowContext(ctx, `SELECT tool_call_id, COALESCE(completed_at,''), repository_uuid, workspace_uuid FROM mutations WHERE id=? AND actor=? AND session_generation=? AND tool_call_id=?`, request.IntentID, input.actor, request.Generation, request.ToolCallID).Scan(&intentTool, &intentEnd, &repository, &workspace); err != nil || intentTool != request.ToolCallID || intentEnd != "" || len(repository) != 16 || len(workspace) != 16 {
+		return protocol.MutationLeaseResult{Decision: protocol.LeaseBlock, Reason: "mutation intent is missing or already completed"}, true
 	}
-	_ = intentStart
+	// Scope is daemon-owned intent identity. The actor may be rooted above the
+	// repository containing the edited file, so client actor scope is not
+	// authoritative for an individual mutation.
+	input.repo, input.workspace = repository, workspace
+	request.RepositoryUUID, request.WorkspaceUUID = uuidString(repository), uuidString(workspace)
 	return protocol.MutationLeaseResult{}, false
 }
 
@@ -259,77 +266,45 @@ func (d *DB) admitWaitingLease(ctx context.Context, tx *sql.Tx, input *preparedL
 		existing.Paths = input.paths
 		return protocol.MutationLeaseResult{Decision: protocol.LeaseWait, Lease: existing, Conflicts: conflicts, Reason: "exact path is leased"}, false, nil
 	}
-	lease, err := insertWaitingLease(ctx, tx, input, request, &conflicts[0])
+	lease, err := waitingLeaseSnapshot(ctx, tx, input, request, &conflicts[0])
 	if err != nil {
 		return protocol.MutationLeaseResult{}, false, err
 	}
 	if err := d.appendLeaseLifecycle("waiting", &lease, input.now, "exact path is leased"); err != nil {
 		return protocol.MutationLeaseResult{}, false, err
 	}
-	if err := tx.Commit(); err != nil {
-		return protocol.MutationLeaseResult{}, false, err
-	}
 	return protocol.MutationLeaseResult{Decision: protocol.LeaseWait, Lease: &lease, Conflicts: conflicts, Reason: "exact path is leased"}, true, nil
 }
 
-func insertWaitingLease(ctx context.Context, tx *sql.Tx, input *preparedLeaseRequest, request *protocol.MutationLeaseRequest, blocker *protocol.MutationLease) (protocol.MutationLease, error) {
+func waitingLeaseSnapshot(ctx context.Context, tx *sql.Tx, input *preparedLeaseRequest, request *protocol.MutationLeaseRequest, blocker *protocol.MutationLease) (protocol.MutationLease, error) {
 	granted, hard := input.now, input.now.Add(30*time.Minute)
 	expires := input.now.Add(2 * time.Minute)
 	if expires.After(hard) {
 		expires = hard
 	}
-	lease := protocol.MutationLease{LeaseUUID: request.LeaseUUID, FencingToken: request.FencingToken, ActorUUID: request.ActorUUID, Generation: request.Generation, RepositoryUUID: request.RepositoryUUID, WorkspaceUUID: request.WorkspaceUUID, IntentID: request.IntentID, ToolCallID: request.ToolCallID, Paths: input.paths, GrantedAt: granted, RenewedAt: granted, ExpiresAt: expires, HardDeadline: hard, State: protocol.LeaseWaiting, RootLeaseUUID: request.LeaseUUID, BlockingLeaseUUID: blocker.LeaseUUID, BlockingRootLeaseUUID: blocker.RootLeaseUUID}
+	lease := protocol.MutationLease{LeaseUUID: request.LeaseUUID, FencingToken: request.FencingToken, ActorUUID: request.ActorUUID, Generation: request.Generation, RepositoryUUID: uuidString(input.repo), WorkspaceUUID: uuidString(input.workspace), IntentID: request.IntentID, ToolCallID: request.ToolCallID, Paths: input.paths, GrantedAt: granted, RenewedAt: granted, ExpiresAt: expires, HardDeadline: hard, State: protocol.LeaseWaiting, RootLeaseUUID: request.LeaseUUID, BlockingLeaseUUID: blocker.LeaseUUID, BlockingRootLeaseUUID: blocker.RootLeaseUUID}
 	var collision []byte
 	if err := tx.QueryRowContext(ctx, `SELECT id FROM collisions WHERE state IN ('active','open') AND path=? ORDER BY id LIMIT 1`, input.paths[0]).Scan(&collision); err == nil && len(collision) == 16 {
 		lease.CollisionID = uuidString(collision)
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return protocol.MutationLease{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO mutation_leases(lease_uuid,fencing_token,actor_uuid,generation,repository_uuid,workspace_uuid,intent_id,tool_call_id,granted_at,renewed_at,expires_at,hard_deadline,state,root_lease_uuid,takeover_depth) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, input.leaseID, input.token, input.actor, request.Generation, input.repo, input.workspace, request.IntentID, request.ToolCallID, granted.Format(time.RFC3339Nano), granted.Format(time.RFC3339Nano), expires.Format(time.RFC3339Nano), hard.Format(time.RFC3339Nano), protocol.LeaseWaiting, input.leaseID, 0); err != nil {
-		return protocol.MutationLease{}, err
-	}
-	for _, path := range input.paths {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO mutation_lease_paths VALUES(?,?)`, input.leaseID, path); err != nil {
-			return protocol.MutationLease{}, err
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO mutation_lease_blockers(waiting_lease_uuid,blocking_lease_uuid,blocking_root_lease_uuid,collision_id) VALUES(?,?,?,?)`, input.leaseID, uuidBlob(blocker.LeaseUUID), uuidBlob(blocker.RootLeaseUUID), nullableUUID(lease.CollisionID)); err != nil {
-		return protocol.MutationLease{}, err
-	}
 	return lease, nil
 }
 
-func activateLease(ctx context.Context, tx *sql.Tx, input *preparedLeaseRequest, request *protocol.MutationLeaseRequest, existing *protocol.MutationLease) (protocol.MutationLease, error) {
+func activeLeaseSnapshot(input *preparedLeaseRequest, request *protocol.MutationLeaseRequest, existing *protocol.MutationLease) protocol.MutationLease {
 	granted, hard := input.now, input.now.Add(30*time.Minute)
 	expires := input.now.Add(2 * time.Minute)
 	if existing != nil && expires.After(existing.HardDeadline) {
 		expires = existing.HardDeadline
 	}
-	if existing != nil {
-		if _, err := tx.ExecContext(ctx, `UPDATE mutation_leases SET renewed_at=?,expires_at=?,state='active',terminal_at=NULL WHERE lease_uuid=? AND state='waiting'`, granted.Format(time.RFC3339Nano), expires.Format(time.RFC3339Nano), input.leaseID); err != nil {
-			return protocol.MutationLease{}, err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM mutation_lease_blockers WHERE waiting_lease_uuid=?`, input.leaseID); err != nil {
-			return protocol.MutationLease{}, err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM mutation_lease_paths WHERE lease_uuid=?`, input.leaseID); err != nil {
-			return protocol.MutationLease{}, err
-		}
-	} else if _, err := tx.ExecContext(ctx, `INSERT INTO mutation_leases(lease_uuid,fencing_token,actor_uuid,generation,repository_uuid,workspace_uuid,intent_id,tool_call_id,granted_at,renewed_at,expires_at,hard_deadline,state,root_lease_uuid,takeover_depth) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, input.leaseID, input.token, input.actor, request.Generation, input.repo, input.workspace, request.IntentID, request.ToolCallID, granted.Format(time.RFC3339Nano), granted.Format(time.RFC3339Nano), expires.Format(time.RFC3339Nano), hard.Format(time.RFC3339Nano), protocol.LeaseActive, input.leaseID, 0); err != nil {
-		return protocol.MutationLease{}, err
-	}
-	for _, path := range input.paths {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO mutation_lease_paths VALUES(?,?)`, input.leaseID, path); err != nil {
-			return protocol.MutationLease{}, err
-		}
-	}
-	lease := protocol.MutationLease{LeaseUUID: request.LeaseUUID, FencingToken: request.FencingToken, ActorUUID: request.ActorUUID, Generation: request.Generation, RepositoryUUID: request.RepositoryUUID, WorkspaceUUID: request.WorkspaceUUID, IntentID: request.IntentID, ToolCallID: request.ToolCallID, Paths: input.paths, GrantedAt: granted, RenewedAt: granted, ExpiresAt: expires, HardDeadline: hard, State: protocol.LeaseActive, RootLeaseUUID: request.LeaseUUID}
+	lease := protocol.MutationLease{LeaseUUID: request.LeaseUUID, FencingToken: request.FencingToken, ActorUUID: request.ActorUUID, Generation: request.Generation, RepositoryUUID: uuidString(input.repo), WorkspaceUUID: uuidString(input.workspace), IntentID: request.IntentID, ToolCallID: request.ToolCallID, Paths: input.paths, GrantedAt: granted, RenewedAt: granted, ExpiresAt: expires, HardDeadline: hard, State: protocol.LeaseActive, RootLeaseUUID: request.LeaseUUID}
 	if existing != nil {
 		lease = *existing
 		lease.Paths, lease.State, lease.GrantedAt, lease.RenewedAt, lease.ExpiresAt = input.paths, protocol.LeaseActive, granted, granted, expires
 		lease.TerminalAt, lease.BlockingLeaseUUID, lease.BlockingRootLeaseUUID = nil, "", ""
 	}
-	return lease, nil
+	return lease
 }
 
 func sameLeaseRequest(existing *protocol.MutationLease, request *protocol.MutationLeaseRequest) bool {
@@ -454,8 +429,13 @@ func scanLeases(ctx context.Context, rows *sql.Rows, tx *sql.Tx) ([]protocol.Mut
 //
 //nolint:cyclop,gocognit,funlen,gocritic // one transaction preserves lineage and mailbox ordering.
 func (d *DB) TakeoverMutationLease(ctx context.Context, req protocol.MutationLeaseTakeoverRequest) (protocol.MutationLeaseTakeoverResult, error) {
+	d.leaseCommandMu.Lock()
+	defer d.leaseCommandMu.Unlock()
 	d.leaseTakeoverMu.Lock()
 	defer d.leaseTakeoverMu.Unlock()
+	if err := d.waitLeaseProjection(ctx); err != nil {
+		return protocol.MutationLeaseTakeoverResult{}, err
+	}
 	d.projectionMu.Lock()
 	writeLocked := true
 	defer func() {
@@ -647,6 +627,11 @@ func (d *DB) MutationLeaseAncestry(ctx context.Context, leaseUUID string) (proto
 //nolint:cyclop // Fencing, projection, and journal admission are one atomic lifecycle operation.
 //nolint:gocritic // Protocol request values intentionally remain value-shaped at the API boundary.
 func (d *DB) ReleaseMutationLease(ctx context.Context, req *protocol.MutationLeaseReleaseRequest) (bool, error) {
+	d.leaseCommandMu.Lock()
+	defer d.leaseCommandMu.Unlock()
+	if err := d.waitLeaseProjection(ctx); err != nil {
+		return false, err
+	}
 	d.projectionMu.Lock()
 	writeLocked := true
 	defer func() {
@@ -654,71 +639,53 @@ func (d *DB) ReleaseMutationLease(ctx context.Context, req *protocol.MutationLea
 			d.projectionMu.Unlock()
 		}
 	}()
-	id, e := parseLeaseUUID(req.LeaseUUID)
-	if e != nil {
-		return false, e
+	id, err := parseLeaseUUID(req.LeaseUUID)
+	if err != nil {
+		return false, err
 	}
-	tok, e := parseLeaseUUID(req.FencingToken)
-	if e != nil {
-		return false, e
+	token, err := parseLeaseUUID(req.FencingToken)
+	if err != nil {
+		return false, err
 	}
-	actor, e := parseLeaseUUID(req.ActorUUID)
-	if e != nil {
-		return false, e
+	actor, err := parseLeaseUUID(req.ActorUUID)
+	if err != nil {
+		return false, err
 	}
-	tx, e := d.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
-	if e != nil {
-		return false, e
+	tx, err := d.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return false, err
 	}
 	defer rollbackLeaseTx(tx)
+	lease, err := loadLease(ctx, tx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if lease.FencingToken != uuidString(token) || lease.ActorUUID != uuidString(actor) || lease.Generation != req.Generation || (lease.State != protocol.LeaseActive && lease.State != protocol.LeaseWaiting) {
+		return false, nil
+	}
 	now := req.Now
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
 	now = now.UTC()
-	var previousState string
-	if e = tx.QueryRowContext(ctx, `SELECT state FROM mutation_leases WHERE lease_uuid=? AND fencing_token=? AND actor_uuid=? AND generation=? AND state IN ('active','waiting')`, id, tok, actor, req.Generation).Scan(&previousState); e != nil {
-		if errors.Is(e, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, e
-	}
 	state := protocol.LeaseReleased
 	action := "released"
-	if previousState == protocol.LeaseWaiting {
+	if lease.State == protocol.LeaseWaiting {
 		state = protocol.LeaseCancelled
 		action = "canceled"
-	}
-	r, e := tx.ExecContext(ctx, `UPDATE mutation_leases SET state=?,expires_at=?,terminal_at=? WHERE lease_uuid=? AND fencing_token=? AND actor_uuid=? AND generation=? AND state IN ('active','waiting')`, state, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id, tok, actor, req.Generation)
-	if e != nil {
-		return false, e
-	}
-	n, e := r.RowsAffected()
-	if e != nil {
-		return false, e
-	}
-	if n != 1 {
-		return false, nil
-	}
-	// Keep the normalized blocker projection clear even before the journal
-	// projector catches up; the lifecycle event remains the rebuild authority.
-	if _, e = tx.ExecContext(ctx, `DELETE FROM mutation_lease_blockers WHERE waiting_lease_uuid=?`, id); e != nil {
-		return false, e
-	}
-	lease, e := loadLease(ctx, d.db, id)
-	if e != nil {
-		return false, e
 	}
 	terminal := now
 	lease.State = state
 	lease.ExpiresAt = terminal
 	lease.TerminalAt = &terminal
+	lease.BlockingLeaseUUID, lease.BlockingRootLeaseUUID, lease.CollisionID = "", "", ""
 	if err := d.appendLeaseLifecycle(action, &lease, now, "holder release"); err != nil {
 		return false, err
 	}
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
+	rollbackLeaseTx(tx)
 	d.projectionMu.Unlock()
 	writeLocked = false
 	if err := d.waitLeaseProjection(ctx); err != nil {

@@ -27,6 +27,26 @@ type baselineEntry struct {
 	observedAt time.Time
 }
 
+var ignoredPathParts = map[string]struct{}{
+	".agent-bridge": {},
+	".cache":        {},
+	".git":          {},
+	".jj":           {},
+	".mypy_cache":   {},
+	".next":         {},
+	".pytest_cache": {},
+	".ruff_cache":   {},
+	".turbo":        {},
+	".venv":         {},
+	"__pycache__":   {},
+	"build":         {},
+	"coverage":      {},
+	"dist":          {},
+	"node_modules":  {},
+	"target":        {},
+	"venv":          {},
+}
+
 type processor struct {
 	mu             sync.Mutex
 	coordination   coordination
@@ -54,11 +74,12 @@ func (p *processor) acceptedPath(path string) bool {
 		return false
 	}
 	for part := range strings.SplitSeq(filepath.ToSlash(relative), "/") {
-		if part == ".git" || part == ".jj" || part == ".agent-bridge" || part == "node_modules" {
+		if _, ignored := ignoredPathParts[part]; ignored {
 			return false
 		}
 	}
-	return true
+	base := filepath.Base(relative)
+	return !strings.HasSuffix(base, ".log") && !strings.HasSuffix(base, ".pyc") && !strings.HasSuffix(base, ".tsbuildinfo") && base != "coverage.out"
 }
 
 func (p *processor) reconcile(paths []string, clock, continuity string) error {

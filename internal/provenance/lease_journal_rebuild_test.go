@@ -38,11 +38,11 @@ func leaseJournalFixture(t *testing.T) *leaseJournalFixtureData {
 		t.Fatal(err)
 	}
 	appender := NewProjectingAppender(journal, db)
-	db.SetLeaseAppender(appender, 0)
 	engine, err := state.New(appender, events, state.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.SetLeaseAppender(engine, 0)
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	repo, workspace := actorUUID("journal-repo"), actorUUID("journal-workspace")
 	actors := make([]protocol.Actor, 3)
@@ -77,6 +77,31 @@ func leaseJournalFixture(t *testing.T) *leaseJournalFixtureData {
 
 func journalLeaseRequest(actor *protocol.Actor, lease, token, intent, tool, repo, workspace string, now time.Time) *protocol.MutationLeaseRequest {
 	return &protocol.MutationLeaseRequest{LeaseUUID: lease, FencingToken: token, ActorUUID: actor.SessionUUID, Generation: 1, RepositoryUUID: repo, WorkspaceUUID: workspace, IntentID: intent, ToolCallID: tool, Paths: []string{"/repo/shared"}, Now: now}
+}
+
+func TestLeaseAdmissionUsesProjectedNestedRepositoryIntentScope(t *testing.T) {
+	fixture := leaseJournalFixture(t)
+	actor := protocol.Actor{Address: actorUUID("nested-actor"), SessionUUID: actorUUID("nested-actor"), Harness: "test", CWD: "/work", State: "active", Generation: 1, StartedAt: fixture.now, HeartbeatAt: fixture.now, Addressable: true}
+	actor, err := fixture.engine.Register(actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	git := &protocol.GitContext{RepoRoot: "/work/nested", WorktreeRoot: "/work/nested", GitDir: "/work/nested/.git", CommonDir: "/work/nested/.git"}
+	intent := protocol.Intent{ID: "nested-intent", Actor: actor.Address, SessionGeneration: 1, ToolCallID: "nested-tool", Tool: "edit", Operation: "edit", Paths: []string{"/work/nested/file.ts"}, CWD: "/work", Git: git, StartedAt: fixture.now, ExpiresAt: fixture.now.Add(time.Hour)}
+	if _, err := fixture.engine.BeginIntent(intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.appender.WaitForCurrent(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	request := &protocol.MutationLeaseRequest{LeaseUUID: actorUUID("nested-lease"), FencingToken: actorUUID("nested-token"), ActorUUID: actor.Address, Generation: 1, RepositoryUUID: actor.RepositoryUUID, WorkspaceUUID: actor.WorkspaceUUID, IntentID: intent.ID, ToolCallID: intent.ToolCallID, Paths: intent.Paths, Now: fixture.now}
+	result, err := fixture.db.AcquireMutationLease(context.Background(), request)
+	if err != nil || result.Decision != protocol.LeaseGrant {
+		t.Fatalf("nested admission = %#v, %v", result, err)
+	}
+	if result.Lease.RepositoryUUID == actor.RepositoryUUID || result.Lease.WorkspaceUUID == actor.WorkspaceUUID {
+		t.Fatalf("nested lease kept parent actor scope: %#v", result.Lease)
+	}
 }
 
 //nolint:gocognit,cyclop // Intentional end-to-end concurrency coverage has high control-flow complexity.

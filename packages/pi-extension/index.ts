@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
+import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isBashToolResult } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -11,6 +12,7 @@ import { inferIntentContext, inferMutation } from "./intent";
 import { inspectJj } from "./jj";
 import type {
   ActorRecord,
+  BridgeContext,
   BridgeMessage,
   CheckpointRequest,
   Collision,
@@ -30,9 +32,10 @@ import { BRIDGE_MESSAGE_TYPE } from "./protocol";
 import { snapshotFiles } from "./provenance";
 import { initialTalkTargets, sameRepository, showTalkModal } from "./talk-modal";
 
-const HEARTBEAT_MS = 2_000;
+const HEARTBEAT_MS = 15_000;
 const JJ_REFRESH_MS = 10_000;
-const MAILBOX_POLL_MS = 250;
+const MAILBOX_POLL_MS = 1_000;
+const BACKGROUND_RETRY_MAX_MS = 30_000;
 const INTENT_TTL_MS = 5 * 60_000;
 const LEASE_RETRY_MS = 500;
 const LEASE_RENEW_MS = 15_000;
@@ -42,6 +45,7 @@ const ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$/;
 type SessionsResult = { actors: ActorRecord[] };
 type PollResult = { messages: BridgeMessage[] | null };
 type IntentResult = { intent: MutationIntent; collisions: Collision[] };
+type LeaseEntry = { lease: MutationLease; renewalFailures: number };
 type AwakenLauncher = (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }) => Promise<void>;
 type AwakenScheduler = (callback: () => void, delayMillis: number) => void;
 
@@ -74,7 +78,7 @@ export function createAgentBridge(
   awakenScheduler: AwakenScheduler = scheduleAwakenCheck,
 ) {
   const openIntents = new Map<string, MutationIntent>();
-  const openLeases = new Map<string, { lease: MutationLease; intent: MutationIntent; renewalFailures: number }>();
+  const openLeases = new Map<string, LeaseEntry>();
   const deliveredInRuntime = new Set<string>();
   const pendingAcknowledgements = new Set<string>();
   let actor: ActorRecord | undefined;
@@ -85,6 +89,13 @@ export function createAgentBridge(
   let leaseRenewTimer: ReturnType<typeof setInterval> | undefined;
   let mailboxPolling = false;
   let heartbeatRunning = false;
+  let compacting = false;
+  let backgroundOutage = false;
+  const backgroundRecovered = new Set<"heartbeat" | "mailbox">();
+  const backgroundRetry = {
+    heartbeat: { failures: 0, nextAt: 0 },
+    mailbox: { failures: 0, nextAt: 0 },
+  };
   let generation = 0;
   let clientSequence = 0;
   let sessionEventSequence = 0;
@@ -111,6 +122,33 @@ export function createAgentBridge(
   function recoverable(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
     return /ENOENT|ECONNREFUSED|EPIPE|closed before replying|unknown actor/i.test(message);
+  }
+
+  function backgroundAttemptAllowed(kind: "heartbeat" | "mailbox"): boolean {
+    return Date.now() >= backgroundRetry[kind].nextAt;
+  }
+
+  function backgroundFailed(kind: "heartbeat" | "mailbox", error: unknown) {
+    const retry = backgroundRetry[kind];
+    retry.failures += 1;
+    retry.nextAt = Date.now() + Math.min(2 ** (retry.failures - 1) * 2_000, BACKGROUND_RETRY_MAX_MS);
+    backgroundRecovered.clear();
+    if (backgroundOutage) return;
+    backgroundOutage = true;
+    const message = error instanceof Error ? error.message : String(error);
+    sessionCtx?.ui.notify(`Agent Bridge background connection unavailable; retrying quietly (${message})`, "warning");
+  }
+
+  function backgroundSucceeded(kind: "heartbeat" | "mailbox") {
+    const retry = backgroundRetry[kind];
+    retry.failures = 0;
+    retry.nextAt = 0;
+    if (!backgroundOutage) return;
+    backgroundRecovered.add(kind);
+    if (backgroundRecovered.size === 2) {
+      backgroundOutage = false;
+      backgroundRecovered.clear();
+    }
   }
 
   function ordinaryPresenceState(): ActorRecord["state"] {
@@ -165,8 +203,7 @@ export function createAgentBridge(
     });
   }
 
-  async function releaseLease(entry: { lease: MutationLease; intent: MutationIntent }): Promise<void> {
-    if (!actor) return;
+  async function releaseLease(entry: LeaseEntry): Promise<void> {
     await call("mutation_lease.release", {
       lease_uuid: entry.lease.lease_uuid,
       fencing_token: entry.lease.fencing_token,
@@ -188,7 +225,7 @@ export function createAgentBridge(
       tool_call_id: intent.tool_call_id,
       paths: intent.paths,
     };
-    openLeases.set(intent.tool_call_id, {
+    const entry: LeaseEntry = {
       lease: {
         ...request,
         paths: intent.paths,
@@ -198,10 +235,11 @@ export function createAgentBridge(
         hard_deadline: "",
         state: "waiting",
       },
-      intent,
       renewalFailures: 0,
-    });
+    };
+    openLeases.set(intent.tool_call_id, entry);
     for (;;) {
+      if (openLeases.get(intent.tool_call_id) !== entry) throw new Error("tool call canceled during lease admission");
       if (signal?.aborted) {
         await closeLease(intent.tool_call_id);
         throw new Error("tool call canceled before mutation lease grant");
@@ -213,14 +251,20 @@ export function createAgentBridge(
         await closeLease(intent.tool_call_id);
         throw new Error(`mutation lease admission unavailable: ${error instanceof Error ? error.message : String(error)}`);
       }
+      if (openLeases.get(intent.tool_call_id) !== entry) {
+        if (result.lease) {
+          entry.lease = result.lease;
+          await releaseDetachedLease(entry);
+        }
+        throw new Error("tool call canceled during lease admission");
+      }
       if (result.decision === "grant" && result.lease?.state === "active") {
+        entry.lease = result.lease;
+        entry.renewalFailures = 0;
         if (signal?.aborted) {
-          openLeases.set(intent.tool_call_id, { lease: result.lease, intent, renewalFailures: 0 });
           await closeLease(intent.tool_call_id);
           throw new Error("tool call canceled before mutation lease grant");
         }
-        const entry = { lease: result.lease, intent, renewalFailures: 0 };
-        openLeases.set(intent.tool_call_id, entry);
         return result.lease;
       }
       if (result.decision === "block") {
@@ -231,7 +275,10 @@ export function createAgentBridge(
         await closeLease(intent.tool_call_id);
         throw new Error(result.reason || "unknown mutation lease admission decision");
       }
-      if (result.lease) openLeases.set(intent.tool_call_id, { lease: result.lease, intent, renewalFailures: 0 });
+      if (result.lease) {
+        entry.lease = result.lease;
+        entry.renewalFailures = 0;
+      }
       try {
         await waitForRetry(signal);
       } catch (error) {
@@ -251,18 +298,12 @@ export function createAgentBridge(
     }
   }
 
-  async function reconcileLeasesImpl(useRawClient: boolean): Promise<void> {
+  async function reconcileLeasesImpl(useRawClient = false): Promise<void> {
     if (!actor) return;
-    if (!actor.workspace_uuid || !actor.repository_uuid) return;
-    let workspaceUUID: string;
-    try {
-      workspaceUUID = canonicalUUID(actor.workspace_uuid, "Workspace UUID");
-    } catch {
-      // Test doubles and legacy registrations may omit scope; there is no
-      // safe lease reconciliation request without a canonical workspace.
-      return;
-    }
-    const scope = { actor_uuid: actor.address, workspace_uuid: workspaceUUID };
+    // An actor rooted above multiple repositories can hold mutation-scoped
+    // leases in several workspaces. Reconcile by fenced actor identity, not by
+    // the actor's current workspace.
+    const scope = { actor_uuid: actor.address };
     const invoke = <T>(method: string, params: unknown): Promise<T> =>
       useRawClient ? client.call<T>(method, params) : call<T>(method, params);
     const result = await invoke<{ leases?: MutationLease[] }>("mutation_lease.list", scope);
@@ -292,18 +333,21 @@ export function createAgentBridge(
     }
   }
 
-  async function closeLease(toolCallId: string): Promise<void> {
+  function detachLease(toolCallId: string): LeaseEntry | undefined {
     const entry = openLeases.get(toolCallId);
-    if (!entry) return;
-    openLeases.delete(toolCallId);
-    await releaseLease(entry).catch((error) => reportError(sessionCtx, error));
+    if (entry) openLeases.delete(toolCallId);
+    return entry;
   }
 
-  async function handleLeaseRenewalFailure(
-    toolCallId: string,
-    entry: { lease: MutationLease; intent: MutationIntent; renewalFailures: number },
-    reason: string,
-  ): Promise<void> {
+  async function releaseDetachedLease(entry: LeaseEntry | undefined): Promise<void> {
+    if (entry) await releaseLease(entry).catch((error) => reportError(sessionCtx, error));
+  }
+
+  async function closeLease(toolCallId: string): Promise<void> {
+    await releaseDetachedLease(detachLease(toolCallId));
+  }
+
+  async function handleLeaseRenewalFailure(toolCallId: string, entry: LeaseEntry, reason: string): Promise<void> {
     if (openLeases.get(toolCallId) !== entry) return;
     entry.renewalFailures += 1;
     const expiry = Date.parse(entry.lease.expires_at);
@@ -331,11 +375,11 @@ export function createAgentBridge(
             fencing_token: entry.lease.fencing_token,
             actor_uuid: actor.address,
             generation,
-            repository_uuid: entry.intent.repository_uuid,
-            workspace_uuid: entry.intent.workspace_uuid,
-            intent_id: entry.intent.id,
-            tool_call_id: entry.intent.tool_call_id,
-            paths: entry.intent.paths,
+            repository_uuid: entry.lease.repository_uuid,
+            workspace_uuid: entry.lease.workspace_uuid,
+            intent_id: entry.lease.intent_id,
+            tool_call_id: entry.lease.tool_call_id,
+            paths: entry.lease.paths,
           });
           // The result may arrive after tool_result closed this entry. That is
           // an expected race, not a failed renewal and not an orphan to delete.
@@ -364,7 +408,8 @@ export function createAgentBridge(
   }
 
   async function heartbeat(state?: ActorRecord["state"]) {
-    if (!actor || heartbeatRunning) return;
+    const explicitState = state !== undefined;
+    if (!actor || heartbeatRunning || (!explicitState && !backgroundAttemptAllowed("heartbeat"))) return;
     heartbeatRunning = true;
     try {
       actor = await call<ActorRecord>("actor.heartbeat", {
@@ -373,32 +418,44 @@ export function createAgentBridge(
         cwd: sessionCtx?.cwd,
         generation,
       });
-      lastError = "";
+      backgroundSucceeded("heartbeat");
     } catch (error) {
-      reportError(sessionCtx, error);
+      if (explicitState) reportError(sessionCtx, error);
+      else backgroundFailed("heartbeat", error);
     } finally {
       heartbeatRunning = false;
     }
   }
 
   async function refreshVCS() {
-    if (!actor || !sessionCtx) return;
-    const [git, jj] = await Promise.all([inspectGit(pi, sessionCtx.cwd), inspectJj(pi, sessionCtx.cwd)]);
-    actor = await call<ActorRecord>("actor.heartbeat", {
-      address: actor.address,
-      state: actor.state === "stealth" ? "stealth" : ordinaryPresenceState(),
-      cwd: sessionCtx.cwd,
-      git,
-      jj,
-      generation,
-    });
+    if (!actor || !sessionCtx || compacting || heartbeatRunning || !backgroundAttemptAllowed("heartbeat")) return;
+    heartbeatRunning = true;
+    try {
+      const [git, jj] = await Promise.all([inspectGit(pi, sessionCtx.cwd), inspectJj(pi, sessionCtx.cwd)]);
+      actor = await call<ActorRecord>("actor.heartbeat", {
+        address: actor.address,
+        state: actor.state === "stealth" ? "stealth" : ordinaryPresenceState(),
+        cwd: sessionCtx.cwd,
+        git,
+        jj,
+        generation,
+      });
+      backgroundSucceeded("heartbeat");
+    } catch (error) {
+      backgroundFailed("heartbeat", error);
+    } finally {
+      heartbeatRunning = false;
+    }
   }
 
   async function pollMailbox() {
-    if (!actor || mailboxPolling) return;
+    if (!actor || mailboxPolling || compacting || !backgroundAttemptAllowed("mailbox")) return;
     mailboxPolling = true;
     try {
       const result = await call<PollResult>("mailbox.poll", { actor: actor.address, limit: 100 });
+      // A poll already in flight when compaction begins must not inject a steer
+      // turn. Messages remain durable and unacknowledged for the next poll.
+      if (compacting) return;
       for (const message of result.messages ?? []) {
         if (deliveredInRuntime.has(message.id)) continue;
         pi.sendMessage(
@@ -423,9 +480,9 @@ export function createAgentBridge(
         deliveredInRuntime.add(message.id);
         pendingAcknowledgements.add(message.id);
       }
-      lastError = "";
+      backgroundSucceeded("mailbox");
     } catch (error) {
-      reportError(sessionCtx, error);
+      backgroundFailed("mailbox", error);
     } finally {
       mailboxPolling = false;
     }
@@ -558,6 +615,27 @@ export function createAgentBridge(
     return selectedWorkUnit;
   }
 
+  function persistSelection() {
+    pi.appendEntry("agent-bridge-coordination", {
+      direction_uuid: selectedDirection?.direction_uuid,
+      work_unit_uuid: selectedWorkUnit?.work_unit_uuid,
+    });
+  }
+
+  function savedSelection(ctx: ExtensionContext): { direction_uuid?: string; work_unit_uuid?: string } | undefined {
+    const entries = (ctx as ExtensionContext & { sessionManager?: { getEntries?: () => unknown[] } }).sessionManager?.getEntries?.() ?? [];
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index] as { customType?: string; data?: unknown };
+      if (entry.customType !== "agent-bridge-coordination" || !entry.data || typeof entry.data !== "object") continue;
+      const data = entry.data as { direction_uuid?: unknown; work_unit_uuid?: unknown };
+      return {
+        direction_uuid: typeof data.direction_uuid === "string" ? data.direction_uuid : undefined,
+        work_unit_uuid: typeof data.work_unit_uuid === "string" ? data.work_unit_uuid : undefined,
+      };
+    }
+    return undefined;
+  }
+
   function isVerificationKind(kind: string): boolean {
     return /^(test|build|runtime)$/i.test(kind.trim());
   }
@@ -595,14 +673,25 @@ export function createAgentBridge(
     ];
   }
 
+  function pollingSleepCommand(command: string): boolean {
+    return /^\s*sleep\s+(?:\d+(?:\.\d+)?|\.\d+)(?:[smhd])?(?:\s*(?:;|&&)\s*(?:echo|printf)\b[^;&|]*)?\s*$/i.test(command);
+  }
+
   function verificationCommand(command: string): boolean {
-    const words = command.trim().split(/\s+/);
+    const trimmed = command.trim();
+    const afterCd = trimmed.match(/^cd\s+(?:"[^"]+"|'[^']+'|[^\s;&|]+)\s*&&\s*(.+)$/s)?.[1] ?? trimmed;
+    const words = afterCd.trim().split(/\s+/);
     const first = words[0]?.toLowerCase();
-    const second = words[1]?.toLowerCase();
+    let second = words[1]?.toLowerCase();
+    let third = words[2]?.toLowerCase();
+    if ((first === "npm" || first === "pnpm") && (second === "--dir" || second === "--prefix") && words[2]) {
+      second = words[3]?.toLowerCase();
+      third = words[4]?.toLowerCase();
+    }
     if (first === "go" && ["test", "build", "run"].includes(second ?? "")) return true;
     if (
       ["bun", "npm", "pnpm"].includes(first ?? "") &&
-      (second === "test" || (second === "run" && ["test", "typecheck", "build"].includes(words[2]?.toLowerCase() ?? "")))
+      (second === "test" || (second === "run" && ["test", "typecheck", "build"].includes(third ?? "")))
     )
       return true;
     if (
@@ -616,7 +705,7 @@ export function createAgentBridge(
   }
 
   function bashResultMetadata(
-    details: { truncation?: { truncated?: boolean } | null },
+    details: { truncation?: { truncated?: boolean } | null } | undefined,
     content: unknown,
     isError: boolean,
   ): { exitCode?: number; output: string; truncated: boolean } {
@@ -631,7 +720,7 @@ export function createAgentBridge(
     return {
       exitCode: exitMatch?.[1] === undefined ? (blocked ? undefined : isError ? 1 : 0) : Number(exitMatch[1]),
       output,
-      truncated: details.truncation?.truncated === true,
+      truncated: details?.truncation?.truncated === true,
     };
   }
 
@@ -720,21 +809,27 @@ export function createAgentBridge(
     });
   }
 
-  async function activeActors(): Promise<ActorRecord[]> {
-    return (await call<SessionsResult>("sessions.list", { include_stale: false })).actors;
+  async function activeActors(
+    filters: { directory?: string; repository_uuid?: string; workspace_uuid?: string } = {},
+  ): Promise<ActorRecord[]> {
+    return (await call<SessionsResult>("sessions.list", { include_stale: false, ...filters })).actors;
   }
 
   async function dormantPiActor(selector: string): Promise<ActorRecord> {
     const normalized = selector.trim().replace(/^@/, "");
     if (!normalized) throw new Error("Awaken target is required");
     const actors = (await call<SessionsResult>("sessions.list", { include_stale: true })).actors;
-    const matches = actors.filter(
+    const directActorUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized);
+    const identityMatches = actors.filter(
       (candidate) =>
-        candidate.state === "dead" &&
         candidate.harness === "pi" &&
-        (candidate.address === normalized || candidate.session_uuid === normalized || candidate.alias === normalized),
+        (candidate.address === normalized ||
+          (!directActorUUID && (candidate.session_uuid === normalized || candidate.alias === normalized))),
     );
-    if (matches.length !== 1) throw new Error(`Expected one dead Pi session for ${JSON.stringify(selector)}`);
+    const live = identityMatches.find((candidate) => candidate.state !== "dead");
+    if (live) throw new Error(`Refusing to awaken live actor ${live.address}; bridge_awaken only accepts dead actors`);
+    const matches = identityMatches.filter((candidate) => candidate.state === "dead");
+    if (matches.length !== 1) throw new Error(`Expected one dead Pi actor for ${JSON.stringify(selector)}`);
     const target = matches[0]!;
     if (!target.session_file || !target.cwd) throw new Error("Dead Pi session has no resumable session file and working directory");
     const scope = requireWorkUnitScope();
@@ -752,11 +847,19 @@ export function createAgentBridge(
         (entry) => entry.agentSession === candidate.session_file || (candidate.pane_id && entry.paneId === candidate.pane_id),
       );
       const identity = candidate.alias ? `@${candidate.alias} (${candidate.address})` : candidate.address;
+      const piSession = candidate.session_file
+        ? ` pi_session=${
+            basename(candidate.session_file)
+              .replace(/\.jsonl$/, "")
+              .split("_")
+              .pop() ?? "unknown"
+          }`
+        : "";
       const git = candidate.git
         ? ` git=${candidate.git.branch ?? candidate.git.head?.slice(0, 12) ?? "unborn"} worktree=${candidate.git.worktree_root}`
         : " git=none";
       const jj = candidate.jj ? ` jj=${candidate.jj.change_id.slice(0, 12)} workspace=${candidate.jj.workspace_root}` : " jj=none";
-      return `${identity} ${herdr?.status ?? candidate.state} cwd=${candidate.cwd}${git}${jj}${herdr ? ` pane=${herdr.paneId}` : ""}`;
+      return `${identity} ${herdr?.status ?? candidate.state}${piSession} cwd=${candidate.cwd}${git}${jj}${herdr ? ` pane=${herdr.paneId}` : ""}`;
     });
     for (const herdr of herdrAgents) {
       if (bridge.actors.some((candidate) => candidate.session_file === herdr.agentSession || candidate.pane_id === herdr.paneId)) continue;
@@ -816,10 +919,13 @@ export function createAgentBridge(
     name: "bridge_awaken",
     label: "Agent Bridge Awaken",
     description:
-      "Fork a dead same-workspace Pi session into a bounded child agent and give it a rehydration request. The original session remains dead; the child gets a new identity and can communicate directly through Agent Bridge.",
+      "WARNING: only awaken a confirmed dead actor. Refuses live actors. Uses an Agent Bridge actor address first; legacy Pi session UUID and alias selectors remain supported. The original session remains dead; the child gets a new identity and can communicate directly through Agent Bridge.",
     promptSnippet: "Awaken a dead Pi agent when the user explicitly requests it.",
     parameters: Type.Object({
-      target: Type.String({ description: "Dead Pi actor address, session UUID, or @alias." }),
+      target: Type.String({
+        description:
+          "Agent Bridge actor address (preferred), or legacy Pi session UUID/@alias. Live actors are refused; only a confirmed dead actor may be awakened.",
+      }),
       request: Type.String({ description: "Bounded question or task for the awakened child." }),
       workUnitUUID: Type.Optional(Type.String({ description: "Optional same-scope WorkUnit for the child." })),
     }),
@@ -899,13 +1005,15 @@ export function createAgentBridge(
     name: "bridge_message",
     label: "Agent Bridge Message",
     description:
-      "Send an ordered durable coordination message to a peer by @alias, canonical session UUID, or @ID. Canonical addresses remain deliverable while a known session reloads.",
+      "Send an ordered durable coordination message to a peer by Agent Bridge actor UUID/address, @alias, or @ID. Pass an actor UUID from the Agent Bridge binding or bridge_context directly; Pi session UUIDs are only legacy recovery metadata.",
     promptSnippet: "Send ordered durable coordination messages to peer agents.",
     promptGuidelines: [
       "Use bridge_message to coordinate with peers named in Agent Bridge collisions; never revert unfamiliar shared-workspace edits without coordinating first.",
     ],
     parameters: Type.Object({
-      to: Type.String({ description: "Target such as @walkie, @<session UUID>, or @<JJ change ID>." }),
+      to: Type.String({
+        description: "Agent Bridge actor UUID/address from the binding or bridge_context, @alias, or @<JJ change ID>.",
+      }),
       body: Type.String({ description: "Coordination message." }),
     }),
     async execute(_toolCallId, params) {
@@ -926,19 +1034,172 @@ export function createAgentBridge(
     name: "bridge_tools",
     label: "Agent Bridge Tools",
     description: "Load optional Agent Bridge tool domains only when needed, keeping normal session context small.",
-    promptSnippet: "Load optional Agent Bridge provenance tools when attribution or historical diagnosis is required.",
+    promptSnippet: "Load optional Agent Bridge coordination or provenance tools only when needed.",
     parameters: Type.Object({
-      domain: Type.String({ description: "Optional domain to load. Currently: provenance" }),
+      domain: StringEnum(["provenance", "coordination"] as const, { description: "Optional domain to load." }),
     }),
     async execute(_toolCallId, params) {
       const domain = String(params.domain ?? "");
-      if (domain !== "provenance") throw new Error(`Unknown Agent Bridge tool domain ${JSON.stringify(domain)}`);
+      if (domain !== "provenance" && domain !== "coordination")
+        throw new Error(`Unknown Agent Bridge tool domain ${JSON.stringify(domain)}`);
+      const names = domain === "provenance" ? ["bridge_provenance"] : ["bridge_context", "bridge_direction", "bridge_work"];
       const active = pi.getActiveTools();
-      pi.setActiveTools([...new Set([...active, "bridge_provenance"])]);
+      const added = names.filter((name) => !active.includes(name));
+      pi.setActiveTools([...new Set([...active, ...names])]);
       return {
-        content: [{ type: "text", text: "Loaded bridge_provenance for this session." }],
-        details: { domain, added: active.includes("bridge_provenance") ? [] : ["bridge_provenance"] },
+        content: [{ type: "text", text: `Loaded ${names.join(", ")} for this session.` }],
+        details: { domain, added },
       };
+    },
+  });
+
+  function boundedCoordinationText(value: unknown): string {
+    const encoded = JSON.stringify(value);
+    return encoded.length <= 20_000 ? encoded : `${encoded.slice(0, 19_900)}\n... coordination output truncated; narrow the scope`;
+  }
+
+  async function coordinationContext(
+    filters: { directory?: string; repository_uuid?: string; workspace_uuid?: string } = {},
+  ): Promise<BridgeContext> {
+    if (!actor) throw new Error("Agent Bridge is not attached to an active session");
+    const scopedFilters =
+      filters.directory || filters.repository_uuid || filters.workspace_uuid
+        ? filters
+        : actor.repository_uuid
+          ? { repository_uuid: actor.repository_uuid }
+          : { directory: actor.cwd };
+    const peers = (await activeActors(scopedFilters)).filter((candidate) => candidate.address !== actor?.address);
+    const direction = selectedDirection ? await fetchDirectionStatus(selectedDirection.direction_uuid) : undefined;
+    const work_unit = selectedWorkUnit ? await fetchWorkUnit(selectedWorkUnit.work_unit_uuid) : undefined;
+    return { self: actor, peers: peers.slice(0, 50), direction, work_unit };
+  }
+
+  pi.registerTool({
+    name: "bridge_context",
+    label: "Agent Bridge Context",
+    description: "Return bounded actor, peer, selected Direction, and selected WorkUnit coordination state.",
+    parameters: Type.Object({
+      directory: Type.Optional(Type.String({ description: "Optional directory filter." })),
+      repository_uuid: Type.Optional(Type.String({ description: "Optional repository UUID filter." })),
+      workspace_uuid: Type.Optional(Type.String({ description: "Optional workspace UUID filter." })),
+      under: Type.Optional(Type.String({ description: "Optional directory subtree filter; translated to the daemon directory scope." })),
+    }),
+    async execute(_toolCallId, params) {
+      if (params.directory && params.under) throw new Error("Use either directory or under, not both");
+      const result = await coordinationContext({
+        directory: params.under ?? params.directory,
+        repository_uuid: params.repository_uuid,
+        workspace_uuid: params.workspace_uuid,
+      });
+      return { content: [{ type: "text", text: boundedCoordinationText(result) }], details: result };
+    },
+  });
+
+  pi.registerTool({
+    name: "bridge_direction",
+    label: "Agent Bridge Direction",
+    description: "Propose, select, inspect, or transition a Direction using existing daemon RPCs.",
+    parameters: Type.Object({
+      action: StringEnum(["propose", "use", "status", "transition", "clear"] as const),
+      objective: Type.Optional(Type.String()),
+      direction_uuid: Type.Optional(Type.String()),
+      state: Type.Optional(StringEnum(["active", "paused", "converging", "verified", "completed", "abandoned"] as const)),
+    }),
+    async execute(_toolCallId, params) {
+      if (!actor) throw new Error("Agent Bridge is not attached to an active session");
+      const action = String(params.action);
+      if (action === "clear") {
+        selectedDirection = undefined;
+        persistSelection();
+        return { content: [{ type: "text", text: "Direction selection cleared." }] };
+      }
+      if (action === "propose") {
+        const objective = String(params.objective ?? "").trim();
+        if (!objective) throw new Error("Direction objective is required");
+        selectedDirection = normalizeDirection(
+          await call("direction.create", { direction: { direction_uuid: randomUUID(), objective, created_by: actor.address } }),
+        );
+      } else if (action === "use") {
+        selectedDirection = await fetchDirection(String(params.direction_uuid ?? ""));
+      } else if (action === "status") {
+        if (!selectedDirection) throw new Error("No Direction selected");
+        const status = await fetchDirectionStatus(selectedDirection.direction_uuid);
+        selectedDirection = status.direction;
+        persistSelection();
+        return { content: [{ type: "text", text: boundedCoordinationText(status) }], details: { status } };
+      } else if (action === "transition") {
+        if (!selectedDirection || !params.state) throw new Error("Selected Direction and state are required");
+        selectedDirection = normalizeDirection(
+          await call("direction.transition", {
+            direction_uuid: selectedDirection.direction_uuid,
+            actor: actor.address,
+            state: params.state,
+          }),
+        );
+      }
+      persistSelection();
+      return {
+        content: [{ type: "text", text: boundedCoordinationText(selectedDirection) }],
+        details: { direction: selectedDirection },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "bridge_work",
+    label: "Agent Bridge WorkUnit",
+    description: "Propose or explicitly join, use, leave, transition, inspect, and clear a WorkUnit.",
+    parameters: Type.Object({
+      action: StringEnum(["propose", "use", "join", "leave", "status", "transition", "clear"] as const),
+      objective: Type.Optional(Type.String()),
+      work_unit_uuid: Type.Optional(Type.String()),
+      state: Type.Optional(StringEnum(["active", "blocked", "verified", "completed", "abandoned"] as const)),
+    }),
+    async execute(_toolCallId, params) {
+      if (!actor) throw new Error("Agent Bridge is not attached to an active session");
+      const action = String(params.action);
+      if (action === "clear") {
+        selectedWorkUnit = undefined;
+        persistSelection();
+        return { content: [{ type: "text", text: "WorkUnit selection cleared." }] };
+      }
+      if (action === "propose") {
+        const objective = String(params.objective ?? "").trim();
+        if (!objective) throw new Error("WorkUnit objective is required");
+        const scope = requireWorkUnitScope();
+        const direction = selectedDirection ? await fetchSelectedDirection() : undefined;
+        selectedWorkUnit = validateWorkUnit(
+          normalizeWorkUnit(
+            await call("work_unit.create", {
+              work_unit: {
+                work_unit_uuid: randomUUID(),
+                ...scope,
+                objective,
+                created_by: actor.address,
+                direction_uuid: direction?.direction_uuid,
+              },
+            }),
+          ),
+        );
+      } else {
+        const unit =
+          selectedWorkUnit && !params.work_unit_uuid ? selectedWorkUnit : await fetchWorkUnit(String(params.work_unit_uuid ?? ""));
+        if (action === "use" || action === "join") {
+          await call("work_unit.join", { work_unit_uuid: unit.work_unit_uuid, actor: actor.address });
+          selectedWorkUnit = unit;
+        } else if (action === "leave") {
+          await call("work_unit.leave", { work_unit_uuid: unit.work_unit_uuid, actor: actor.address });
+          if (selectedWorkUnit?.work_unit_uuid === unit.work_unit_uuid) selectedWorkUnit = undefined;
+        } else if (action === "status") selectedWorkUnit = await fetchWorkUnit(unit.work_unit_uuid);
+        else if (action === "transition") {
+          if (!params.state) throw new Error("WorkUnit state is required");
+          selectedWorkUnit = normalizeWorkUnit(
+            await call("work_unit.transition", { work_unit_uuid: unit.work_unit_uuid, actor: actor.address, state: params.state }),
+          );
+        }
+      }
+      persistSelection();
+      return { content: [{ type: "text", text: boundedCoordinationText(selectedWorkUnit) }], details: { work_unit: selectedWorkUnit } };
     },
   });
 
@@ -1338,11 +1599,13 @@ export function createAgentBridge(
         }
         if (action === "clear") {
           selectedDirection = undefined;
+          persistSelection();
           return void ctx.ui.notify("Direction selection cleared.", "info");
         }
         if (action === "use") {
           if (!rest[0]) throw new Error("/direction use requires a Direction UUID");
           selectedDirection = await fetchDirection(rest[0]);
+          persistSelection();
           return void ctx.ui.notify(`Selected Direction ${selectedDirection.direction_uuid}.`, "info");
         }
         const transitions: Record<string, string> = {
@@ -1363,6 +1626,7 @@ export function createAgentBridge(
               state: transition,
             }),
           );
+          persistSelection();
           return void ctx.ui.notify(`Direction ${selectedDirection.state}.`, "info");
         }
         if (!input) throw new Error(directionUsage);
@@ -1371,6 +1635,7 @@ export function createAgentBridge(
             direction: { direction_uuid: randomUUID(), objective: input, created_by: actor.address },
           }),
         );
+        persistSelection();
         ctx.ui.notify(`Created and selected Direction ${selectedDirection.direction_uuid}.`, "info");
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
@@ -1407,6 +1672,7 @@ export function createAgentBridge(
         }
         if (action === "clear") {
           selectedWorkUnit = undefined;
+          persistSelection();
           ctx.ui.notify("WorkUnit selection cleared.", "info");
           return;
         }
@@ -1416,6 +1682,7 @@ export function createAgentBridge(
           const unit = await fetchWorkUnit(uuid);
           await call("work_unit.join", { work_unit_uuid: unit.work_unit_uuid, actor: actor.address });
           await selectWorkUnit(unit);
+          persistSelection();
           ctx.ui.notify(`Selected WorkUnit ${unit.work_unit_uuid}.`, "info");
           return;
         }
@@ -1438,6 +1705,7 @@ export function createAgentBridge(
         validateWorkUnit(unit);
         await call("work_unit.join", { work_unit_uuid: unit.work_unit_uuid, actor: actor.address });
         await selectWorkUnit(unit);
+        persistSelection();
         ctx.ui.notify(`Created and selected WorkUnit ${unit.work_unit_uuid}.`, "info");
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
@@ -1471,17 +1739,25 @@ export function createAgentBridge(
     },
   });
 
-  pi.on("before_agent_start", (event) => ({
-    systemPrompt: `${event.systemPrompt}\n\nAgent Bridge automatically detects shared-workspace file collisions. When it reports one, do not revert unfamiliar edits; coordinate using bridge_message, then record yield or resolution using bridge_collision. You never declare edit intent manually. Checkpoint claims are asserted, verified, failed, or blocked: test/build/runtime claims are verified only with successful persisted evidence attached. Without evidence, say asserted and lacking verification; never claim tests, builds, or runtime checks passed.`,
-  }));
+  pi.on("before_agent_start", async (event) => {
+    let coordination = "";
+    if (selectedDirection || selectedWorkUnit) {
+      coordination = `\n\nSelected coordination: Direction=${selectedDirection?.direction_uuid ?? "none"} WorkUnit=${selectedWorkUnit?.work_unit_uuid ?? "none"}. Use bridge_context for bounded current state.`;
+    }
+    return {
+      systemPrompt: `${event.systemPrompt}\n\nAgent Bridge uses actor addresses (not Pi session UUIDs) for direct coordination. Do not revert unfamiliar shared-workspace edits; coordinate using bridge_message, then record yield or resolution using bridge_collision. Checkpoint guidance: record proposals, findings, decisions, and handoffs as concise checkpoints; test/build/runtime claims are verified only with successful persisted evidence, otherwise say asserted. Never poll background agents or the mailbox with sleep commands; finish the turn and let event-driven mailbox delivery reactivate the session.${coordination}`,
+    };
+  });
 
   pi.on("session_start", async (event, ctx) => {
     sessionCtx = ctx;
-    pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "bridge_provenance"));
+    const deferredTools = new Set(["bridge_provenance", "bridge_context", "bridge_direction", "bridge_work"]);
+    pi.setActiveTools(pi.getActiveTools().filter((name) => !deferredTools.has(name)));
     generation = Date.now();
     clientSequence = 0;
     sessionEventSequence = 0;
     currentTurnIndex = undefined;
+    selectedDirection = undefined;
     selectedWorkUnit = undefined;
     capturedTestResults = [];
     declarationSequence = 0;
@@ -1523,12 +1799,38 @@ export function createAgentBridge(
       } satisfies ActorRecord,
     });
     await reconcileLeases();
+    const saved = savedSelection(ctx);
+    let staleSavedSelection = false;
+    if (saved?.direction_uuid) {
+      try {
+        selectedDirection = await fetchDirection(saved.direction_uuid);
+      } catch (error) {
+        reportError(ctx, error);
+        selectedDirection = undefined;
+        staleSavedSelection = true;
+      }
+    }
+    if (saved?.work_unit_uuid) {
+      try {
+        const restored = await fetchWorkUnit(saved.work_unit_uuid);
+        if (restored.direction_uuid && !selectedDirection) selectedDirection = await fetchDirection(restored.direction_uuid);
+        selectedWorkUnit = restored;
+      } catch (error) {
+        reportError(ctx, error);
+        selectedWorkUnit = undefined;
+        staleSavedSelection = true;
+      }
+    }
+    if (staleSavedSelection) persistSelection();
     const workUnitUUID = process.env.AGENT_BRIDGE_WORK_UNIT_UUID;
     if (workUnitUUID !== undefined) {
       canonicalUUID(workUnitUUID, "Agent Bridge WorkUnit UUID");
       const inheritedWorkUnit = await fetchWorkUnit(workUnitUUID);
+      if (inheritedWorkUnit.direction_uuid && !selectedDirection)
+        selectedDirection = await fetchDirection(inheritedWorkUnit.direction_uuid);
       await call("work_unit.join", { work_unit_uuid: workUnitUUID, actor: actor.address });
       await selectWorkUnit(inheritedWorkUnit);
+      persistSelection();
     }
     await recordSessionEvent("session.started", { data: { reason: event.reason, work_unit_uuid: workUnitUUID } });
     await pollMailbox();
@@ -1554,13 +1856,23 @@ export function createAgentBridge(
     if (currentTurnIndex === event.turnIndex) currentTurnIndex = undefined;
   });
 
+  pi.on("session_before_compact", async () => {
+    compacting = true;
+  });
+
   pi.on("session_compact", async (event) => {
-    const entry = event.compactionEntry as { summary?: unknown; tokensBefore?: unknown };
-    const summary = String(entry?.summary ?? "");
-    await recordSessionEvent("session.compacted", {
-      summary: summary.length <= 20_000 ? summary : `${summary.slice(0, 19_999)}…`,
-      data: { reason: event.reason, tokens_before: entry?.tokensBefore },
-    });
+    try {
+      const entry = event.compactionEntry as { summary?: unknown; tokensBefore?: unknown };
+      const summary = String(entry?.summary ?? "");
+      await recordSessionEvent("session.compacted", {
+        summary: summary.length <= 20_000 ? summary : `${summary.slice(0, 19_999)}…`,
+        data: { reason: event.reason, tokens_before: entry?.tokensBefore },
+      });
+    } finally {
+      compacting = false;
+      void heartbeat();
+      void pollMailbox();
+    }
   });
 
   pi.on("tool_call", async (event, ctx) => {
@@ -1570,6 +1882,12 @@ export function createAgentBridge(
         .split(".")
         .at(-1) ?? "";
     const input = event.input as Record<string, unknown> | undefined;
+    if (toolName === "bash" && typeof input?.command === "string" && pollingSleepCommand(input.command)) {
+      return {
+        block: true,
+        reason: "Polling sleeps are disabled. Finish the turn and let Pi mailbox events reactivate the session.",
+      };
+    }
     const toolCallId = String(event.toolCallId ?? "");
     if (toolName === "bash" && typeof input?.command === "string" && verificationCommand(input.command) && toolCallId) {
       verificationRuns.set(toolCallId, { command: input.command, cwd: ctx.cwd, startedAt: new Date() });
@@ -1659,6 +1977,7 @@ export function createAgentBridge(
 
   pi.on("tool_result", async (event) => {
     const toolCallId = String(event.toolCallId ?? "");
+    const lease = detachLease(toolCallId);
     try {
       const verification = verificationRuns.get(toolCallId);
       verificationRuns.delete(toolCallId);
@@ -1704,20 +2023,27 @@ export function createAgentBridge(
       }
       await endMutation(toolCallId, Boolean(event.isError));
     } finally {
-      await closeLease(toolCallId);
+      await releaseDetachedLease(lease);
     }
   });
 
   pi.on("tool_execution_end", async (event) => {
     const toolCallId = String(event.toolCallId ?? "");
+    const lease = detachLease(toolCallId);
     try {
       await endMutation(toolCallId, Boolean(event.isError));
     } finally {
-      await closeLease(toolCallId);
+      await releaseDetachedLease(lease);
     }
   });
 
   pi.on("agent_settled", async () => {
+    if (compacting) {
+      // Failed or canceled compaction has no session_compact event.
+      compacting = false;
+      void heartbeat();
+      void pollMailbox();
+    }
     if (!actor) return;
     await recordSessionEvent("agent.settled", { turnIndex: currentTurnIndex }).catch((error) => reportError(sessionCtx, error));
     if (pendingAcknowledgements.size === 0) return;
@@ -1740,8 +2066,12 @@ export function createAgentBridge(
     leaseRenewTimer = undefined;
     const pendingToolCalls = new Set([...openIntents.keys(), ...openLeases.keys()]);
     for (const toolCallId of pendingToolCalls) {
-      await endMutation(toolCallId, true, "session ended before tool completion");
-      await closeLease(toolCallId);
+      const lease = detachLease(toolCallId);
+      try {
+        await endMutation(toolCallId, true, "session ended before tool completion");
+      } finally {
+        await releaseDetachedLease(lease);
+      }
     }
     openIntents.clear();
     openLeases.clear();
@@ -1749,6 +2079,13 @@ export function createAgentBridge(
     if (actor) await call("actor.heartbeat", { address: actor.address, state: "dead", generation }).catch(() => undefined);
     actor = undefined;
     sessionCtx = undefined;
+    compacting = false;
+    backgroundOutage = false;
+    backgroundRecovered.clear();
+    for (const retry of Object.values(backgroundRetry)) {
+      retry.failures = 0;
+      retry.nextAt = 0;
+    }
     selectedWorkUnit = undefined;
     selectedDirection = undefined;
     capturedTestResults = [];

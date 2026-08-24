@@ -28,7 +28,7 @@ func projectExternalChange(tx *sql.Tx, event *protocol.Event) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(context.Background(), `INSERT OR IGNORE INTO external_changes(external_change_uuid,repository_uuid,workspace_uuid,unknown_actor_uuid,interval_started_at,interval_ended_at,continuity_state,change_kind,watchman_clock,before_json,after_json,data,event_sequence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, uuidBlob(change.ID), uuidBlob(change.RepositoryUUID), uuidBlob(change.WorkspaceUUID), uuidBlob(change.UnknownActor), change.IntervalStartedAt.UTC().Format(time.RFC3339Nano), change.IntervalEndedAt.UTC().Format(time.RFC3339Nano), change.ContinuityState, change.ChangeKind, change.WatchmanClock, before, after, string(event.Data), event.Sequence)
+	_, err = tx.ExecContext(context.Background(), `INSERT OR IGNORE INTO external_changes(external_change_uuid,repository_uuid,workspace_uuid,unknown_actor_uuid,interval_started_at,interval_ended_at,continuity_state,change_kind,watchman_clock,before_json,after_json,data,event_sequence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, uuidBlob(change.ID), uuidBlob(change.RepositoryUUID), uuidBlob(change.WorkspaceUUID), uuidBlob(change.UnknownActor), change.IntervalStartedAt.UTC().Format(time.RFC3339Nano), change.IntervalEndedAt.UTC().Format(time.RFC3339Nano), change.ContinuityState, change.ChangeKind, change.WatchmanClock, before, after, "", event.Sequence)
 	if err != nil {
 		return err
 	}

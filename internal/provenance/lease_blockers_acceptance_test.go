@@ -55,14 +55,32 @@ func takeoverRequest(pred, succ, token, actor string, at time.Time) protocol.Mut
 	}
 }
 
+func TestAcquireAppendFailureLeavesNoLeaseProjection(t *testing.T) {
+	db, at, actor, _, repo, workspace, intent := leaseFixture(t)
+	appender := &leaseTestAppender{fail: true}
+	db.SetLeaseAppender(appender, 0)
+	leaseUUID := actorUUID("failed-acquire")
+	_, err := db.AcquireMutationLease(context.Background(), leaseRequest(actor, leaseUUID, actorUUID("failed-acquire-token"), intent, "tool-a", repo, workspace, 1, []string{"/repo/failed-acquire"}, at))
+	if err == nil {
+		t.Fatal("acquire unexpectedly succeeded with a failed journal append")
+	}
+	var leases int
+	if err := db.db.QueryRowContext(context.Background(), `SELECT count(*) FROM mutation_leases WHERE lease_uuid=?`, uuidBlob(leaseUUID)).Scan(&leases); err != nil {
+		t.Fatal(err)
+	}
+	if leases != 0 {
+		t.Fatalf("lease projection rows after failed append = %d", leases)
+	}
+}
+
 func TestTakeoverAppendFailureLeavesPredecessorActiveAndNoSuccessor(t *testing.T) {
 	db, at, a, b, repo, workspace, intent := leaseFixture(t)
-	appender := &leaseTestAppender{}
-	db.SetLeaseAppender(appender, 0)
 	root, err := db.AcquireMutationLease(context.Background(), leaseRequest(a, actorUUID("append-root"), actorUUID("append-token"), intent, "tool-a", repo, workspace, 1, []string{"/repo/append"}, at))
 	if err != nil {
 		t.Fatal(err)
 	}
+	appender := &leaseTestAppender{}
+	db.SetLeaseAppender(appender, 0)
 	appender.mu.Lock()
 	appender.fail = true
 	appender.mu.Unlock()
@@ -86,7 +104,7 @@ func TestTakeoverAppendFailureLeavesPredecessorActiveAndNoSuccessor(t *testing.T
 	}
 }
 
-//nolint:cyclop,gocognit // End-to-end restart coverage intentionally combines projection and engine replay.
+//nolint:cyclop,gocognit,funlen // End-to-end restart coverage intentionally combines projection and engine replay.
 func TestOneTakeoverEventRebuildsLineageAndCanonicalMessageAndEnginePollsAfterRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bridge.db")
 	db, err := OpenProjection(path)
@@ -102,6 +120,12 @@ func TestOneTakeoverEventRebuildsLineageAndCanonicalMessageAndEnginePollsAfterRe
 	seedLeaseIntent(t, db, a, "restart-intent", "restart-tool", repo, workspace, at)
 	root, err := db.AcquireMutationLease(context.Background(), leaseRequest(a, actorUUID("restart-root"), actorUUID("restart-root-token"), "restart-intent", "restart-tool", repo, workspace, 1, []string{"/repo/restart"}, at))
 	if err != nil {
+		t.Fatal(err)
+	}
+	appender.mu.Lock()
+	rootEvent := appender.events[len(appender.events)-1]
+	appender.mu.Unlock()
+	if err := db.Project(rootEvent); err != nil {
 		t.Fatal(err)
 	}
 	successor := actorUUID("restart-successor")

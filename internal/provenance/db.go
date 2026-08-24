@@ -33,9 +33,11 @@ type DB struct {
 	// leaseAppender is the only authority allowed to publish lease lifecycle
 	// events. Lease SQL tables are projections and are never used to allocate
 	// event sequences.
-	leaseMu         sync.Mutex
-	leaseTakeoverMu sync.Mutex
-	leaseAppender   interface {
+	leaseMu          sync.Mutex
+	leaseCommandMu   sync.Mutex
+	leaseAdmissionMu sync.Mutex
+	leaseTakeoverMu  sync.Mutex
+	leaseAppender    interface {
 		AppendNext(protocol.Event) (protocol.Event, error)
 	}
 	ownedLeaseAppender interface{ Close() }
@@ -382,6 +384,7 @@ func initializeSchemaGroup2() []string {
 		`CREATE TABLE IF NOT EXISTS external_changes (external_change_uuid BLOB PRIMARY KEY, repository_uuid BLOB NOT NULL, workspace_uuid BLOB NOT NULL, unknown_actor_uuid BLOB NOT NULL, interval_started_at TEXT NOT NULL, interval_ended_at TEXT NOT NULL, continuity_state TEXT NOT NULL, change_kind TEXT NOT NULL, watchman_clock TEXT NOT NULL, before_json TEXT, after_json TEXT, data TEXT NOT NULL, event_sequence INTEGER NOT NULL) STRICT`,
 		`CREATE TABLE IF NOT EXISTS external_change_paths (external_change_uuid BLOB NOT NULL REFERENCES external_changes(external_change_uuid) ON DELETE CASCADE, path TEXT NOT NULL, PRIMARY KEY(external_change_uuid, path)) STRICT`,
 		`CREATE TABLE IF NOT EXISTS external_change_intents (external_change_uuid BLOB NOT NULL REFERENCES external_changes(external_change_uuid) ON DELETE CASCADE, intent_id TEXT NOT NULL, PRIMARY KEY(external_change_uuid, intent_id)) STRICT`,
+		`CREATE INDEX IF NOT EXISTS external_changes_retention ON external_changes(interval_ended_at)`,
 		`CREATE TABLE IF NOT EXISTS workspace_continuity (workspace_uuid BLOB PRIMARY KEY, repository_uuid BLOB NOT NULL, state TEXT NOT NULL, at TEXT NOT NULL, watchman_clock TEXT, event_sequence INTEGER NOT NULL) STRICT`,
 	}
 }
@@ -741,8 +744,14 @@ func (d *DB) Project(event protocol.Event) error {
 }
 
 func (d *DB) projectEvent(transaction *sql.Tx, event *protocol.Event) (bool, error) {
+	storedData := string(event.Data)
+	if event.Type == "external_change.observed" {
+		// Structured external-change columns are the query model. Duplicating the
+		// full payload in the raw event table roughly doubles database growth.
+		storedData = ""
+	}
 	result, err := transaction.ExecContext(context.Background(), `INSERT OR IGNORE INTO events(sequence, type, at, data) VALUES (?, ?, ?, ?)`,
-		event.Sequence, event.Type, event.At.UTC().Format(time.RFC3339Nano), string(event.Data))
+		event.Sequence, event.Type, event.At.UTC().Format(time.RFC3339Nano), storedData)
 	if err != nil {
 		return false, fmt.Errorf("record provenance event %d: %w", event.Sequence, err)
 	}
@@ -755,7 +764,7 @@ func (d *DB) projectEvent(transaction *sql.Tx, event *protocol.Event) (bool, err
 		if err := transaction.QueryRowContext(context.Background(), `SELECT type, data FROM events WHERE sequence = ?`, event.Sequence).Scan(&existingType, &existingData); err != nil {
 			return false, fmt.Errorf("check duplicate provenance event %d: %w", event.Sequence, err)
 		}
-		if existingType != event.Type || existingData != string(event.Data) {
+		if existingType != event.Type || existingData != storedData {
 			return false, fmt.Errorf("conflicting provenance event sequence %d", event.Sequence)
 		}
 		return false, nil

@@ -22,6 +22,11 @@ import (
 	watchsidecar "github.com/AndrewPBerg/agent-bridge/internal/watchman"
 )
 
+const (
+	projectionRetention = 14 * 24 * time.Hour
+	retentionSweepEvery = 6 * time.Hour
+)
+
 func main() {
 	// Provenance, journals, WAL files, and sockets are private by default.
 	syscall.Umask(0o077)
@@ -67,11 +72,6 @@ func serve(args []string) error {
 		return fmt.Errorf("write daemon metadata: %w", err)
 	}
 	defer removeDaemonMetadata(metadata)
-	journal, events, err := store.Open(*journalPath)
-	if err != nil {
-		return err
-	}
-	defer closeQuietly(journal)
 	database, err := provenance.OpenProjection(*databasePath)
 	if err != nil {
 		return err
@@ -81,6 +81,13 @@ func serve(args []string) error {
 	if err != nil {
 		return fmt.Errorf("read provenance projection sequence: %w", err)
 	}
+	// Historical external-change payloads already live in the query projection;
+	// the coordination engine does not need another in-memory copy.
+	journal, events, err := store.Open(*journalPath, projectedSequence)
+	if err != nil {
+		return err
+	}
+	defer closeQuietly(journal)
 	if projectedSequence > uint64(len(events)) {
 		return fmt.Errorf("provenance projection sequence %d is ahead of journal sequence %d", projectedSequence, len(events))
 	}
@@ -88,26 +95,52 @@ func serve(args []string) error {
 	if err := database.ProjectAll(events[projectedSequence:]); err != nil {
 		return fmt.Errorf("backfill provenance database: %w", err)
 	}
+	pruneExpiredProjection(context.Background(), database)
 	initialSequence := uint64(0)
 	if len(events) > 0 {
 		initialSequence = events[len(events)-1].Sequence
 	}
 	appender := provenance.NewProjectingAppender(journal, database, initialSequence)
 	defer appender.Close()
-	// Lease commands publish through the same authoritative journal/appender as
-	// every other coordination event; the SQLite lease tables are projections.
-	database.SetLeaseAppender(appender, initialSequence)
 	engine, err := state.New(appender, events, state.Options{})
 	if err != nil {
 		return err
 	}
-	appender.SetObserver(engine.ApplyExternal)
+	// Lease commands publish through the engine so all state and journal writes
+	// use one lock order. A journal observer introduces the inverse order and can
+	// deadlock heartbeats/mailbox reads against a concurrent engine mutation.
+	database.SetLeaseAppender(engine, initialSequence)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 	watchManager := watchsidecar.New(engine)
 	go watchManager.Run(ctx)
+	go runProjectionRetention(ctx, database)
 	fmt.Fprintf(os.Stderr, "agent-bridge listening on %s (ready in %s, replayed %d events, backfilled %d, provenance %s, watchman %t)\n", *socket, time.Since(startupStarted).Round(time.Millisecond), len(events), backfillCount, *databasePath, watchManager.Available())
 	return server.NewWithProvenance(engine, database, *socket, appender).Serve(ctx)
+}
+
+func pruneExpiredProjection(ctx context.Context, database *provenance.DB) {
+	result, err := database.PruneExternalChangesBefore(ctx, time.Now().UTC().Add(-projectionRetention))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent-bridge: projection retention sweep failed: %v\n", err)
+		return
+	}
+	if result.ExternalChanges > 0 || result.RawEvents > 0 {
+		fmt.Fprintf(os.Stderr, "agent-bridge: projection retention removed %d external changes and %d raw events older than %s\n", result.ExternalChanges, result.RawEvents, projectionRetention)
+	}
+}
+
+func runProjectionRetention(ctx context.Context, database *provenance.DB) {
+	ticker := time.NewTicker(retentionSweepEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pruneExpiredProjection(ctx, database)
+		}
+	}
 }
 
 func sessions(args []string) error {

@@ -396,6 +396,67 @@ describe("Go Agent Bridge adapter", () => {
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });
 
+  it("defers mailbox delivery while compaction is running", async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createMockPi();
+      pi.sendMessage = vi.fn();
+      let polls = 0;
+      const message: BridgeMessage = {
+        id: "during-compaction",
+        from: "peer",
+        to: "sender",
+        kind: "message",
+        body: "wait until compacted",
+        created_at: new Date().toISOString(),
+        global_sequence: 1,
+        sender_sequence: 1,
+        recipient_sequence: 1,
+      };
+      const client = mockClient((method) => {
+        if (method === "mailbox.poll") return { messages: ++polls === 1 ? [] : [message] };
+        return undefined;
+      });
+      const ctx = await start(pi, client);
+      await emitAll(pi, "session_before_compact", { reason: "threshold" }, ctx);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(polls).toBe(1);
+      expect(pi.sendMessage).not.toHaveBeenCalled();
+
+      await emitAll(pi, "session_compact", { reason: "threshold", compactionEntry: { summary: "done", tokensBefore: 42_000 } }, ctx);
+      await Promise.resolve();
+      expect(polls).toBe(2);
+      expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("coalesces background RPC failures and backs off retries", async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createMockPi();
+      const client = mockClient((method) => {
+        if (method === "mailbox.poll" || method === "actor.heartbeat") throw new Error(`Agent Bridge ${method} timed out`);
+        return undefined;
+      });
+      const ctx = await start(pi, client);
+      await vi.advanceTimersByTimeAsync(90_000);
+
+      const outageWarnings = vi
+        .mocked(ctx.ui.notify)
+        .mock.calls.filter(([message, level]) => level === "warning" && String(message).includes("retrying quietly"));
+      expect(outageWarnings).toHaveLength(1);
+      const calls = vi.mocked(client.call).mock.calls;
+      expect(calls.filter(([method]) => method === "mailbox.poll").length).toBeLessThan(10);
+      expect(calls.filter(([method]) => method === "actor.heartbeat").length).toBeLessThan(8);
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("silently reconnects and re-registers after a daemon restart", async () => {
     const pi = createMockPi();
     let failNextSessionEvent = false;
@@ -510,7 +571,7 @@ describe("Go Agent Bridge adapter", () => {
         input: { command: "pnpm test" },
         isError: false,
         content: [{ type: "text", text: "passed" }],
-        details: { output: "passed", exitCode: 0, truncated: false },
+        details: undefined,
       },
       ctx,
     );
@@ -533,6 +594,35 @@ describe("Go Agent Bridge adapter", () => {
         request: expect.objectContaining({ test_result_ids: [], claims: [expect.objectContaining({ status: "asserted", evidence: [] })] }),
       }),
     );
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("captures verification commands behind cd and package-directory options without matching arbitrary shell text", async () => {
+    const pi = createMockPi();
+    let persisted = 0;
+    const client = mockClient((method) => (method === "test.result" ? { id: `result-${++persisted}` } : undefined));
+    const ctx = await start(pi, client);
+    const commands = [
+      "cd packages/pi-extension && pnpm test",
+      "pnpm --dir packages/pi-extension test",
+      "npm --dir packages/pi-extension run typecheck",
+    ];
+    for (const [index, command] of commands.entries()) {
+      const event = { toolName: "bash", toolCallId: `scoped-${index}`, input: { command } };
+      await emitAll(pi, "tool_call", event, ctx);
+      await emitAll(
+        pi,
+        "tool_result",
+        { ...event, isError: false, content: [{ type: "text", text: "passed\nexit code: 0" }], details: { truncated: false } },
+        ctx,
+      );
+    }
+    const unrelated = { toolName: "bash", toolCallId: "not-verification", input: { command: "echo 'pnpm test'" } };
+    await emitAll(pi, "tool_call", unrelated, ctx);
+    await emitAll(pi, "tool_result", { ...unrelated, isError: false, content: [{ type: "text", text: "pnpm test" }] }, ctx);
+    const results = vi.mocked(client.call).mock.calls.filter(([method]) => method === "test.result");
+    expect(results).toHaveLength(3);
+    expect(results.map(([, params]) => (params as any).result.command)).toEqual(commands);
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });
 
@@ -1186,6 +1276,31 @@ describe("Go Agent Bridge adapter", () => {
     }
   });
 
+  it("releases an admission result that arrives after session shutdown", async () => {
+    const pi = createMockPi();
+    let acquireRequest: any;
+    let resolveAcquire!: (value: MutationLeaseResult) => void;
+    const client = leaseClient((method, params) => {
+      if (method === "mutation_lease.acquire") {
+        acquireRequest = params;
+        return new Promise<MutationLeaseResult>((resolve) => {
+          resolveAcquire = resolve;
+        });
+      }
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    const pending = emitAll(pi, "tool_call", { toolName: "edit", toolCallId: "shutdown-admission", input: { path: "src/a.ts" } }, ctx);
+    await vi.waitFor(() => expect(acquireRequest).toBeDefined());
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    resolveAcquire({ decision: "grant", lease: leaseForRequest(acquireRequest) });
+    await expect(pending).resolves.toEqual(expect.objectContaining({ block: true, reason: expect.stringContaining("canceled") }));
+    const releases = vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.release");
+    expect(releases.at(-1)?.[1]).toEqual(
+      expect.objectContaining({ lease_uuid: acquireRequest.lease_uuid, fencing_token: acquireRequest.fencing_token }),
+    );
+  });
+
   it("fails safe when the daemon disconnects during lease admission or release", async () => {
     const pi = createMockPi();
     const client = leaseClient((method) => {
@@ -1422,6 +1537,44 @@ describe("Go Agent Bridge adapter", () => {
     }
   });
 
+  it("detaches a finished tool before ending its intent so a blocked renewal cannot abort it", async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createMockPi();
+      let resolveRenew!: (value: MutationLeaseResult) => void;
+      let resolveIntentEnd!: (value: unknown) => void;
+      let holdIntentEnd = false;
+      const client = leaseClient((method) => {
+        if (method === "mutation_lease.renew") {
+          return new Promise<MutationLeaseResult>((resolve) => {
+            resolveRenew = resolve;
+          });
+        }
+        if (method === "intent.end" && holdIntentEnd) {
+          return new Promise((resolve) => {
+            resolveIntentEnd = resolve;
+          });
+        }
+        return undefined;
+      });
+      const ctx = await start(pi, client);
+      await emitAll(pi, "tool_call", { toolName: "edit", toolCallId: "closing-renew", input: { path: "src/a.ts" } }, ctx);
+      await vi.advanceTimersByTimeAsync(15_000);
+      holdIntentEnd = true;
+      const finishing = emitAll(pi, "tool_result", { toolName: "edit", toolCallId: "closing-renew", isError: false }, ctx);
+      await vi.waitFor(() => expect(vi.mocked(client.call).mock.calls.some(([method]) => method === "intent.end")).toBe(true));
+      resolveRenew({ decision: "block", reason: "mutation intent is missing or already completed" });
+      await Promise.resolve();
+      expect(ctx.abort).not.toHaveBeenCalled();
+      expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("intent"), "warning");
+      resolveIntentEnd({});
+      await finishing;
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("aborts and releases immediately when renewal is blocked", async () => {
     vi.useFakeTimers();
     try {
@@ -1543,6 +1696,159 @@ describe("Go Agent Bridge adapter", () => {
     expect(client.call).not.toHaveBeenCalledWith("mailbox.ack", expect.anything());
     await pi.events.get("agent_settled")?.[0]?.({}, ctx);
     expect(client.call).toHaveBeenCalledWith("mailbox.ack", { actor: "sender", message_ids: ["message-1"] });
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("restores a persisted Direction selection on session start", async () => {
+    const directionUUID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const direction = { direction_uuid: directionUUID, objective: "restore direction", state: "active", created_by: "sender" };
+    const pi = createMockPi();
+    const client = mockClient((method) => {
+      if (method === "actor.register") return { ...actor(), repository_uuid: repositoryUUID, workspace_uuid: workspaceUUID };
+      if (method === "direction.get") return direction;
+      if (method === "direction.status") return { direction, work_units: [] };
+      return undefined;
+    });
+    const ctx = context();
+    ctx.sessionManager.getEntries = vi.fn(
+      () => [{ type: "custom", customType: "agent-bridge-coordination", data: { direction_uuid: directionUUID } }] as any,
+    );
+    await start(pi, client, ctx);
+    await pi.tools.get("bridge_tools").execute("coordination", { domain: "coordination" });
+    const result = await pi.tools.get("bridge_context").execute("context", {});
+    expect(result.details.direction.direction).toEqual(direction);
+    expect(client.call).toHaveBeenCalledWith("direction.get", { direction_uuid: directionUUID });
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("restores a persisted WorkUnit and inherits its Direction", async () => {
+    const directionUUID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const direction = { direction_uuid: directionUUID, objective: "inherited direction", state: "active", created_by: "sender" };
+    const unit = { ...workUnit(), direction_uuid: directionUUID };
+    const pi = createMockPi();
+    const client = mockClient((method) => {
+      if (method === "actor.register") return { ...actor(), repository_uuid: repositoryUUID, workspace_uuid: workspaceUUID };
+      if (method === "provenance.work_unit") return unit;
+      if (method === "direction.get") return direction;
+      if (method === "direction.status") return { direction, work_units: [unit] };
+      return undefined;
+    });
+    const ctx = context();
+    ctx.sessionManager.getEntries = vi.fn(
+      () => [{ type: "custom", customType: "agent-bridge-coordination", data: { work_unit_uuid: defaultWorkUnitUUID } }] as any,
+    );
+    await start(pi, client, ctx);
+    await pi.tools.get("bridge_tools").execute("coordination", { domain: "coordination" });
+    const result = await pi.tools.get("bridge_context").execute("context", {});
+    expect(result.details.work_unit).toEqual(unit);
+    expect(result.details.direction.direction).toEqual(direction);
+    expect(client.call).toHaveBeenCalledWith("direction.get", { direction_uuid: directionUUID });
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("persists cleared state after stale saved selections so later starts do not retry them", async () => {
+    const directionUUID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const pi = createMockPi();
+    const client = mockClient((method) => {
+      if (method === "actor.register") return { ...actor(), repository_uuid: repositoryUUID, workspace_uuid: workspaceUUID };
+      if (method === "direction.get" || method === "provenance.work_unit") throw new Error("not found");
+      return undefined;
+    });
+    const ctx = context();
+    ctx.sessionManager.getEntries = vi.fn(
+      () =>
+        [
+          {
+            type: "custom",
+            customType: "agent-bridge-coordination",
+            data: { direction_uuid: directionUUID, work_unit_uuid: defaultWorkUnitUUID },
+          },
+        ] as any,
+    );
+    await start(pi, client, ctx);
+    expect(pi.entries.at(-1)).toEqual({
+      customType: "agent-bridge-coordination",
+      data: { direction_uuid: undefined, work_unit_uuid: undefined },
+    });
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+
+    const nextPi = createMockPi();
+    const nextClient = mockClient((method) =>
+      method === "actor.register" ? { ...actor(), repository_uuid: repositoryUUID, workspace_uuid: workspaceUUID } : undefined,
+    );
+    const nextCtx = context("next");
+    nextCtx.sessionManager.getEntries = vi.fn(() => pi.entries.map((entry) => ({ type: "custom", ...entry })) as any);
+    await start(nextPi, nextClient, nextCtx);
+    expect(nextClient.call).not.toHaveBeenCalledWith("direction.get", expect.anything());
+    expect(nextClient.call).not.toHaveBeenCalledWith("provenance.work_unit", expect.anything());
+    await nextPi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, nextCtx);
+  });
+
+  it("loads coordination tools lazily and refuses awakening a live actor", async () => {
+    const pi = createMockPi();
+    pi.activeTools.push("bridge_context", "bridge_direction", "bridge_work");
+    const live = { ...actor("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), state: "active" as const };
+    const client = mockClient((method) => (method === "sessions.list" ? { actors: [live] } : undefined));
+    const ctx = await start(pi, client);
+    expect(pi.getActiveTools()).not.toContain("bridge_context");
+    await pi.tools.get("bridge_tools").execute("load", { domain: "coordination" });
+    expect(pi.getActiveTools()).toEqual(expect.arrayContaining(["bridge_context", "bridge_direction", "bridge_work"]));
+    await expect(pi.tools.get("bridge_awaken").execute("awaken", { target: live.address, request: "inspect" })).rejects.toThrow(
+      "live actor",
+    );
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+  it("scopes peer context and keeps WorkUnit proposals separate from joining", async () => {
+    const pi = createMockPi();
+    const parent = {
+      ...actor("11111111-1111-5111-8111-111111111111"),
+      repository_uuid: repositoryUUID,
+      workspace_uuid: workspaceUUID,
+    };
+    const peer = { ...actor("44444444-4444-5444-8444-444444444444"), repository_uuid: repositoryUUID, workspace_uuid: workspaceUUID };
+    const proposed = { ...workUnit(), state: "proposed" };
+    const client = mockClient((method, _params) => {
+      if (method === "actor.register" || method === "actor.heartbeat") return parent;
+      if (method === "sessions.list") return { actors: [parent, peer] };
+      if (method === "work_unit.create" || method === "provenance.work_unit") return proposed;
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await pi.tools.get("bridge_tools").execute("load", { domain: "coordination" });
+    const contextTool = pi.tools.get("bridge_context");
+    const defaultContext = await contextTool.execute("default", {});
+    expect(defaultContext.details.peers.map((candidate: ActorRecord) => candidate.address)).toEqual([peer.address]);
+    expect(client.call).toHaveBeenCalledWith("sessions.list", { include_stale: false, repository_uuid: repositoryUUID });
+    await contextTool.execute("under", { under: "/repo/src" });
+    expect(client.call).toHaveBeenCalledWith("sessions.list", { include_stale: false, directory: "/repo/src" });
+    await expect(contextTool.execute("ambiguous", { directory: "/repo", under: "/repo/src" })).rejects.toThrow("either directory or under");
+
+    await pi.tools.get("bridge_work").execute("propose", { action: "propose", objective: "Inspect typed routes" });
+    expect(client.call).toHaveBeenCalledWith(
+      "work_unit.create",
+      expect.objectContaining({ work_unit: expect.objectContaining({ objective: "Inspect typed routes" }) }),
+    );
+    expect(client.call).not.toHaveBeenCalledWith("work_unit.join", expect.anything());
+    expect(pi.entries.at(-1)?.data.work_unit_uuid).toBe(defaultWorkUnitUUID);
+    await pi.tools.get("bridge_work").execute("join", { action: "join", work_unit_uuid: defaultWorkUnitUUID });
+    expect(client.call).toHaveBeenCalledWith("work_unit.join", { work_unit_uuid: defaultWorkUnitUUID, actor: parent.address });
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+  it("blocks wait-only polling sleeps but permits sleeps inside real compound workflows", async () => {
+    const pi = createMockPi();
+    const client = mockClient();
+    const ctx = await start(pi, client);
+    await expect(
+      emitAll(pi, "tool_call", { toolName: "bash", toolCallId: "poll", input: { command: "sleep 35; echo ready" } }, ctx),
+    ).resolves.toEqual(expect.objectContaining({ block: true, reason: expect.stringContaining("mailbox events reactivate") }));
+    await expect(
+      emitAll(
+        pi,
+        "tool_call",
+        { toolName: "bash", toolCallId: "workflow", input: { command: "sleep 0.1 && curl http://localhost/health" } },
+        ctx,
+      ),
+    ).resolves.toBeUndefined();
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
   });
 });

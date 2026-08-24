@@ -54,6 +54,13 @@ func TestExternalChangeProjectionUsesNormalizedUUIDRelations(t *testing.T) {
 	if idLength != 16 || repositoryLength != 16 || workspaceLength != 16 || actorLength != 16 {
 		t.Fatalf("UUID lengths = %d/%d/%d/%d", idLength, repositoryLength, workspaceLength, actorLength)
 	}
+	var rawEventBytes, externalDataBytes int
+	if err := database.db.QueryRowContext(context.Background(), `SELECT length(e.data), length(x.data) FROM events e JOIN external_changes x ON x.event_sequence=e.sequence WHERE e.sequence=1`).Scan(&rawEventBytes, &externalDataBytes); err != nil {
+		t.Fatal(err)
+	}
+	if rawEventBytes != 0 || externalDataBytes != 0 {
+		t.Fatalf("external payload duplicated in projection: events=%d external=%d", rawEventBytes, externalDataBytes)
+	}
 	continuity, err := database.WorkspaceContinuity(workspace)
 	if err != nil || continuity.State != "restored" {
 		t.Fatalf("continuity = %#v, %v", continuity, err)

@@ -57,6 +57,25 @@ func validateExternalChange(change protocol.ExternalChange) error {
 	return nil
 }
 
+//nolint:gocritic // The event-sourced state API intentionally stores a value copy.
+func (e *Engine) rememberExternalChange(change protocol.ExternalChange) error {
+	if existing, ok := e.externalChanges[change.ID]; ok {
+		if reflect.DeepEqual(existing, change) {
+			return nil
+		}
+		return errors.New("conflicting external change replay")
+	}
+	if len(e.externalChangeOrder) < externalChangeCacheLimit {
+		e.externalChangeOrder = append(e.externalChangeOrder, change.ID)
+	} else {
+		delete(e.externalChanges, e.externalChangeOrder[e.externalChangeCursor])
+		e.externalChangeOrder[e.externalChangeCursor] = change.ID
+		e.externalChangeCursor = (e.externalChangeCursor + 1) % externalChangeCacheLimit
+	}
+	e.externalChanges[change.ID] = change
+	return nil
+}
+
 func (e *Engine) externalWorkspaceRoot(repositoryUUID, workspaceUUID string) (string, bool) {
 	for address := range e.actors {
 		actor := e.actors[address]
@@ -246,7 +265,11 @@ func (e *Engine) NotifyExternalChange(change protocol.ExternalChange) error {
 	return nil
 }
 
-// ExternalChange returns an observed change by canonical UUID.
+// ExternalChange returns a recently observed change by canonical UUID.
+// Durable historical observations are queried from the provenance projection.
+// ExternalChange exposes the bounded in-memory cache for state-level tests.
+//
+//nolint:unparam // The production consumer is the journal replay path; tests inspect the cache directly.
 func (e *Engine) ExternalChange(id string) (protocol.ExternalChange, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()

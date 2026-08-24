@@ -1,7 +1,7 @@
 package store
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,7 +36,7 @@ type Journal struct {
 // Open opens path, replaying valid events and repairing a partial final line.
 //
 //nolint:cyclop // open performs the ordered durability and repair checks.
-func Open(path string) (*Journal, []protocol.Event, error) {
+func Open(path string, discardProjectedExternalThrough ...uint64) (*Journal, []protocol.Event, error) {
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return nil, nil, fmt.Errorf("create journal directory: %w", err)
@@ -57,7 +57,11 @@ func Open(path string) (*Journal, []protocol.Event, error) {
 		ignoreError(file.Close())
 		return nil, nil, fmt.Errorf("secure journal: %w", err)
 	}
-	events, validBytes, err := readEvents(file)
+	discardThrough := uint64(0)
+	if len(discardProjectedExternalThrough) > 0 {
+		discardThrough = discardProjectedExternalThrough[0]
+	}
+	events, validBytes, err := readEvents(file, discardThrough)
 	if err != nil {
 		ignoreError(file.Close())
 		return nil, nil, err
@@ -87,34 +91,43 @@ func Open(path string) (*Journal, []protocol.Event, error) {
 	return &Journal{file: file, path: path, lastSequence: lastSequence}, events, nil
 }
 
-func readEvents(file *os.File) ([]protocol.Event, int64, error) {
+//nolint:gocognit,nestif // Journal recovery keeps line validation and crash-tail accounting together.
+func readEvents(file *os.File, discardProjectedExternalThrough uint64) ([]protocol.Event, int64, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return nil, 0, fmt.Errorf("seek journal: %w", err)
 	}
-	content, err := io.ReadAll(file)
-	if err != nil {
-		return nil, 0, fmt.Errorf("read journal: %w", err)
-	}
-	validLength := len(content)
-	if len(content) > 0 && content[len(content)-1] != '\n' {
-		lastNewline := bytes.LastIndexByte(content, '\n')
-		validLength = lastNewline + 1
-	}
+	reader := bufio.NewReader(file)
 	var events []protocol.Event
-	for index, line := range bytes.Split(content[:validLength], []byte{'\n'}) {
-		if len(line) == 0 {
-			continue
+	var validLength int64
+	lineNumber := 0
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 && line[len(line)-1] == '\n' {
+			lineNumber++
+			validLength += int64(len(line))
+			line = line[:len(line)-1]
+			if len(line) > 0 {
+				var event protocol.Event
+				if decodeErr := json.Unmarshal(line, &event); decodeErr != nil {
+					return nil, 0, fmt.Errorf("decode journal line %d: %w", lineNumber, decodeErr)
+				}
+				if event.Version != protocol.Version {
+					return nil, 0, fmt.Errorf("journal line %d has unsupported version %d", lineNumber, event.Version)
+				}
+				if event.Type == "external_change.observed" && event.Sequence <= discardProjectedExternalThrough {
+					event.Data = nil
+				}
+				events = append(events, event)
+			}
 		}
-		var event protocol.Event
-		if err := json.Unmarshal(line, &event); err != nil {
-			return nil, 0, fmt.Errorf("decode journal line %d: %w", index+1, err)
+		if errors.Is(err, io.EOF) {
+			break
 		}
-		if event.Version != protocol.Version {
-			return nil, 0, fmt.Errorf("journal line %d has unsupported version %d", index+1, event.Version)
+		if err != nil {
+			return nil, 0, fmt.Errorf("read journal line %d: %w", lineNumber+1, err)
 		}
-		events = append(events, event)
 	}
-	return events, int64(validLength), nil
+	return events, validLength, nil
 }
 
 func syncDirectory(path string) error {
