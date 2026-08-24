@@ -86,6 +86,33 @@ export type MutationIntent = {
   completed_at?: string;
 };
 
+export type MutationLease = {
+  lease_uuid: string;
+  fencing_token: string;
+  actor_uuid: string;
+  generation: number;
+  repository_uuid: string;
+  workspace_uuid: string;
+  intent_id: string;
+  tool_call_id: string;
+  paths: string[];
+  granted_at: string;
+  renewed_at: string;
+  expires_at: string;
+  hard_deadline: string;
+  state: "active" | "waiting" | string;
+  blocking_lease_uuid?: string;
+  blocking_root_lease_uuid?: string;
+  collision_id?: string;
+};
+
+export type MutationLeaseResult = {
+  decision: "grant" | "wait" | "block" | string;
+  lease?: MutationLease;
+  conflicts?: MutationLease[];
+  reason?: string;
+};
+
 export type SessionEvent = {
   id: string;
   actor: ActorRecord["address"];

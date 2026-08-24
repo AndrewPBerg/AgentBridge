@@ -7,6 +7,7 @@ export type ExtensionContext = {
   mode: string;
   cwd: string;
   isIdle: () => boolean;
+  abort: () => void;
   ui: {
     notify: (message: string, type?: string) => void;
     custom: <T>(
@@ -263,6 +264,7 @@ export function createMockContext(overrides: Partial<any> = {}) {
     },
     cwd: process.cwd(),
     isIdle: () => true,
+    abort: vi.fn(),
     mode: "tui",
     hasUI: true,
     ...overrides,

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { BridgeClient } from "./client";
 import { createAgentBridge } from "./index";
-import type { ActorRecord, BridgeMessage } from "./protocol";
+import type { ActorRecord, BridgeMessage, MutationLease, MutationLeaseResult } from "./protocol";
 import { createMockContext, createMockPi } from "./test/mocks/pi-coding-agent";
 
 function actor(session = "sender"): ActorRecord {
@@ -31,6 +31,58 @@ function context(session = "sender") {
         { type: "message", message: { role: "assistant", content: [{ type: "text", text: "editing schema" }] } },
       ],
     },
+  });
+}
+
+function lease(leaseUUID = "lease-1", fencingToken = "fence-1", overrides: Partial<MutationLease> = {}): MutationLease {
+  const now = Date.now();
+  return {
+    lease_uuid: leaseUUID,
+    fencing_token: fencingToken,
+    actor_uuid: "sender",
+    generation: 1,
+    repository_uuid: "11111111-1111-5111-8111-111111111111",
+    workspace_uuid: "22222222-2222-5222-8222-222222222222",
+    intent_id: "sender:1:intent",
+    tool_call_id: "tool-1",
+    paths: ["/repo/src/a.ts"],
+    granted_at: new Date(now).toISOString(),
+    renewed_at: new Date(now).toISOString(),
+    expires_at: new Date(now + 2 * 60_000).toISOString(),
+    hard_deadline: new Date(now + 30 * 60_000).toISOString(),
+    state: "active",
+    ...overrides,
+  };
+}
+
+function leaseForRequest(params: any, state: MutationLease["state"] = "active", overrides: Partial<MutationLease> = {}): MutationLease {
+  return lease(params.lease_uuid, params.fencing_token, {
+    actor_uuid: params.actor_uuid,
+    generation: params.generation,
+    repository_uuid: params.repository_uuid,
+    workspace_uuid: params.workspace_uuid,
+    intent_id: params.intent_id,
+    tool_call_id: params.tool_call_id,
+    paths: params.paths,
+    state,
+    ...overrides,
+  });
+}
+
+function leaseClient(handler?: (method: string, params: any) => any) {
+  return mockClient((method, params) => {
+    const custom = handler?.(method, params);
+    if (custom !== undefined) return custom;
+    if (method === "actor.register")
+      return {
+        ...actor(),
+        repository_uuid: "11111111-1111-5111-8111-111111111111",
+        workspace_uuid: "22222222-2222-5222-8222-222222222222",
+      };
+    if (method === "mutation_lease.acquire") return { decision: "grant", lease: leaseForRequest(params) } satisfies MutationLeaseResult;
+    if (method === "mutation_lease.renew") return { decision: "grant", lease: leaseForRequest(params) } satisfies MutationLeaseResult;
+    if (method === "mutation_lease.list") return { leases: [] };
+    return undefined;
   });
 }
 
@@ -971,6 +1023,497 @@ describe("Go Agent Bridge adapter", () => {
     expect(client.call).toHaveBeenCalledWith("direction.update", expect.objectContaining({ tickets: stored }));
     expect(client.call).toHaveBeenCalledWith("direction.update", expect.objectContaining({ tickets: [] }));
     await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("admits only edit/write mutations and keeps read/bash lease-free", async () => {
+    const pi = createMockPi();
+    const client = leaseClient();
+    const ctx = await start(pi, client);
+
+    await emitAll(pi, "tool_call", { toolName: "read", toolCallId: "read-1", input: { path: "src/a.ts" } }, ctx);
+    await emitAll(pi, "tool_call", { toolName: "bash", toolCallId: "bash-1", input: { command: "echo ok" } }, ctx);
+    await emitAll(
+      pi,
+      "tool_call",
+      { toolName: "edit", toolCallId: "edit-1", input: { path: "src/a.ts", oldText: "a", newText: "b" } },
+      ctx,
+    );
+    await emitAll(pi, "tool_result", { toolName: "edit", toolCallId: "edit-1", isError: false }, ctx);
+
+    const methods = vi.mocked(client.call).mock.calls.map(([method]) => method);
+    expect(
+      methods.filter((method) => ["mutation_lease.acquire", "mutation_lease.release", "mutation_lease.renew"].includes(method)),
+    ).toEqual(["mutation_lease.acquire", "mutation_lease.release"]);
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("waits without executing until the same request is promoted, and returns a block", async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createMockPi();
+      const acquireResults: MutationLeaseResult[] = [
+        { decision: "wait", reason: "held" },
+        { decision: "grant", lease: lease("lease-promoted", "fence-promoted") },
+      ];
+      const client = leaseClient((method) => (method === "mutation_lease.acquire" ? acquireResults.shift() : undefined));
+      const ctx = await start(pi, client);
+      const pending = emitAll(
+        pi,
+        "tool_call",
+        { toolName: "write", toolCallId: "write-1", input: { path: "src/a.ts", content: "x" } },
+        ctx,
+      );
+      await vi.waitFor(() =>
+        expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.acquire")).toHaveLength(1),
+      );
+      expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.acquire")[0]?.[1]).toEqual(
+        expect.objectContaining({ tool_call_id: "write-1", lease_uuid: expect.any(String), fencing_token: expect.any(String) }),
+      );
+      await vi.advanceTimersByTimeAsync(500);
+      expect(await pending).toBeUndefined();
+      const acquireCalls = vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.acquire");
+      expect(acquireCalls).toHaveLength(2);
+      const firstAcquire = acquireCalls[0]?.[1] as any;
+      const secondAcquire = acquireCalls[1]?.[1] as any;
+      expect(firstAcquire).toEqual(
+        expect.objectContaining({ lease_uuid: secondAcquire.lease_uuid, fencing_token: secondAcquire.fencing_token }),
+      );
+      await emitAll(pi, "tool_result", { toolName: "write", toolCallId: "write-1", isError: false }, ctx);
+
+      const blocked = leaseClient((method) =>
+        method === "mutation_lease.acquire" ? { decision: "block", reason: "conflict" } : undefined,
+      );
+      const blockedPi = createMockPi();
+      const blockedCtx = await start(blockedPi, blocked);
+      expect(
+        await emitAll(
+          blockedPi,
+          "tool_call",
+          { toolName: "edit", toolCallId: "edit-blocked", input: { path: "src/a.ts", oldText: "a", newText: "b" } },
+          blockedCtx,
+        ),
+      ).toEqual({
+        block: true,
+        reason: "conflict",
+      });
+      await blockedPi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, blockedCtx);
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("permits disjoint sibling mutations and releases on success or error", async () => {
+    const pi = createMockPi();
+    const client = leaseClient();
+    const ctx = await start(pi, client);
+    const calls = [
+      { toolName: "edit", toolCallId: "edit-a", input: { path: "src/a.ts" } },
+      { toolName: "write", toolCallId: "write-b", input: { path: "src/b.ts", content: "b" } },
+    ];
+    await Promise.all(calls.map((event) => emitAll(pi, "tool_call", event, ctx)));
+    await emitAll(pi, "tool_result", { ...calls[0], isError: false }, ctx);
+    await emitAll(pi, "tool_result", { ...calls[1], isError: true }, ctx);
+    const acquireCalls = vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.acquire");
+    const releases = vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.release");
+    expect(acquireCalls).toHaveLength(2);
+    expect(releases).toHaveLength(2);
+    const acquired = acquireCalls.map(([, params]) => params as any);
+    const released = releases.map(([, params]) => params as any);
+    expect(new Set(acquired.map((params) => params.lease_uuid)).size).toBe(2);
+    expect(new Set(acquired.map((params) => params.fencing_token)).size).toBe(2);
+    expect(released.map((params) => params.lease_uuid).sort()).toEqual(acquired.map((params) => params.lease_uuid).sort());
+    expect(released.map((params) => params.fencing_token).sort()).toEqual(acquired.map((params) => params.fencing_token).sort());
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("renews an open lease every 15 seconds, but never after its result", async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createMockPi();
+      const client = leaseClient();
+      const ctx = await start(pi, client);
+      await emitAll(pi, "tool_call", { toolName: "edit", toolCallId: "renew-1", input: { path: "src/a.ts" } }, ctx);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.renew")).toHaveLength(1);
+      await emitAll(pi, "tool_result", { toolName: "edit", toolCallId: "renew-1", isError: false }, ctx);
+      const releasesAfterResult = vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.release");
+      await emitAll(pi, "tool_result", { toolName: "edit", toolCallId: "renew-1", isError: true }, ctx);
+      expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.release")).toHaveLength(
+        releasesAfterResult.length,
+      );
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.renew")).toHaveLength(1);
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases active and waiting leases on cancellation and shutdown, reconciles reconnects, and preserves fencing", async () => {
+    vi.useFakeTimers();
+    try {
+      const existing = lease("existing-lease", "existing-fence");
+      const pi = createMockPi();
+      const client = leaseClient((method) => (method === "mutation_lease.list" ? { leases: [existing] } : undefined));
+      const ctx = await start(pi, client);
+      expect(client.call).toHaveBeenCalledWith("mutation_lease.list", expect.anything());
+      expect(client.call).toHaveBeenCalledWith(
+        "mutation_lease.release",
+        expect.objectContaining({ lease_uuid: existing.lease_uuid, fencing_token: existing.fencing_token }),
+      );
+      const controller = new AbortController();
+      const waitingClient = leaseClient((method) =>
+        method === "mutation_lease.acquire" ? { decision: "wait", reason: "held" } : undefined,
+      );
+      const waitingPi = createMockPi();
+      const waitingCtx = await start(waitingPi, waitingClient);
+      const pending = emitAll(
+        waitingPi,
+        "tool_call",
+        { toolName: "edit", toolCallId: "cancel-1", input: { path: "src/a.ts" } },
+        { ...waitingCtx, signal: controller.signal },
+      );
+      await vi.waitFor(() =>
+        expect(vi.mocked(waitingClient.call).mock.calls.some(([method]) => method === "mutation_lease.acquire")).toBe(true),
+      );
+      controller.abort();
+      await expect(pending).resolves.toEqual(expect.objectContaining({ block: true, reason: expect.stringContaining("canceled") }));
+      await waitingPi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, waitingCtx);
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails safe when the daemon disconnects during lease admission or release", async () => {
+    const pi = createMockPi();
+    const client = leaseClient((method) => {
+      if (method === "mutation_lease.acquire") throw new Error("daemon disconnected");
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    expect(
+      await emitAll(pi, "tool_call", { toolName: "write", toolCallId: "disconnect-1", input: { path: "src/a.ts", content: "x" } }, ctx),
+    ).toEqual(expect.objectContaining({ block: true, reason: expect.stringContaining("admission unavailable") }));
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("preserves an active local claim across a socket reconnect", async () => {
+    const pi = createMockPi();
+    let active: MutationLease | undefined;
+    let failSessionEvent = false;
+    const client = leaseClient((method, params) => {
+      if (method === "mutation_lease.acquire") {
+        active = leaseForRequest(params);
+        return { decision: "grant", lease: active } satisfies MutationLeaseResult;
+      }
+      if (method === "mutation_lease.list") return { leases: active ? [active] : [] };
+      if (method === "session.event" && failSessionEvent) {
+        failSessionEvent = false;
+        throw new Error("socket closed before replying");
+      }
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    await emitAll(pi, "tool_call", { toolName: "edit", toolCallId: "reconnect-active", input: { path: "src/a.ts" } }, ctx);
+    failSessionEvent = true;
+    await emitAll(pi, "turn_start", { turnIndex: 1, timestamp: Date.now() }, ctx);
+    expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.release")).toHaveLength(0);
+    expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "actor.register")).toHaveLength(2);
+    await emitAll(pi, "tool_result", { toolName: "edit", toolCallId: "reconnect-active", isError: false }, ctx);
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("keeps a durable wait claim and retries the same UUID after reconnect", async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createMockPi();
+      let firstRequest: any;
+      let acquireCount = 0;
+      let failSessionEvent = false;
+      const client = leaseClient((method, params) => {
+        if (method === "mutation_lease.acquire") {
+          firstRequest ??= params;
+          acquireCount++;
+          if (acquireCount > 1) return { decision: "grant", lease: leaseForRequest(params) } satisfies MutationLeaseResult;
+          return { decision: "wait", lease: leaseForRequest(params, "waiting"), reason: "held" } satisfies MutationLeaseResult;
+        }
+        if (method === "mutation_lease.list") return { leases: firstRequest ? [leaseForRequest(firstRequest, "waiting")] : [] };
+        if (method === "session.event" && failSessionEvent) {
+          failSessionEvent = false;
+          throw new Error("socket closed before replying");
+        }
+        return undefined;
+      });
+      const ctx = await start(pi, client);
+      const pending = emitAll(pi, "tool_call", { toolName: "write", toolCallId: "reconnect-wait", input: { path: "src/a.ts" } }, ctx);
+      await vi.waitFor(() => expect(firstRequest).toBeDefined());
+      failSessionEvent = true;
+      const reconnect = emitAll(pi, "turn_start", { turnIndex: 2, timestamp: Date.now() }, ctx);
+      await vi.waitFor(() => expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "actor.register")).toHaveLength(2));
+      await reconnect;
+      await vi.advanceTimersByTimeAsync(500);
+      const acquires = vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.acquire");
+      expect(acquires).toHaveLength(2);
+      const firstAcquire = acquires[0]?.[1] as any;
+      const secondAcquire = acquires[1]?.[1] as any;
+      expect(secondAcquire.lease_uuid).toBe(firstAcquire.lease_uuid);
+      expect(secondAcquire.fencing_token).toBe(firstAcquire.fencing_token);
+      expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.release")).toHaveLength(0);
+      await emitAll(pi, "tool_result", { toolName: "write", toolCallId: "reconnect-wait", isError: true }, ctx);
+      await pending;
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails reconnect without deadlocking when raw lease reconciliation fails", async () => {
+    const pi = createMockPi();
+    let failSessionEvent = false;
+    let failList = false;
+    const client = leaseClient((method) => {
+      if (method === "session.event" && failSessionEvent) {
+        failSessionEvent = false;
+        throw new Error("socket closed before replying");
+      }
+      if (method === "mutation_lease.list" && failList) throw new Error("socket closed during lease reconciliation");
+      return undefined;
+    });
+    const ctx = await start(pi, client);
+    failSessionEvent = true;
+    failList = true;
+    await expect(emitAll(pi, "turn_start", { turnIndex: 4, timestamp: Date.now() }, ctx)).rejects.toThrow(
+      "socket closed during lease reconciliation",
+    );
+    expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "actor.register")).toHaveLength(2);
+    failList = false;
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("releases an orphaned remote lease during reconciliation", async () => {
+    const pi = createMockPi();
+    const orphan = lease("orphan-remote", "orphan-fence", { actor_uuid: "sender", generation: 99, tool_call_id: "gone" });
+    const client = leaseClient((method) => (method === "mutation_lease.list" ? { leases: [orphan] } : undefined));
+    const ctx = await start(pi, client);
+    expect(client.call).toHaveBeenCalledWith(
+      "mutation_lease.release",
+      expect.objectContaining({
+        lease_uuid: orphan.lease_uuid,
+        fencing_token: orphan.fencing_token,
+        generation: orphan.generation,
+      }),
+    );
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+  });
+
+  it("ends intent after its after-snapshot and before releasing the lease", async () => {
+    for (const isError of [false, true]) {
+      const pi = createMockPi();
+      const client = leaseClient();
+      const ctx = await start(pi, client);
+      const id = `ordered-${isError}`;
+      await emitAll(pi, "tool_call", { toolName: "edit", toolCallId: id, input: { path: "src/a.ts" } }, ctx);
+      await emitAll(pi, "tool_result", { toolName: "edit", toolCallId: id, isError }, ctx);
+      const calls = vi.mocked(client.call).mock.calls.map(([method]) => method);
+      expect(calls.indexOf("intent.end")).toBeGreaterThan(calls.indexOf("intent.begin"));
+      expect(calls.indexOf("intent.end")).toBeLessThan(calls.lastIndexOf("mutation_lease.release"));
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    }
+  });
+
+  it("does not accumulate abort listeners across repeated durable waits", async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createMockPi();
+      let acquireCount = 0;
+      const client = leaseClient((method, params) => {
+        if (method !== "mutation_lease.acquire") return undefined;
+        acquireCount++;
+        return acquireCount % 2 ? { decision: "wait", reason: "held" } : { decision: "grant", lease: leaseForRequest(params) };
+      });
+      const ctx = await start(pi, client);
+      const controller = new AbortController();
+      let listeners = 0;
+      const signal = controller.signal;
+      const add = signal.addEventListener.bind(signal);
+      const remove = signal.removeEventListener.bind(signal);
+      signal.addEventListener = ((type: string, listener: any, options?: any) => {
+        listeners++;
+        return add(type, listener, options);
+      }) as any;
+      signal.removeEventListener = ((type: string, listener: any, options?: any) => {
+        listeners--;
+        return remove(type, listener, options);
+      }) as any;
+      for (let i = 0; i < 3; i++) {
+        const pending = emitAll(
+          pi,
+          "tool_call",
+          { toolName: "edit", toolCallId: `wait-${i}`, input: { path: `src/${i}.ts` } },
+          { ...ctx, signal },
+        );
+        await vi.waitFor(() => expect(acquireCount).toBe(i * 2 + 1));
+        await vi.advanceTimersByTimeAsync(500);
+        await pending;
+        await emitAll(pi, "tool_result", { toolName: "edit", toolCallId: `wait-${i}`, isError: false }, ctx);
+      }
+      expect(listeners).toBe(0);
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("serializes overlapping renewal ticks", async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createMockPi();
+      let resolveRenew!: (value: MutationLeaseResult) => void;
+      const client = leaseClient((method) =>
+        method === "mutation_lease.renew"
+          ? new Promise<MutationLeaseResult>((resolve) => {
+              resolveRenew = resolve;
+            })
+          : undefined,
+      );
+      const ctx = await start(pi, client);
+      await emitAll(pi, "tool_call", { toolName: "edit", toolCallId: "serial-renew", input: { path: "src/a.ts" } }, ctx);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.renew")).toHaveLength(1);
+      resolveRenew({
+        decision: "grant",
+        lease: leaseForRequest((vi.mocked(client.call).mock.calls.find(([method]) => method === "mutation_lease.renew") as any)[1]),
+      });
+      await vi.waitFor(() =>
+        expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.renew")).toHaveLength(1),
+      );
+      await emitAll(pi, "tool_result", { toolName: "edit", toolCallId: "serial-renew", isError: false }, ctx);
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not warn when an in-flight successful renewal finishes after tool close", async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createMockPi();
+      let resolveRenew!: (value: MutationLeaseResult) => void;
+      const client = leaseClient((method) =>
+        method === "mutation_lease.renew"
+          ? new Promise<MutationLeaseResult>((resolve) => {
+              resolveRenew = resolve;
+            })
+          : undefined,
+      );
+      const ctx = await start(pi, client);
+      await emitAll(pi, "tool_call", { toolName: "edit", toolCallId: "late-renew", input: { path: "src/a.ts" } }, ctx);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await emitAll(pi, "tool_result", { toolName: "edit", toolCallId: "late-renew", isError: false }, ctx);
+      resolveRenew({ decision: "grant", lease: lease() });
+      await Promise.resolve();
+      expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("renewal"), "warning");
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts and releases immediately when renewal is blocked", async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createMockPi();
+      const client = leaseClient((method) =>
+        method === "mutation_lease.renew" ? { decision: "block", reason: "hard deadline reached" } : undefined,
+      );
+      const ctx = context();
+      await start(pi, client, ctx);
+      await emitAll(pi, "tool_call", { toolName: "edit", toolCallId: "renew-block", input: { path: "src/a.ts" } }, ctx);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(ctx.abort).toHaveBeenCalledOnce();
+      expect(client.call).toHaveBeenCalledWith(
+        "mutation_lease.release",
+        expect.objectContaining({ lease_uuid: expect.any(String), fencing_token: expect.any(String) }),
+      );
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.renew")).toHaveLength(1);
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retries renewal failures while the lease is still before its soft expiry", async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createMockPi();
+      let renewals = 0;
+      const client = leaseClient((method, params) => {
+        if (method !== "mutation_lease.renew") return undefined;
+        renewals++;
+        if (renewals === 1) throw new Error("temporary renewal failure");
+        return { decision: "grant", lease: leaseForRequest(params) } satisfies MutationLeaseResult;
+      });
+      const ctx = await start(pi, client);
+      await emitAll(pi, "tool_call", { toolName: "edit", toolCallId: "retry-renew", input: { path: "src/a.ts" } }, ctx);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(renewals).toBe(2);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("temporary renewal failure"), "warning");
+      await emitAll(pi, "tool_result", { toolName: "edit", toolCallId: "retry-renew", isError: false }, ctx);
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts and releases before a failed renewal can cross soft expiry", async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createMockPi();
+      const abort = vi.fn();
+      const client = leaseClient((method, params) => {
+        if (method === "mutation_lease.acquire") {
+          return {
+            decision: "grant",
+            lease: leaseForRequest(params, "active", { expires_at: new Date(Date.now() + 20_000).toISOString() }),
+          } satisfies MutationLeaseResult;
+        }
+        if (method === "mutation_lease.renew") throw new Error("renew unavailable");
+        return undefined;
+      });
+      const ctx = context();
+      (ctx as any).abort = abort;
+      await start(pi, client, ctx);
+      await emitAll(pi, "tool_call", { toolName: "edit", toolCallId: "expiry-abort", input: { path: "src/a.ts" } }, ctx);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(abort).toHaveBeenCalledOnce();
+      expect(client.call).toHaveBeenCalledWith(
+        "mutation_lease.release",
+        expect.objectContaining({ lease_uuid: expect.any(String), fencing_token: expect.any(String) }),
+      );
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(vi.mocked(client.call).mock.calls.filter(([method]) => method === "mutation_lease.renew")).toHaveLength(1);
+      await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ends pending intents before releasing leases and recording shutdown", async () => {
+    const pi = createMockPi();
+    const client = leaseClient();
+    const ctx = await start(pi, client);
+    await emitAll(pi, "tool_call", { toolName: "write", toolCallId: "shutdown-order", input: { path: "src/a.ts" } }, ctx);
+    vi.mocked(client.call).mockClear();
+    await pi.events.get("session_shutdown")?.[0]?.({ reason: "quit" }, ctx);
+    const methods = vi.mocked(client.call).mock.calls.map(([method]) => method);
+    expect(methods.indexOf("intent.end")).toBeGreaterThanOrEqual(0);
+    expect(methods.indexOf("intent.end")).toBeLessThan(methods.indexOf("mutation_lease.release"));
+    expect(methods.indexOf("mutation_lease.release")).toBeLessThan(methods.indexOf("session.event"));
   });
 
   it("keeps polled mail pending until the injected agent run settles", async () => {

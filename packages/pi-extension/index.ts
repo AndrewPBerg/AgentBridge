@@ -17,7 +17,11 @@ import type {
   CollisionState,
   Direction,
   DirectionStatus,
+  GitContext,
+  JjContext,
   MutationIntent,
+  MutationLease,
+  MutationLeaseResult,
   SessionEvent,
   TestResult,
   WorkUnit,
@@ -30,6 +34,8 @@ const HEARTBEAT_MS = 2_000;
 const JJ_REFRESH_MS = 10_000;
 const MAILBOX_POLL_MS = 250;
 const INTENT_TTL_MS = 5 * 60_000;
+const LEASE_RETRY_MS = 500;
+const LEASE_RENEW_MS = 15_000;
 const AWAKEN_ATTACH_TIMEOUT_MS = 30_000;
 const ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$/;
 
@@ -68,6 +74,7 @@ export function createAgentBridge(
   awakenScheduler: AwakenScheduler = scheduleAwakenCheck,
 ) {
   const openIntents = new Map<string, MutationIntent>();
+  const openLeases = new Map<string, { lease: MutationLease; intent: MutationIntent; renewalFailures: number }>();
   const deliveredInRuntime = new Set<string>();
   const pendingAcknowledgements = new Set<string>();
   let actor: ActorRecord | undefined;
@@ -75,6 +82,7 @@ export function createAgentBridge(
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   let jjTimer: ReturnType<typeof setInterval> | undefined;
   let mailboxTimer: ReturnType<typeof setInterval> | undefined;
+  let leaseRenewTimer: ReturnType<typeof setInterval> | undefined;
   let mailboxPolling = false;
   let heartbeatRunning = false;
   let generation = 0;
@@ -83,6 +91,8 @@ export function createAgentBridge(
   let declarationSequence = 0;
   let currentTurnIndex: number | undefined;
   let recoveryPromise: Promise<void> | undefined;
+  let reconcilingLeases = false;
+  let renewingLeases: Promise<void> | undefined;
   let lastError = "";
   let selectedWorkUnit: WorkUnit | undefined;
   let selectedDirection: Direction | undefined;
@@ -121,6 +131,7 @@ export function createAgentBridge(
             generation,
           },
         });
+        if (!reconcilingLeases) await reconcileLeases(true);
       }
     })().finally(() => {
       recoveryPromise = undefined;
@@ -136,6 +147,220 @@ export function createAgentBridge(
       await recoverConnection();
       return client.call<T>(method, params);
     }
+  }
+
+  function waitForRetry(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(new Error("tool call canceled while waiting for mutation lease"));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", abort);
+        resolve();
+      }, LEASE_RETRY_MS);
+      const abort = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        reject(new Error("tool call canceled while waiting for mutation lease"));
+      };
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+
+  async function releaseLease(entry: { lease: MutationLease; intent: MutationIntent }): Promise<void> {
+    if (!actor) return;
+    await call("mutation_lease.release", {
+      lease_uuid: entry.lease.lease_uuid,
+      fencing_token: entry.lease.fencing_token,
+      actor_uuid: entry.lease.actor_uuid,
+      generation: entry.lease.generation,
+    });
+  }
+
+  async function admitMutationLease(intent: MutationIntent, signal?: AbortSignal): Promise<MutationLease> {
+    if (!actor) throw new Error("Agent Bridge is not attached to an active session");
+    const request = {
+      lease_uuid: randomUUID(),
+      fencing_token: randomUUID(),
+      actor_uuid: actor.address,
+      generation,
+      repository_uuid: canonicalUUID(actor.repository_uuid, "Repository UUID"),
+      workspace_uuid: canonicalUUID(actor.workspace_uuid, "Workspace UUID"),
+      intent_id: intent.id,
+      tool_call_id: intent.tool_call_id,
+      paths: intent.paths,
+    };
+    openLeases.set(intent.tool_call_id, {
+      lease: {
+        ...request,
+        paths: intent.paths,
+        granted_at: "",
+        renewed_at: "",
+        expires_at: "",
+        hard_deadline: "",
+        state: "waiting",
+      },
+      intent,
+      renewalFailures: 0,
+    });
+    for (;;) {
+      if (signal?.aborted) {
+        await closeLease(intent.tool_call_id);
+        throw new Error("tool call canceled before mutation lease grant");
+      }
+      let result: MutationLeaseResult;
+      try {
+        result = await call<MutationLeaseResult>("mutation_lease.acquire", request);
+      } catch (error) {
+        await closeLease(intent.tool_call_id);
+        throw new Error(`mutation lease admission unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (result.decision === "grant" && result.lease?.state === "active") {
+        if (signal?.aborted) {
+          openLeases.set(intent.tool_call_id, { lease: result.lease, intent, renewalFailures: 0 });
+          await closeLease(intent.tool_call_id);
+          throw new Error("tool call canceled before mutation lease grant");
+        }
+        const entry = { lease: result.lease, intent, renewalFailures: 0 };
+        openLeases.set(intent.tool_call_id, entry);
+        return result.lease;
+      }
+      if (result.decision === "block") {
+        await closeLease(intent.tool_call_id);
+        throw new Error(result.reason || "mutation lease admission blocked");
+      }
+      if (result.decision !== "wait") {
+        await closeLease(intent.tool_call_id);
+        throw new Error(result.reason || "unknown mutation lease admission decision");
+      }
+      if (result.lease) openLeases.set(intent.tool_call_id, { lease: result.lease, intent, renewalFailures: 0 });
+      try {
+        await waitForRetry(signal);
+      } catch (error) {
+        await closeLease(intent.tool_call_id);
+        throw error;
+      }
+    }
+  }
+
+  async function reconcileLeases(useRawClient = false): Promise<void> {
+    if (!actor || reconcilingLeases) return;
+    reconcilingLeases = true;
+    try {
+      await reconcileLeasesImpl(useRawClient);
+    } finally {
+      reconcilingLeases = false;
+    }
+  }
+
+  async function reconcileLeasesImpl(useRawClient: boolean): Promise<void> {
+    if (!actor) return;
+    if (!actor.workspace_uuid || !actor.repository_uuid) return;
+    let workspaceUUID: string;
+    try {
+      workspaceUUID = canonicalUUID(actor.workspace_uuid, "Workspace UUID");
+    } catch {
+      // Test doubles and legacy registrations may omit scope; there is no
+      // safe lease reconciliation request without a canonical workspace.
+      return;
+    }
+    const scope = { actor_uuid: actor.address, workspace_uuid: workspaceUUID };
+    const invoke = <T>(method: string, params: unknown): Promise<T> =>
+      useRawClient ? client.call<T>(method, params) : call<T>(method, params);
+    const result = await invoke<{ leases?: MutationLease[] }>("mutation_lease.list", scope);
+    // Preserve claims that this runtime can still finish. The fencing tuple is
+    // the identity; tool-call IDs alone are not safe across reconnects.
+    for (const lease of result.leases ?? []) {
+      if (lease.actor_uuid !== actor.address) continue;
+      const local = [...openLeases.values()].find(
+        (entry) =>
+          entry.lease.lease_uuid === lease.lease_uuid &&
+          entry.lease.fencing_token === lease.fencing_token &&
+          entry.lease.actor_uuid === lease.actor_uuid &&
+          entry.lease.generation === lease.generation &&
+          (entry.lease.state === "active" || entry.lease.state === "waiting"),
+      );
+      if (local) {
+        local.lease = lease;
+        local.renewalFailures = 0;
+        continue;
+      }
+      await invoke("mutation_lease.release", {
+        lease_uuid: lease.lease_uuid,
+        fencing_token: lease.fencing_token,
+        actor_uuid: lease.actor_uuid,
+        generation: lease.generation,
+      }).catch((error) => reportError(sessionCtx, error));
+    }
+  }
+
+  async function closeLease(toolCallId: string): Promise<void> {
+    const entry = openLeases.get(toolCallId);
+    if (!entry) return;
+    openLeases.delete(toolCallId);
+    await releaseLease(entry).catch((error) => reportError(sessionCtx, error));
+  }
+
+  async function handleLeaseRenewalFailure(
+    toolCallId: string,
+    entry: { lease: MutationLease; intent: MutationIntent; renewalFailures: number },
+    reason: string,
+  ): Promise<void> {
+    if (openLeases.get(toolCallId) !== entry) return;
+    entry.renewalFailures += 1;
+    const expiry = Date.parse(entry.lease.expires_at);
+    const unsafeToWait = !Number.isFinite(expiry) || Date.now() + LEASE_RENEW_MS >= expiry;
+    reportError(
+      sessionCtx,
+      new Error(
+        `mutation lease renewal failed (${entry.renewalFailures})${unsafeToWait ? "; lease expiry is imminent" : "; retrying before lease expiry"}: ${reason}`,
+      ),
+    );
+    if (!unsafeToWait) return;
+    sessionCtx?.abort();
+    await closeLease(toolCallId);
+  }
+
+  async function renewOpenLeases(): Promise<void> {
+    if (renewingLeases) return renewingLeases;
+    renewingLeases = (async () => {
+      if (!actor) return;
+      for (const [toolCallId, entry] of openLeases) {
+        if (openLeases.get(toolCallId) !== entry || entry.lease.state !== "active") continue;
+        try {
+          const result = await call<MutationLeaseResult>("mutation_lease.renew", {
+            lease_uuid: entry.lease.lease_uuid,
+            fencing_token: entry.lease.fencing_token,
+            actor_uuid: actor.address,
+            generation,
+            repository_uuid: entry.intent.repository_uuid,
+            workspace_uuid: entry.intent.workspace_uuid,
+            intent_id: entry.intent.id,
+            tool_call_id: entry.intent.tool_call_id,
+            paths: entry.intent.paths,
+          });
+          // The result may arrive after tool_result closed this entry. That is
+          // an expected race, not a failed renewal and not an orphan to delete.
+          if (openLeases.get(toolCallId) !== entry) continue;
+          if (result.decision === "grant" && result.lease) {
+            entry.lease = result.lease;
+            entry.renewalFailures = 0;
+            continue;
+          }
+          if (result.decision === "block") {
+            reportError(sessionCtx, new Error(result.reason || "mutation lease renewal was blocked"));
+            sessionCtx?.abort();
+            await closeLease(toolCallId);
+            continue;
+          }
+          await handleLeaseRenewalFailure(toolCallId, entry, result.reason || "not granted");
+        } catch (error) {
+          if (openLeases.get(toolCallId) !== entry) continue;
+          await handleLeaseRenewalFailure(toolCallId, entry, error instanceof Error ? error.message : String(error));
+        }
+      }
+    })().finally(() => {
+      renewingLeases = undefined;
+    });
+    return renewingLeases;
   }
 
   async function heartbeat(state?: ActorRecord["state"]) {
@@ -1297,6 +1522,7 @@ export function createAgentBridge(
         heartbeat_at: now,
       } satisfies ActorRecord,
     });
+    await reconcileLeases();
     const workUnitUUID = process.env.AGENT_BRIDGE_WORK_UNIT_UUID;
     if (workUnitUUID !== undefined) {
       canonicalUUID(workUnitUUID, "Agent Bridge WorkUnit UUID");
@@ -1312,6 +1538,8 @@ export function createAgentBridge(
     jjTimer.unref?.();
     mailboxTimer = setInterval(() => void pollMailbox(), MAILBOX_POLL_MS);
     mailboxTimer.unref?.();
+    leaseRenewTimer = setInterval(() => void renewOpenLeases(), LEASE_RENEW_MS);
+    leaseRenewTimer.unref?.();
     const vcs = actor.git && actor.jj ? "git+jj" : actor.git ? "git" : actor.jj ? "jj" : undefined;
     ctx.ui.setStatus(BRIDGE_MESSAGE_TYPE, vcs ? `bridge:go:${vcs}` : "bridge:go");
   });
@@ -1370,76 +1598,123 @@ export function createAgentBridge(
       git: mutationGit ?? actor.git,
       jj: mutationJj ?? actor.jj,
       context: inferIntentContext(ctx.sessionManager.getBranch()),
+      repository_uuid: actor.repository_uuid,
+      workspace_uuid: actor.workspace_uuid,
       before,
       started_at: started.toISOString(),
       expires_at: new Date(started.getTime() + INTENT_TTL_MS).toISOString(),
     };
     openIntents.set(mutationToolCallId, intent);
     await call<IntentResult>("intent.begin", { intent });
-  });
-
-  pi.on("tool_result", async (event) => {
-    const toolCallId = String(event.toolCallId ?? "");
-    const verification = verificationRuns.get(toolCallId);
-    verificationRuns.delete(toolCallId);
-    if (verification && actor && isBashToolResult(event)) {
-      const metadata = bashResultMetadata(event.details, event.content, event.isError);
-      const outcome = metadata.exitCode === undefined ? "blocked" : metadata.exitCode === 0 && !event.isError ? "passed" : "failed";
-      const completedAt = new Date();
-      const outputBytes = Buffer.byteLength(metadata.output, "utf8");
+    if (
+      mutationToolCallId &&
+      (mutation.operation === "edit" || mutation.operation === "write") &&
+      actor.repository_uuid &&
+      actor.workspace_uuid
+    ) {
       try {
-        const persisted = await call<TestResult>("test.result", {
-          result: {
-            id: createHash("sha256").update(`${actor.address}:${generation}:test-result:${toolCallId}`).digest("hex"),
-            actor: actor.address,
-            session_generation: generation,
-            turn_id: currentTurnIndex === undefined ? undefined : `${actor.address}:${generation}:turn:${currentTurnIndex}`,
-            turn_index: currentTurnIndex,
-            tool_call_id: toolCallId,
-            command: verification.command,
-            cwd: verification.cwd,
-            exit_code: metadata.exitCode,
-            outcome,
-            started_at: verification.startedAt.toISOString(),
-            completed_at: completedAt.toISOString(),
-            duration_ms: completedAt.getTime() - verification.startedAt.getTime(),
-            output_excerpt: metadata.output.slice(0, 600),
-            output_sha256: createHash("sha256").update(metadata.output).digest("hex"),
-            output_bytes: outputBytes,
-            output_truncated: metadata.truncated,
-            repository_uuid: actor.repository_uuid,
-            workspace_uuid: actor.workspace_uuid,
-            git: actor.git,
-            jj: actor.jj,
-          },
-        });
-        if (typeof persisted?.id === "string" && persisted.id.trim()) {
-          const daemonOutcome = persisted.outcome;
-          const confirmedOutcome = outcome === "failed" || outcome === "blocked" ? outcome : (daemonOutcome ?? outcome);
-          capturedTestResults.push({ id: persisted.id.trim(), outcome: confirmedOutcome });
-        }
+        await admitMutationLease(intent, ctx.signal);
       } catch (error) {
-        reportError(sessionCtx, error);
+        openIntents.delete(mutationToolCallId);
+        await call("intent.end", {
+          intent_id: intent.id,
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          after: before,
+          completed_at: new Date().toISOString(),
+        }).catch(() => undefined);
+        return { block: true, reason: error instanceof Error ? error.message : String(error) };
       }
     }
+    return;
+  });
+
+  async function endMutation(toolCallId: string, isError: boolean, errorReason = "tool result reported an error"): Promise<void> {
     const intent = openIntents.get(toolCallId);
     if (!intent) return;
     openIntents.delete(toolCallId);
     const vcsCwd = intent.paths[0] ? dirname(intent.paths[0]) : sessionCtx?.cwd;
-    const [after, gitAfter, jjAfter] = await Promise.all([
-      snapshotFiles(intent.paths),
-      vcsCwd ? inspectGit(pi, vcsCwd) : undefined,
-      vcsCwd ? inspectJj(pi, vcsCwd) : undefined,
-    ]);
+    let after = intent.before;
+    let gitAfter: GitContext | undefined;
+    let jjAfter: JjContext | undefined;
+    try {
+      [after, gitAfter, jjAfter] = await Promise.all([
+        snapshotFiles(intent.paths),
+        vcsCwd ? inspectGit(pi, vcsCwd) : undefined,
+        vcsCwd ? inspectJj(pi, vcsCwd) : undefined,
+      ]);
+    } catch (error) {
+      reportError(sessionCtx, error);
+    }
     await call("intent.end", {
       intent_id: intent.id,
-      success: !event.isError,
-      error: event.isError ? "tool result reported an error" : undefined,
+      success: !isError,
+      error: isError ? errorReason : undefined,
       after,
       git_after: gitAfter,
       jj_after: jjAfter,
       completed_at: new Date().toISOString(),
-    });
+    }).catch((error) => reportError(sessionCtx, error));
+  }
+
+  pi.on("tool_result", async (event) => {
+    const toolCallId = String(event.toolCallId ?? "");
+    try {
+      const verification = verificationRuns.get(toolCallId);
+      verificationRuns.delete(toolCallId);
+      if (verification && actor && isBashToolResult(event)) {
+        const metadata = bashResultMetadata(event.details, event.content, event.isError);
+        const outcome = metadata.exitCode === undefined ? "blocked" : metadata.exitCode === 0 && !event.isError ? "passed" : "failed";
+        const completedAt = new Date();
+        const outputBytes = Buffer.byteLength(metadata.output, "utf8");
+        try {
+          const persisted = await call<TestResult>("test.result", {
+            result: {
+              id: createHash("sha256").update(`${actor.address}:${generation}:test-result:${toolCallId}`).digest("hex"),
+              actor: actor.address,
+              session_generation: generation,
+              turn_id: currentTurnIndex === undefined ? undefined : `${actor.address}:${generation}:turn:${currentTurnIndex}`,
+              turn_index: currentTurnIndex,
+              tool_call_id: toolCallId,
+              command: verification.command,
+              cwd: verification.cwd,
+              exit_code: metadata.exitCode,
+              outcome,
+              started_at: verification.startedAt.toISOString(),
+              completed_at: completedAt.toISOString(),
+              duration_ms: completedAt.getTime() - verification.startedAt.getTime(),
+              output_excerpt: metadata.output.slice(0, 600),
+              output_sha256: createHash("sha256").update(metadata.output).digest("hex"),
+              output_bytes: outputBytes,
+              output_truncated: metadata.truncated,
+              repository_uuid: actor.repository_uuid,
+              workspace_uuid: actor.workspace_uuid,
+              git: actor.git,
+              jj: actor.jj,
+            },
+          });
+          if (typeof persisted?.id === "string" && persisted.id.trim()) {
+            const daemonOutcome = persisted.outcome;
+            const confirmedOutcome = outcome === "failed" || outcome === "blocked" ? outcome : (daemonOutcome ?? outcome);
+            capturedTestResults.push({ id: persisted.id.trim(), outcome: confirmedOutcome });
+          }
+        } catch (error) {
+          reportError(sessionCtx, error);
+        }
+      }
+      await endMutation(toolCallId, Boolean(event.isError));
+    } finally {
+      await closeLease(toolCallId);
+    }
+  });
+
+  pi.on("tool_execution_end", async (event) => {
+    const toolCallId = String(event.toolCallId ?? "");
+    try {
+      await endMutation(toolCallId, Boolean(event.isError));
+    } finally {
+      await closeLease(toolCallId);
+    }
   });
 
   pi.on("agent_settled", async () => {
@@ -1458,20 +1733,19 @@ export function createAgentBridge(
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (jjTimer) clearInterval(jjTimer);
     if (mailboxTimer) clearInterval(mailboxTimer);
+    if (leaseRenewTimer) clearInterval(leaseRenewTimer);
     heartbeatTimer = undefined;
     jjTimer = undefined;
     mailboxTimer = undefined;
-    await recordSessionEvent("session.shutdown", { data: { reason: event.reason } }).catch(() => undefined);
-    for (const intent of openIntents.values()) {
-      await call("intent.end", {
-        intent_id: intent.id,
-        success: false,
-        error: "session ended before tool completion",
-        after: await snapshotFiles(intent.paths),
-        completed_at: new Date().toISOString(),
-      }).catch(() => undefined);
+    leaseRenewTimer = undefined;
+    const pendingToolCalls = new Set([...openIntents.keys(), ...openLeases.keys()]);
+    for (const toolCallId of pendingToolCalls) {
+      await endMutation(toolCallId, true, "session ended before tool completion");
+      await closeLease(toolCallId);
     }
     openIntents.clear();
+    openLeases.clear();
+    await recordSessionEvent("session.shutdown", { data: { reason: event.reason } }).catch(() => undefined);
     if (actor) await call("actor.heartbeat", { address: actor.address, state: "dead", generation }).catch(() => undefined);
     actor = undefined;
     sessionCtx = undefined;
